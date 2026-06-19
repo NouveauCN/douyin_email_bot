@@ -39,3 +39,9 @@ bot:
   cooldown_seconds: 5
   # Subject must contain this keyword to trigger download
   subject_keyword: "下载"
+  # Special command keywords in email subject
+  commands:
+    # "更新cookie" — paste new DOUYIN_COOKIE in email body
+    cookie_update: "更新cookie"
+    # "自动获取cookie" — auto-extract from browser on this machine
+    cookie_auto: "自动获取cookie"

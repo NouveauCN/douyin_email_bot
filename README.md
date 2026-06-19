@@ -79,6 +79,27 @@ uv run python main.py
 
 机器人收到后会下载视频并回复邮件。
 
+## Cookie 管理
+
+抖音 cookie 有效期通常 **24-48 小时**，过期后下载会失败。机器人支持两种方式更新 cookie：
+
+### 手动粘贴（主题：更新cookie）
+
+向机器人邮箱发送邮件：
+- **主题**：含"更新cookie"
+- **正文**：粘贴新的 cookie 字符串
+
+获取 cookie：浏览器登录 douyin.com → `F12` → 控制台 → `document.cookie` → 复制输出。
+
+### 自动提取（主题：自动获取cookie）
+
+向机器人邮箱发送邮件：
+- **主题**：含"自动获取cookie"
+
+机器人会依次尝试 Firefox → Chrome → Edge 浏览器，提取已登录的抖音 cookie 并自动更新。
+
+> 提示：Windows 上建议安装 Firefox 并登录 douyin.com，Firefox 的 cookie 存储不加密，提取成功率最高。
+
 ## 配置说明
 
 | 配置项 | 类型 | 默认值 | 说明 |
@@ -95,6 +116,8 @@ uv run python main.py
 | `bot.allowed_senders` | list | `[]` | 允许的发件人邮箱（空=允许所有人） |
 | `bot.subject_keyword` | str | `"下载"` | 触发下载的邮件主题关键词 |
 | `bot.cooldown_seconds` | int | `5` | 同一发件人冷却时间 |
+| `bot.commands.cookie_update` | str | `"更新cookie"` | 手动更新 cookie 的邮件主题关键词 |
+| `bot.commands.cookie_auto` | str | `"自动获取cookie"` | 浏览器自动提取 cookie 的邮件主题关键词 |
 
 ## 常见问题
 

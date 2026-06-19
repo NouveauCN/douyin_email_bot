@@ -45,12 +45,21 @@ class DouyinConfig:
 
 
 @dataclass
+class BotCommands:
+    """Email subject keywords that trigger special actions."""
+
+    cookie_update: str = "更新cookie"    # Paste new cookie in body
+    cookie_auto: str = "自动获取cookie"   # Auto-extract from browser
+
+
+@dataclass
 class BotConfig:
     """Bot behavior settings."""
 
     allowed_senders: list[str] = field(default_factory=list)
     cooldown_seconds: int = 5
     subject_keyword: str = "下载"
+    commands: BotCommands = field(default_factory=BotCommands)
 
 
 @dataclass
@@ -99,10 +108,16 @@ def load_config(path: Path) -> AppConfig:
 
     # ── Bot ──
     bot_raw = raw.get("bot", {})
+    cmd_raw = bot_raw.get("commands", {})
+    bot_commands = BotCommands(
+        cookie_update=cmd_raw.get("cookie_update", "更新cookie"),
+        cookie_auto=cmd_raw.get("cookie_auto", "自动获取cookie"),
+    )
     bot = BotConfig(
         allowed_senders=bot_raw.get("allowed_senders", []),
         cooldown_seconds=bot_raw.get("cooldown_seconds", 5),
         subject_keyword=bot_raw.get("subject_keyword", "下载"),
+        commands=bot_commands,
     )
 
     return AppConfig(email=email, douyin=douyin, bot=bot)
