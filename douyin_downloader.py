@@ -23,6 +23,15 @@ from f2.exceptions import (
 logger = logging.getLogger("DouyinDownloader")
 
 
+def _silence_f2_loggers() -> None:
+    """Suppress noisy F2/httpx loggers that get reconfigured on each call."""
+    for name in ("httpx", "httpcore", "f2", "browser_cookie3", "urllib3"):
+        lg = logging.getLogger(name)
+        lg.setLevel(logging.WARNING)
+        lg.handlers.clear()
+        lg.propagate = False
+
+
 class DouyinDownloader:
     """Download Douyin videos using F2 metadata + direct httpx download.
 
@@ -81,6 +90,11 @@ class DouyinDownloader:
 
     async def _download_async(self, kwargs: dict, download_dir: Path) -> dict:
         """Fetch metadata via F2, then download directly via httpx."""
+
+        # F2 reconfigures its loggers when DouyinHandler is instantiated;
+        # suppress again so the user doesn't see Bark/HTTP noise.
+        _silence_f2_loggers()
+
         handler = DouyinHandler(kwargs | {"mode": "one", "path": str(download_dir),
                                           "naming": self.config.naming,
                                           "folderize": self.config.folderize,
