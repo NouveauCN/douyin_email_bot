@@ -78,7 +78,7 @@ class EmailBot:
             if not msg_ids:
                 return
 
-            logger.info("Found %d unseen email(s)", len(msg_ids))
+            logger.debug("Found %d unseen email(s)", len(msg_ids))
 
             for msg_id in msg_ids:
                 self._process_email(mail, msg_id, cfg, bot_cfg)
@@ -134,7 +134,7 @@ class EmailBot:
             _mark_seen(mail, msg_id)
             return
 
-        logger.info("Douyin URL from %s: %s", sender, url)
+        logger.info("收到下载请求: %s", sender)
 
         # Cooldown
         now = time.time()
@@ -249,7 +249,7 @@ class EmailBot:
             smtp.login(cfg.email, cfg.password)
             smtp.send_message(msg)
 
-        logger.info("Reply sent to %s", to_addr)
+        logger.debug("Reply sent to %s", to_addr)
 
 
 # ── Email parsing utilities ───────────────────────────────────────

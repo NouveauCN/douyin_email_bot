@@ -89,7 +89,7 @@ class DouyinDownloader:
 
         # Step 1: Resolve short link → aweme_id
         aweme_id = await AwemeIdFetcher.get_aweme_id(kwargs["url"])
-        logger.info("Resolved aweme_id: %s", aweme_id)
+        logger.debug("Resolved aweme_id: %s", aweme_id)
 
         # Step 2: Fetch video metadata (works with document.cookie)
         video_data = await handler.fetch_one_video(aweme_id)
@@ -128,11 +128,10 @@ class DouyinDownloader:
 
         # Step 5: Download
         if filepath.exists():
-            logger.info("File already exists: %s", filepath)
+            logger.info("已存在: %s", filepath.name)
         else:
             await self._download_file(video_url, filepath, kwargs)
-
-        logger.info("Downloaded: %s (%d bytes)", filepath, filepath.stat().st_size)
+            logger.info("下载完成: %s (%.1f MB)", filepath.name, filepath.stat().st_size / 1_000_000)
 
         return {
             "success": True,

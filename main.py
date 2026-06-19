@@ -18,13 +18,16 @@ from email_bot import EmailBot
 
 
 def setup_logging() -> None:
-    """Configure root logger."""
+    """Configure root logger — suppress noisy third-party logs."""
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
+    # Silence verbose third-party libraries
+    for name in ("httpx", "httpcore", "f2", "browser_cookie3"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def main() -> None:
