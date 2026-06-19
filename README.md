@@ -1,13 +1,19 @@
-# WeChat Douyin Video Downloader
+# Email Bot for Douyin Video Download
 
-微信机器人 —— 接收抖音分享链接，自动下载视频到本地。
+邮箱机器人 —— 发邮件给机器人，自动下载抖音视频到本地。
+
+## 工作原理
+
+```
+你发邮件（含抖音链接）→ 机器人轮询收件箱 → 下载视频 → 邮件回复结果
+```
 
 ## 环境要求
 
-- Windows 10/11 64-bit
-- **微信 PC 版 3.9.12.17**（WeChatFerry 依赖特定版本，请关闭微信自动更新）
 - Python 3.10+
 - [uv](https://docs.astral.sh/uv/)（Python 包管理器）
+- 一个 QQ 邮箱账号（作为机器人邮箱）
+- 无需特定操作系统（Windows / macOS / Linux 均可）
 
 ## 快速开始
 
@@ -17,64 +23,100 @@
 uv sync
 ```
 
-### 2. 获取抖音 Cookie
+### 2. 配置 QQ 邮箱
+
+登录 QQ 邮箱网页版 → **设置** → **账户** → 找到 **POP3/IMAP/SMTP/Exchange/CardDAV/CalDAV服务** → 开启 **IMAP/SMTP服务** → 获取**授权码**。
+
+> ⚠️ 授权码不是你的 QQ 密码。开启服务后会显示一串 16 位字符，请妥善保存。
+
+### 3. 获取抖音 Cookie
 
 ```bash
 uv run f2 dy --auto-cookie chrome
 ```
 
-或者从浏览器手动提取 cookie，填入 `config.yaml` 的 `douyin.cookie` 字段。
-
-### 3. 配置
+### 4. 编辑配置文件
 
 编辑 `config.yaml`：
 
 ```yaml
+email:
+  email: "your_bot@qq.com"     # 机器人邮箱地址
+  password: "你的QQ邮箱授权码"    # 不是 QQ 密码！
+
 douyin:
-  cookie: "你的抖音cookie"   # 必填
-  download_path: "./downloads"  # 视频保存目录
+  cookie: "你的抖音cookie"       # 上一步获取的
+
+bot:
+  allowed_senders:
+    - "your_email@qq.com"       # 允许发送下载请求的邮箱
 ```
 
-### 4. 运行
+### 5. 运行
 
 ```bash
 uv run python main.py
 ```
 
-首次运行会弹出微信登录二维码，用机器人账号扫码登录。登录成功后，向该微信发送抖音分享链接即可自动下载。
+### 6. 使用
 
-### 5. 使用
+从白名单邮箱向机器人邮箱发送邮件：
+- **主题**：需包含"下载"（可自定义 `bot.subject_keyword`）
+- **正文**：包含抖音分享链接
 
-- 向机器人微信发送一条抖音分享链接（分享卡片或文字链接均可）
-- 机器人会自动下载视频到 `downloads/` 目录
-- 下载完成后机器人回复标题和保存路径
+机器人收到后会下载视频并回复邮件。
 
 ## 配置说明
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `wechat.host` | str | `null` | WeChatFerry RPC 地址（null=本地模式） |
-| `wechat.port` | int | `10086` | RPC 端口 |
+| `email.imap_server` | str | `imap.qq.com` | IMAP 收件服务器 |
+| `email.imap_port` | int | `993` | IMAP SSL 端口 |
+| `email.smtp_server` | str | `smtp.qq.com` | SMTP 发件服务器 |
+| `email.smtp_port` | int | `587` | SMTP STARTTLS 端口 |
+| `email.email` | str | `""` | **必填**，机器人邮箱地址 |
+| `email.password` | str | `""` | **必填**，QQ 邮箱授权码 |
+| `email.poll_interval` | int | `30` | 收件箱轮询间隔（秒） |
 | `douyin.cookie` | str | `""` | **必填**，抖音登录 cookie |
 | `douyin.download_path` | str | `"./downloads"` | 视频下载目录 |
-| `douyin.folderize` | bool | `true` | 是否按用户分文件夹 |
-| `bot.cooldown_seconds` | int | `5` | 同一发送者下载冷却时间 |
-| `bot.allowed_senders` | list | `[]` | 允许的发送者 wxid（空=全部允许） |
+| `bot.allowed_senders` | list | `[]` | 允许的发件人邮箱（空=允许所有人） |
+| `bot.subject_keyword` | str | `"下载"` | 触发下载的邮件主题关键词 |
+| `bot.cooldown_seconds` | int | `5` | 同一发件人冷却时间 |
 
 ## 常见问题
 
-### 微信登录失败 / 消息收不到
-请确认微信 PC 版本为 **3.9.12.17**。如果微信自动更新了新版本，需要降级。
+### 连接邮箱失败
+- 确认已开启 QQ 邮箱的 IMAP/SMTP 服务
+- 确认 `email.password` 填写的是**授权码**而不是 QQ 密码
+- 确认服务器地址和端口正确
 
-### 抖音下载失败：未配置 cookie
-抖音需要登录 cookie 才能下载视频。请运行 `uv run f2 dy --auto-cookie chrome` 获取。
+### 抖音下载失败
+- 确认 `douyin.cookie` 已正确填写
+- 抖音 cookie 有时效性，过期后需重新获取
 
-### 抖音下载失败：视频不存在
-链接对应的视频可能已被删除、设为私密或链接已过期。
+### 邮件发不出去
+- QQ 邮箱 SMTP 有频率限制，建议 `poll_interval` 不小于 30 秒
 
-### Protobuf 版本冲突
-项目依赖的 `f2` 和 `wcferry` 对 protobuf 版本要求不同，`pyproject.toml` 中已配置 `override-dependencies` 解决此问题。
+## 其他邮箱
+
+默认配置适用于 QQ 邮箱。其他邮箱只需修改 `email:` 配置段即可：
+
+```yaml
+# 163 邮箱示例
+email:
+  imap_server: "imap.163.com"
+  imap_port: 993
+  smtp_server: "smtp.163.com"
+  smtp_port: 465
+
+# Gmail 示例（需开启两步验证 + App Password）
+email:
+  imap_server: "imap.gmail.com"
+  imap_port: 993
+  smtp_server: "smtp.gmail.com"
+  smtp_port: 587
+```
 
 ## 免责声明
 
-本项目仅供个人学习和研究使用。请遵守微信和抖音的服务条款，尊重视频创作者的版权。使用本项目产生的任何后果由使用者自行承担。
+本项目仅供个人学习和研究使用。请遵守相关平台的服务条款，尊重视频创作者的版权。

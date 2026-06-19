@@ -1,18 +1,25 @@
-# WeChatFerry settings
-wechat:
-  # RPC host (null = local mode, auto-starts the wcferry SDK)
-  host: null
-  # RPC port
-  port: 10086
-  # Enable debug logging from wcferry
-  debug: false
+# Email settings (QQ Mail)
+email:
+  # IMAP server for receiving emails
+  imap_server: "imap.qq.com"
+  imap_port: 993
+  # SMTP server for sending replies
+  smtp_server: "smtp.qq.com"
+  smtp_port: 587
+  # Bot email address
+  email: ""
+  # QQ Mail authorization code (NOT your QQ password)
+  # To get: QQ邮箱 → 设置 → 账户 → POP3/IMAP/SMTP服务 → 开启并获取授权码
+  password: ""
+  # Poll inbox interval (seconds)
+  poll_interval: 30
 
 # Douyin download settings
 douyin:
   # Download save path (relative to project root)
   download_path: "./downloads"
-  # Douyin cookie (REQUIRED - fetch from browser or set manually)
-  # To get a cookie, run: uv run f2 dy --auto-cookie chrome
+  # Douyin cookie (REQUIRED)
+  # To get: uv run f2 dy --auto-cookie chrome
   cookie: ""
   # Video filename template
   naming: "{create}_{aweme_id}"
@@ -27,9 +34,9 @@ douyin:
 
 # Bot behavior
 bot:
-  # Delay between processing messages (seconds)
-  message_delay: 1.0
-  # Allowed sender wxids (empty = allow all contacts)
+  # Allowed sender email addresses (empty = allow all)
   allowed_senders: []
-  # Download cooldown per sender (seconds)
+  # Cooldown per sender (seconds)
   cooldown_seconds: 5
+  # Subject must contain this keyword to trigger download
+  subject_keyword: "下载"

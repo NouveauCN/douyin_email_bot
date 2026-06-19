@@ -7,12 +7,17 @@ import yaml
 
 
 @dataclass
-class WechatConfig:
-    """WeChatFerry connection settings."""
+class EmailConfig:
+    """Email IMAP/SMTP settings."""
 
-    host: str | None = None
-    port: int = 10086
-    debug: bool = False
+    imap_server: str = "imap.qq.com"
+    imap_port: int = 993
+    smtp_server: str = "smtp.qq.com"
+    smtp_port: int = 587
+    email: str = ""       # Bot email address
+    password: str = ""    # QQ authorization code (not login password)
+    # Polling interval in seconds
+    poll_interval: int = 30
 
 
 @dataclass
@@ -32,16 +37,19 @@ class DouyinConfig:
 class BotConfig:
     """Bot behavior settings."""
 
-    message_delay: float = 1.0
+    # Allowed sender email addresses (empty = allow all senders)
     allowed_senders: list[str] = field(default_factory=list)
+    # Cooldown per sender (seconds)
     cooldown_seconds: int = 5
+    # Subject must contain this keyword to trigger download
+    subject_keyword: str = "下载"
 
 
 @dataclass
 class AppConfig:
     """Top-level application config."""
 
-    wechat: WechatConfig
+    email: EmailConfig
     douyin: DouyinConfig
     bot: BotConfig
 
@@ -51,11 +59,15 @@ def load_config(path: Path) -> AppConfig:
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
 
-    wechat_raw = raw.get("wechat", {})
-    wechat = WechatConfig(
-        host=wechat_raw.get("host"),
-        port=wechat_raw.get("port", 10086),
-        debug=wechat_raw.get("debug", False),
+    email_raw = raw.get("email", {})
+    email = EmailConfig(
+        imap_server=email_raw.get("imap_server", "imap.qq.com"),
+        imap_port=email_raw.get("imap_port", 993),
+        smtp_server=email_raw.get("smtp_server", "smtp.qq.com"),
+        smtp_port=email_raw.get("smtp_port", 587),
+        email=email_raw.get("email", ""),
+        password=email_raw.get("password", ""),
+        poll_interval=email_raw.get("poll_interval", 30),
     )
 
     douyin_raw = raw.get("douyin", {})
@@ -71,9 +83,9 @@ def load_config(path: Path) -> AppConfig:
 
     bot_raw = raw.get("bot", {})
     bot = BotConfig(
-        message_delay=bot_raw.get("message_delay", 1.0),
         allowed_senders=bot_raw.get("allowed_senders", []),
         cooldown_seconds=bot_raw.get("cooldown_seconds", 5),
+        subject_keyword=bot_raw.get("subject_keyword", "下载"),
     )
 
-    return AppConfig(wechat=wechat, douyin=douyin, bot=bot)
+    return AppConfig(email=email, douyin=douyin, bot=bot)

@@ -1,14 +1,9 @@
 [project]
 name = "wechat-video-download"
-version = "0.1.0"
-description = "WeChat bot that downloads Douyin videos from shared links"
+version = "0.2.0"
+description = "Email bot that downloads Douyin videos from shared links"
 requires-python = ">=3.10"
 dependencies = [
-    "wcferry>=39.5.2.0",
     "f2>=0.0.1.7",
     "pyyaml>=6.0",
 ]
-
-[tool.uv]
-# f2 pins protobuf==5.28.3 but wcferry needs >=5.29.0
-override-dependencies = ["protobuf>=5.29.0"]
