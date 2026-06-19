@@ -5,3 +5,4 @@ logs/
 *.pyc
 douyin_users.db
 douyin_videos.db
+.env

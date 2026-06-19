@@ -35,18 +35,31 @@ uv sync
 uv run f2 dy --auto-cookie chrome
 ```
 
-### 4. 编辑配置文件
+### 4. 配置 .env 文件
 
-编辑 `config.yaml`：
+复制模板并填入隐私信息：
+
+```bash
+cp .env.example .env
+```
+
+编辑 `.env`：
+
+```env
+EMAIL_ADDRESS=your_bot@qq.com
+EMAIL_PASSWORD=你的QQ邮箱授权码
+DOUYIN_COOKIE=你的抖音cookie
+```
+
+`.env` 已被 `.gitignore` 排除，不会被提交到 Git。
+
+### 5. 编辑 config.yaml（可选）
+
+`config.yaml` 只包含非敏感设置（服务器地址、端口等），隐私信息从 `.env` 加载。
+
+如需限制发件人，编辑 `bot.allowed_senders`：
 
 ```yaml
-email:
-  email: "your_bot@qq.com"     # 机器人邮箱地址
-  password: "你的QQ邮箱授权码"    # 不是 QQ 密码！
-
-douyin:
-  cookie: "你的抖音cookie"       # 上一步获取的
-
 bot:
   allowed_senders:
     - "your_email@qq.com"       # 允许发送下载请求的邮箱
@@ -74,10 +87,10 @@ uv run python main.py
 | `email.imap_port` | int | `993` | IMAP SSL 端口 |
 | `email.smtp_server` | str | `smtp.qq.com` | SMTP 发件服务器 |
 | `email.smtp_port` | int | `587` | SMTP STARTTLS 端口 |
-| `email.email` | str | `""` | **必填**，机器人邮箱地址 |
-| `email.password` | str | `""` | **必填**，QQ 邮箱授权码 |
+| `email.email` | str | `""` | **必填**（.env `EMAIL_ADDRESS`），机器人邮箱地址 |
+| `email.password` | str | `""` | **必填**（.env `EMAIL_PASSWORD`），QQ 邮箱授权码 |
 | `email.poll_interval` | int | `30` | 收件箱轮询间隔（秒） |
-| `douyin.cookie` | str | `""` | **必填**，抖音登录 cookie |
+| `douyin.cookie` | str | `""` | **必填**（.env `DOUYIN_COOKIE`），抖音登录 cookie |
 | `douyin.download_path` | str | `"./downloads"` | 视频下载目录 |
 | `bot.allowed_senders` | list | `[]` | 允许的发件人邮箱（空=允许所有人） |
 | `bot.subject_keyword` | str | `"下载"` | 触发下载的邮件主题关键词 |
@@ -87,11 +100,11 @@ uv run python main.py
 
 ### 连接邮箱失败
 - 确认已开启 QQ 邮箱的 IMAP/SMTP 服务
-- 确认 `email.password` 填写的是**授权码**而不是 QQ 密码
-- 确认服务器地址和端口正确
+- 确认 `.env` 中 `EMAIL_PASSWORD` 填写的是**授权码**而不是 QQ 密码
+- 确认 `.env` 中 `EMAIL_ADDRESS` 正确
 
 ### 抖音下载失败
-- 确认 `douyin.cookie` 已正确填写
+- 确认 `.env` 中 `DOUYIN_COOKIE` 已正确填写
 - 抖音 cookie 有时效性，过期后需重新获取
 
 ### 邮件发不出去

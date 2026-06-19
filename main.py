@@ -11,6 +11,8 @@ import logging
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 from config_loader import load_config
 from email_bot import EmailBot
 
@@ -29,23 +31,30 @@ def main() -> None:
     setup_logging()
     log = logging.getLogger("main")
 
-    # Locate config
+    # Load .env file (secrets: EMAIL_ADDRESS, EMAIL_PASSWORD, DOUYIN_COOKIE)
+    env_path = Path(__file__).parent / ".env"
+    if env_path.exists():
+        load_dotenv(env_path)
+    else:
+        log.warning(".env file not found — copy .env.example to .env and fill in your secrets")
+
+    # Load config.yaml (non-sensitive settings)
     config_path = Path(__file__).parent / "config.yaml"
     if not config_path.exists():
         log.error("config.yaml not found in project directory")
-        log.error("Copy and edit config.yaml (set email and douyin.cookie)")
         sys.exit(1)
 
     config = load_config(config_path)
 
-    # Validate required settings
+    # Validate required secrets
     if not config.email.email or not config.email.password:
-        log.error("email.email and email.password are required in config.yaml")
-        log.error("password is the QQ Mail authorization code, not your QQ password")
+        log.error("EMAIL_ADDRESS and EMAIL_PASSWORD are required")
+        log.error("Copy .env.example to .env and fill in your email credentials")
         sys.exit(1)
 
     if not config.douyin.cookie:
-        log.warning("douyin.cookie is empty — downloads will fail until set")
+        log.warning("DOUYIN_COOKIE is empty — downloads will fail until set")
+        log.info("Add DOUYIN_COOKIE to .env (see .env.example)")
         log.info("To get a cookie: uv run f2 dy --auto-cookie chrome")
 
     bot = EmailBot(config)

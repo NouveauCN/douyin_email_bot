@@ -1,4 +1,4 @@
-# Email settings (QQ Mail)
+# Email settings (QQ Mail by default)
 email:
   # IMAP server for receiving emails
   imap_server: "imap.qq.com"
@@ -6,21 +6,17 @@ email:
   # SMTP server for sending replies
   smtp_server: "smtp.qq.com"
   smtp_port: 587
-  # Bot email address
-  email: ""
-  # QQ Mail authorization code (NOT your QQ password)
-  # To get: QQ邮箱 → 设置 → 账户 → POP3/IMAP/SMTP服务 → 开启并获取授权码
-  password: ""
   # Poll inbox interval (seconds)
   poll_interval: 30
+  # NOTE: email address and password are loaded from .env file.
+  #       See .env.example for the required variables:
+  #         EMAIL_ADDRESS=your_bot@qq.com
+  #         EMAIL_PASSWORD=your_authorization_code
 
 # Douyin download settings
 douyin:
   # Download save path (relative to project root)
   download_path: "./downloads"
-  # Douyin cookie (REQUIRED)
-  # To get: uv run f2 dy --auto-cookie chrome
-  cookie: ""
   # Video filename template
   naming: "{create}_{aweme_id}"
   # Save videos to individual user folders
@@ -31,6 +27,9 @@ douyin:
   max_retries: 3
   # Max concurrent download tasks
   max_tasks: 5
+  # NOTE: douyin cookie is loaded from .env file.
+  #       See .env.example:
+  #         DOUYIN_COOKIE=your_douyin_cookie
 
 # Bot behavior
 bot:
