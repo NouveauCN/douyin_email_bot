@@ -223,8 +223,8 @@ class EmailBot:
             self._send_reply(
                 cfg, sender,
                 "自动获取失败：未找到已登录抖音的浏览器。\n\n"
-                "请确保已用浏览器登录 douyin.com，然后重试。\n"
-                "或使用方法二：发送主题含「更新cookie」的邮件，正文粘贴 document.cookie 的输出。",
+                "方案一：在宿主机终端运行 uv run python get_cookie.py\n"
+                "方案二：发送主题含「更新cookie」的邮件，正文粘贴 document.cookie 的输出。",
             )
 
         _mark_seen(mail, msg_id)

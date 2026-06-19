@@ -70,7 +70,7 @@ def main() -> None:
     if not config.douyin.cookie:
         log.warning("DOUYIN_COOKIE is empty — downloads will fail until set")
         log.info("Add DOUYIN_COOKIE to .env (see .env.example)")
-        log.info("To get a cookie: run 'uv run python -c \"import browser_cookie3; ...\"' or send an email with subject '自动获取cookie'")
+        log.info("To get a cookie: uv run python get_cookie.py")
 
     bot = EmailBot(config)
 
