@@ -1,0 +1,35 @@
+# WeChatFerry settings
+wechat:
+  # RPC host (null = local mode, auto-starts the wcferry SDK)
+  host: null
+  # RPC port
+  port: 10086
+  # Enable debug logging from wcferry
+  debug: false
+
+# Douyin download settings
+douyin:
+  # Download save path (relative to project root)
+  download_path: "./downloads"
+  # Douyin cookie (REQUIRED - fetch from browser or set manually)
+  # To get a cookie, run: uv run f2 dy --auto-cookie chrome
+  cookie: ""
+  # Video filename template
+  naming: "{create}_{aweme_id}"
+  # Save videos to individual user folders
+  folderize: true
+  # Network timeout (seconds)
+  timeout: 30
+  # Max retries on failure
+  max_retries: 3
+  # Max concurrent download tasks
+  max_tasks: 5
+
+# Bot behavior
+bot:
+  # Delay between processing messages (seconds)
+  message_delay: 1.0
+  # Allowed sender wxids (empty = allow all contacts)
+  allowed_senders: []
+  # Download cooldown per sender (seconds)
+  cooldown_seconds: 5
