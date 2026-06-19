@@ -11,27 +11,39 @@ import logging
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
+# ── Suppress noisy third-party logs BEFORE they are imported ──────
+for _name in ("httpx", "httpcore", "f2", "browser_cookie3", "urllib3"):
+    _lg = logging.getLogger(_name)
+    _lg.setLevel(logging.WARNING)
+    _lg.handlers.clear()
+    _lg.propagate = False
 
-from config_loader import load_config
-from email_bot import EmailBot
+from dotenv import load_dotenv  # noqa: E402
+
+from config_loader import load_config  # noqa: E402
+from email_bot import EmailBot  # noqa: E402
 
 
 def setup_logging() -> None:
-    """Configure root logger — suppress noisy third-party logs."""
+    """Configure root logger for our own output."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
-    # Silence verbose third-party libraries
-    for name in ("httpx", "httpcore", "f2", "browser_cookie3"):
-        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def main() -> None:
     setup_logging()
+
+    # Second pass — F2 reconfigures its logger during import, suppress again
+    for _name in ("httpx", "httpcore", "f2", "browser_cookie3", "urllib3"):
+        _lg = logging.getLogger(_name)
+        _lg.setLevel(logging.WARNING)
+        _lg.handlers.clear()
+        _lg.propagate = False
+
     log = logging.getLogger("main")
 
     # Load .env file (secrets: EMAIL_ADDRESS, EMAIL_PASSWORD, DOUYIN_COOKIE)
@@ -58,7 +70,7 @@ def main() -> None:
     if not config.douyin.cookie:
         log.warning("DOUYIN_COOKIE is empty — downloads will fail until set")
         log.info("Add DOUYIN_COOKIE to .env (see .env.example)")
-        log.info("To get a cookie: uv run f2 dy --auto-cookie chrome")
+        log.info("To get a cookie: run 'uv run python -c \"import browser_cookie3; ...\"' or send an email with subject '自动获取cookie'")
 
     bot = EmailBot(config)
 
