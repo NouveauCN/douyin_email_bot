@@ -63,7 +63,8 @@ class DouyinDownloader:
             "music": False,
             "cover": False,
             "desc": False,
-            "proxies": None,
+            "proxies": {},
+            "headers": {},
         }
 
         try:
