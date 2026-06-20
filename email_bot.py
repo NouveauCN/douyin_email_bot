@@ -38,6 +38,7 @@ class EmailBot:
         self.extractor = UrlExtractor()
         self._cooldowns: dict[str, float] = {}
         self._project_dir = Path(__file__).parent
+        self._seen_ids: set[str] = set()  # dedup across poll cycles
 
     def run(self) -> None:
         cfg = self.config.email
@@ -100,6 +101,20 @@ class EmailBot:
 
         if not sender:
             return
+
+        # ── Skip own replies (avoid infinite loop) ──────────────────
+        if sender == cfg.email:
+            logger.debug("Skipping own email: %s", subject)
+            _mark_seen(mail, msg_id)
+            return
+
+        # ── Dedup: skip already-processed message IDs ───────────────
+        msg_id_str = msg_id.decode("ascii", errors="replace") if isinstance(msg_id, bytes) else str(msg_id)
+        if msg_id_str in self._seen_ids:
+            logger.debug("Skipping already-processed message: %s", msg_id_str)
+            _mark_seen(mail, msg_id)
+            return
+        self._seen_ids.add(msg_id_str)
 
         # Sender allowlist
         allowed = bot_cfg.allowed_senders
@@ -339,10 +354,16 @@ def _get_body_text(msg) -> str:
 
 
 def _mark_seen(mail, msg_id: bytes) -> None:
+    """Mark an email as read. Tries two methods for compatibility."""
+    msg_str = msg_id.decode("ascii", errors="replace") if isinstance(msg_id, bytes) else str(msg_id)
     try:
         mail.store(msg_id, "+FLAGS", "\\Seen")
     except Exception:
-        logger.warning("Failed to mark message %s as seen", msg_id)
+        try:
+            # Some IMAP servers need the flag without backslash
+            mail.store(msg_id, "+FLAGS", "Seen")
+        except Exception:
+            logger.warning("Failed to mark message as seen: %s", msg_str)
 
 
 # ── .env file utilities ───────────────────────────────────────────
