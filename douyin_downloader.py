@@ -206,13 +206,11 @@ class DouyinDownloader:
         self, images: list, images_video: list, data: dict, aweme_id: str,
         download_dir: Path, kwargs: dict,
     ) -> dict:
-        """Download slideshow content — prefers animated video clips over static images.
+        """Download both static images AND animated video clips from a 图文 post.
 
-        Douyin slideshows return both:
+        Douyin slideshows return:
           - images: static .webp images
-          - images_video: short .mp4 clips (the animated version shown in-app)
-
-        We prefer images_video when available.
+          - images_video: short .mp4 clips (animated version shown in-app)
         """
         title = data.get("desc") or data.get("nickname") or "Douyin Slideshow"
 
@@ -236,58 +234,64 @@ class DouyinDownloader:
         slide_dir = base_dir / slide_dir_name
         slide_dir.mkdir(parents=True, exist_ok=True)
 
-        # ── Prefer animated video clips ────────────────────────────
-        if images_video:
-            urls = [u for u in images_video if isinstance(u, str)]
-            ext = ".mp4"
-            content_type = "动图"
-        else:
-            urls = [u for u in images if isinstance(u, str)]
-            ext = ".webp"
-            if urls:
-                first = urls[0]
-                if ".jpg" in first or ".jpeg" in first:
-                    ext = ".jpg"
-                elif ".png" in first:
-                    ext = ".png"
-            content_type = "图片"
+        # ── Build download queues ──────────────────────────────────
+        # Static images
+        static_urls = [u for u in images if isinstance(u, str)]
+        static_ext = ".webp"
+        if static_urls:
+            first = static_urls[0]
+            if ".jpg" in first or ".jpeg" in first:
+                static_ext = ".jpg"
+            elif ".png" in first:
+                static_ext = ".png"
 
-        if not urls:
+        # Animated video clips
+        video_urls = [u for u in images_video if isinstance(u, str)]
+
+        # Flatten into a single download list: (url, save_name, label)
+        downloads: list[tuple[str, str, str]] = []
+        for i, url in enumerate(static_urls):
+            downloads.append((url, f"{i + 1:02d}{static_ext}", "图片"))
+        for i, url in enumerate(video_urls):
+            downloads.append((url, f"{i + 1:02d}.mp4", "动图"))
+
+        if not downloads:
             return self._error("图文内容为空，无法下载")
 
         logger.info(
-            "Downloading %d slideshow %s to %s",
-            len(urls), content_type, slide_dir,
+            "Downloading slideshow: %d 图片 + %d 动图 to %s",
+            len(static_urls), len(video_urls), slide_dir,
         )
 
-        downloaded = 0
+        done = 0
         total_size = 0
-        for i, url in enumerate(urls):
-            filename = f"{i + 1:02d}{ext}"
+        for url, filename, label in downloads:
             filepath = slide_dir / filename
 
             if filepath.exists():
                 logger.info(f"{Fore.YELLOW}已存在: %s/%s", slide_dir_name, filename)
-                downloaded += 1
+                done += 1
                 total_size += filepath.stat().st_size
                 continue
 
             try:
                 await self._download_file(url, filepath, kwargs)
-                downloaded += 1
+                done += 1
                 total_size += filepath.stat().st_size
             except Exception as exc:
-                logger.warning("Failed to download slide %d/%d: %s", i + 1, len(urls), exc)
+                logger.warning("Failed to download %s %s: %s", label, filename, exc)
 
         logger.info(
-            f"{Fore.GREEN}{Style.BRIGHT}[DONE] 图文下载完成: %s (%d/%d %s, %.1f MB)",
-            slide_dir_name, downloaded, len(urls), content_type, total_size / 1_000_000,
+            f"{Fore.GREEN}{Style.BRIGHT}[DONE] 图文下载完成: %s "
+            f"(%d图片+%d动图, %.1f MB)",
+            slide_dir_name, len(static_urls), len(video_urls),
+            total_size / 1_000_000,
         )
 
         return {
             "success": True,
             "filepath": str(slide_dir),
-            "title": f"{title} [图文 {downloaded}/{len(urls)}{content_type}]",
+            "title": f"{title} [图文 {len(static_urls)}图+{len(video_urls)}动图]",
             "error": None,
         }
 
