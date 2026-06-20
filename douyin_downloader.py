@@ -121,8 +121,9 @@ class DouyinDownloader:
 
         # ── Slideshow / 图文 ────────────────────────────────────────
         if not play_urls and images:
+            images_video = data.get("images_video", [])
             return await self._download_slideshow(
-                images, data, aweme_id, download_dir, kwargs,
+                images, images_video, data, aweme_id, download_dir, kwargs,
             )
 
         # ── No playable content ────────────────────────────────────
@@ -202,10 +203,17 @@ class DouyinDownloader:
         }
 
     async def _download_slideshow(
-        self, images: list, data: dict, aweme_id: str,
+        self, images: list, images_video: list, data: dict, aweme_id: str,
         download_dir: Path, kwargs: dict,
     ) -> dict:
-        """Download all images from a 图文 (slideshow) post."""
+        """Download slideshow content — prefers animated video clips over static images.
+
+        Douyin slideshows return both:
+          - images: static .webp images
+          - images_video: short .mp4 clips (the animated version shown in-app)
+
+        We prefer images_video when available.
+        """
         title = data.get("desc") or data.get("nickname") or "Douyin Slideshow"
 
         # Build save path
@@ -228,26 +236,33 @@ class DouyinDownloader:
         slide_dir = base_dir / slide_dir_name
         slide_dir.mkdir(parents=True, exist_ok=True)
 
-        # Determine image extension from first URL
-        first_url = images[0] if isinstance(images[0], str) else ""
-        ext = ".webp"
-        if ".jpg" in first_url or ".jpeg" in first_url:
-            ext = ".jpg"
-        elif ".png" in first_url:
-            ext = ".png"
+        # ── Prefer animated video clips ────────────────────────────
+        if images_video:
+            urls = [u for u in images_video if isinstance(u, str)]
+            ext = ".mp4"
+            content_type = "动图"
+        else:
+            urls = [u for u in images if isinstance(u, str)]
+            ext = ".webp"
+            if urls:
+                first = urls[0]
+                if ".jpg" in first or ".jpeg" in first:
+                    ext = ".jpg"
+                elif ".png" in first:
+                    ext = ".png"
+            content_type = "图片"
+
+        if not urls:
+            return self._error("图文内容为空，无法下载")
 
         logger.info(
-            "Downloading %d slideshow images to %s",
-            len(images), slide_dir,
+            "Downloading %d slideshow %s to %s",
+            len(urls), content_type, slide_dir,
         )
 
         downloaded = 0
         total_size = 0
-        for i, img_url in enumerate(images):
-            if not isinstance(img_url, str):
-                logger.warning("Skipping non-string image entry at index %d: %s", i, type(img_url))
-                continue
-
+        for i, url in enumerate(urls):
             filename = f"{i + 1:02d}{ext}"
             filepath = slide_dir / filename
 
@@ -258,21 +273,21 @@ class DouyinDownloader:
                 continue
 
             try:
-                await self._download_file(img_url, filepath, kwargs)
+                await self._download_file(url, filepath, kwargs)
                 downloaded += 1
                 total_size += filepath.stat().st_size
             except Exception as exc:
-                logger.warning("Failed to download slide %d/%d: %s", i + 1, len(images), exc)
+                logger.warning("Failed to download slide %d/%d: %s", i + 1, len(urls), exc)
 
         logger.info(
-            f"{Fore.GREEN}{Style.BRIGHT}[DONE] 图文下载完成: %s (%d/%d 张, %.1f MB)",
-            slide_dir_name, downloaded, len(images), total_size / 1_000_000,
+            f"{Fore.GREEN}{Style.BRIGHT}[DONE] 图文下载完成: %s (%d/%d %s, %.1f MB)",
+            slide_dir_name, downloaded, len(urls), content_type, total_size / 1_000_000,
         )
 
         return {
             "success": True,
             "filepath": str(slide_dir),
-            "title": f"{title} [图文 {downloaded}/{len(images)}P]",
+            "title": f"{title} [图文 {downloaded}/{len(urls)}{content_type}]",
             "error": None,
         }
 
