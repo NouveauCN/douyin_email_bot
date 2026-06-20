@@ -45,3 +45,13 @@ bot:
     cookie_update: "更新cookie"
     # "自动获取cookie" — auto-extract from browser on this machine
     cookie_auto: "自动获取cookie"
+
+# Headless Firefox cookie extraction (optional)
+cookie_extractor:
+  # Firefox profile directory for persistent cookies
+  # Leave empty to use default: ~/.wechat_video_download/firefox_profile/
+  profile_dir: ""
+  # Use headless mode (no visible browser window)
+  headless: true
+  # Validate extracted cookies by testing against douyin.com
+  validate: true

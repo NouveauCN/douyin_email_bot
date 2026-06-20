@@ -1,8 +1,8 @@
-__pycache__/
 .venv/
-downloads/
-logs/
+__pycache__/
 *.pyc
-douyin_users.db
-douyin_videos.db
 .env
+downloads/
+firefox_profile/
+logs/
+douyin_users.db

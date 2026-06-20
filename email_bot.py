@@ -16,6 +16,7 @@ from email.header import decode_header
 from email.mime.text import MIMEText
 from pathlib import Path
 
+from colorama import Fore, Style
 from douyin_downloader import DouyinDownloader
 from url_extractor import UrlExtractor
 
@@ -23,8 +24,6 @@ logger = logging.getLogger("EmailBot")
 
 _ADDR_RE = re.compile(r"<([^>]+)>")
 
-# Cookie domain filter for browser extraction
-_DOUYIN_COOKIE_DOMAINS = {".douyin.com", "douyin.com", "www.douyin.com"}
 
 
 class EmailBot:
@@ -134,7 +133,7 @@ class EmailBot:
             _mark_seen(mail, msg_id)
             return
 
-        logger.info("收到下载请求: %s", sender)
+        logger.info(f"{Fore.CYAN}收到下载请求: %s", sender)
 
         # Cooldown
         now = time.time()
@@ -150,15 +149,63 @@ class EmailBot:
         if result["success"]:
             self._cooldowns[sender] = time.time()
             filepath = result["filepath"] or "未知路径"
+            logger.info(
+                f"{Fore.GREEN}{Style.BRIGHT}[DONE] 下载成功: %s -> %s",
+                result["title"],
+                filepath,
+            )
             self._send_reply(
                 cfg, sender,
                 f"下载完成！\n标题：{result['title']}\n保存位置：{filepath}",
             )
         else:
             error_msg = result["error"]
-            # If the error mentions cookie, hint the user
-            if "cookie" in error_msg.lower():
-                error_msg += "\n\n提示：发送主题含「更新cookie」的邮件并粘贴新 cookie 即可更新。"
+            # ── Auto-refresh cookie and retry once ──────────────────
+            is_cookie_issue = (
+                "删" in error_msg
+                or "私密" in error_msg
+                or "cookie" in error_msg.lower()
+                or "异常" in error_msg
+            )
+            if is_cookie_issue:
+                logger.info("Attempting auto cookie refresh from Firefox profile...")
+                refreshed_cookie, refresh_msg = _try_extract_cookie(
+                    profile_dir=self.config.cookie_extractor.profile_dir or None,
+                )
+                if refreshed_cookie and refreshed_cookie != self.downloader.config.cookie:
+                    # Hot-reload new cookie and retry
+                    self.downloader.config.cookie = refreshed_cookie
+                    os.environ["DOUYIN_COOKIE"] = refreshed_cookie
+                    _write_env(self._project_dir / ".env", "DOUYIN_COOKIE", refreshed_cookie)
+                    logger.info(
+                        "Cookie refreshed (%d chars → %d chars), retrying download...",
+                        len(self.config.douyin.cookie), len(refreshed_cookie),
+                    )
+                    retry_result = self.downloader.download(url)
+                    if retry_result["success"]:
+                        self._cooldowns[sender] = time.time()
+                        filepath = retry_result["filepath"] or "未知路径"
+                        logger.info(
+                            f"{Fore.GREEN}{Style.BRIGHT}[DONE] 下载成功 (cookie 刷新后): %s -> %s",
+                            retry_result["title"],
+                            filepath,
+                        )
+                        self._send_reply(
+                            cfg, sender,
+                            f"下载完成！（cookie 已自动刷新）\n标题：{retry_result['title']}\n保存位置：{filepath}",
+                        )
+                        _mark_seen(mail, msg_id)
+                        return
+                    else:
+                        logger.warning("Retry after cookie refresh also failed: %s", retry_result["error"])
+                        error_msg += f"\n（已尝试自动刷新 cookie 并重试，仍失败）"
+
+            # Build helpful hints
+            error_msg += (
+                "\n\n解决方案："
+                "\n1. 发送主题含「更新cookie」的邮件，正文粘贴浏览器中获取的完整 cookie"
+                "\n2. 发送主题含「自动获取cookie」的邮件，让机器人从 Firefox 配置文件提取"
+            )
             self._send_reply(cfg, sender, f"下载失败：{error_msg}")
 
         _mark_seen(mail, msg_id)
@@ -201,28 +248,29 @@ class EmailBot:
         _mark_seen(mail, msg_id)
 
     def _handle_cookie_auto(self, mail, msg_id, cfg, sender, body) -> None:
-        """Try to auto-extract cookie from browsers on this machine."""
-        self._send_reply(cfg, sender, "正在尝试从浏览器自动获取 cookie，请稍候...")
+        """Try to auto-extract cookie via headless Playwright Firefox."""
+        self._send_reply(cfg, sender, "正在尝试自动获取 cookie（无头 Firefox）...")
 
-        # Try browsers in order of success probability on Windows
-        cookie_str = _try_extract_cookie()
+        cookie_str, status_msg = _try_extract_cookie(
+            profile_dir=self.config.cookie_extractor.profile_dir or None,
+        )
 
         if cookie_str:
             ok = _write_env(self._project_dir / ".env", "DOUYIN_COOKIE", cookie_str)
             if ok:
                 self.downloader.config.cookie = cookie_str
                 os.environ["DOUYIN_COOKIE"] = cookie_str
-                logger.info("Cookie auto-extracted (%d chars)", len(cookie_str))
+                logger.info("Cookie auto-extracted (%d chars): %s", len(cookie_str), status_msg)
                 self._send_reply(
                     cfg, sender,
-                    f"Cookie 已自动获取并更新！（{len(cookie_str)} 字符）\n来源：浏览器自动提取",
+                    f"Cookie 已自动获取并更新！（{len(cookie_str)} 字符）\n来源：{status_msg}",
                 )
             else:
                 self._send_reply(cfg, sender, "Cookie 已提取但写入 .env 失败，请检查文件权限。")
         else:
             self._send_reply(
                 cfg, sender,
-                "自动获取失败：未找到已登录抖音的浏览器。\n\n"
+                f"自动获取失败：{status_msg}\n\n"
                 "方案一：在宿主机终端运行 uv run python get_cookie.py\n"
                 "方案二：发送主题含「更新cookie」的邮件，正文粘贴 document.cookie 的输出。",
             )
@@ -326,38 +374,15 @@ def _write_env(env_path: Path, key: str, value: str) -> bool:
 
 # ── Browser cookie extraction ─────────────────────────────────────
 
-def _try_extract_cookie() -> str | None:
-    """Try to extract douyin.com cookies from installed browsers.
+def _try_extract_cookie(profile_dir: Path | None = None) -> tuple[str | None, str]:
+    """Extract douyin.com cookies via headless Playwright Firefox.
 
-    Tries Firefox first (simpler cookie storage, no encryption),
-    then Chrome, then Edge. Returns a semicolon-joined cookie string
-    or None if all browsers fail.
+    Args:
+        profile_dir: Firefox profile directory (None = use default).
+
+    Returns:
+        (cookie_string_or_None, status_message).
     """
-    try:
-        import browser_cookie3  # type: ignore[import-untyped]
-    except ImportError:
-        logger.warning("browser_cookie3 not available")
-        return None
+    from cookie_extractor import extract_cookies  # noqa: E402
 
-    # Order: Firefox first on Windows (least likely to encrypt),
-    # then Chrome, then Edge
-    browsers = [
-        ("Firefox", "firefox"),
-        ("Chrome", "chrome"),
-        ("Edge", "edge"),
-    ]
-
-    for name, browser_key in browsers:
-        try:
-            cj = getattr(browser_cookie3, browser_key)()
-            cookies = []
-            for c in cj:
-                if c.domain in _DOUYIN_COOKIE_DOMAINS:
-                    cookies.append(f"{c.name}={c.value}")
-            if cookies:
-                logger.info("Extracted %d douyin cookies from %s", len(cookies), name)
-                return "; ".join(cookies)
-        except Exception as e:
-            logger.debug("Failed to extract cookies from %s: %s", name, e)
-
-    return None
+    return extract_cookies(profile_dir=profile_dir, headless=True, validate=True)

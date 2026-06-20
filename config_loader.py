@@ -63,12 +63,22 @@ class BotConfig:
 
 
 @dataclass
+class CookieExtractorConfig:
+    """Headless Firefox cookie extraction settings."""
+
+    profile_dir: str = ""      # empty = use default ~/.wechat_video_download/firefox_profile/
+    headless: bool = True      # run browser in headless mode
+    validate: bool = True      # validate cookies after extraction
+
+
+@dataclass
 class AppConfig:
     """Top-level application config."""
 
     email: EmailConfig
     douyin: DouyinConfig
     bot: BotConfig
+    cookie_extractor: CookieExtractorConfig
 
 
 def load_config(path: Path) -> AppConfig:
@@ -120,4 +130,14 @@ def load_config(path: Path) -> AppConfig:
         commands=bot_commands,
     )
 
-    return AppConfig(email=email, douyin=douyin, bot=bot)
+    # ── Cookie Extractor ──
+    extractor_raw = raw.get("cookie_extractor", {})
+    cookie_extractor = CookieExtractorConfig(
+        profile_dir=extractor_raw.get("profile_dir", ""),
+        headless=extractor_raw.get("headless", True),
+        validate=extractor_raw.get("validate", True),
+    )
+
+    return AppConfig(
+        email=email, douyin=douyin, bot=bot, cookie_extractor=cookie_extractor
+    )

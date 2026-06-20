@@ -1,16 +1,19 @@
-"""Douyin video downloader — wraps F2's async API behind a sync interface.
+"""Douyin video & slideshow downloader — wraps F2's async API behind a sync interface.
 
-Fetches video metadata via F2, then downloads the video directly
-using httpx to avoid F2's user-profile API (which often fails with
-browser-exported cookies that lack httpOnly fields).
+Fetches metadata via F2, then downloads the content directly using httpx.
+Supports:
+  - Regular videos (media_type=4)
+  - Slideshows / 图文 (media_type=42, aweme_type=68)
 """
 
 import asyncio
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 
 import httpx
+from colorama import Fore, Style
 from f2.apps.douyin.handler import DouyinHandler
 from f2.apps.douyin.utils import AwemeIdFetcher
 from f2.exceptions import (
@@ -21,15 +24,6 @@ from f2.exceptions import (
 )
 
 logger = logging.getLogger("DouyinDownloader")
-
-
-def _silence_f2_loggers() -> None:
-    """Suppress noisy F2/httpx loggers that get reconfigured on each call."""
-    for name in ("httpx", "httpcore", "f2", "browser_cookie3", "urllib3"):
-        lg = logging.getLogger(name)
-        lg.setLevel(logging.WARNING)
-        lg.handlers.clear()
-        lg.propagate = False
 
 
 class DouyinDownloader:
@@ -57,6 +51,21 @@ class DouyinDownloader:
                 "title": None,
                 "error": "未配置 Douyin cookie，请在 .env 中设置 DOUYIN_COOKIE",
             }
+
+        # ── Quick cookie quality pre-check ──────────────────────────
+        cookie_len = len(self.config.cookie)
+        auth_indicators = ["sessionid", "passport_csrf_token", "odin_tt", "uid"]
+        has_auth = any(k in self.config.cookie for k in auth_indicators)
+        if cookie_len < 500 and not has_auth:
+            logger.warning(
+                "Cookie looks too short (%d chars) and lacks auth tokens — "
+                "download will likely fail",
+                cookie_len,
+            )
+        logger.debug(
+            "Cookie: %d chars, has_auth_tokens=%s",
+            cookie_len, has_auth,
+        )
 
         download_dir = Path(self.config.download_path)
         download_dir.mkdir(parents=True, exist_ok=True)
@@ -91,10 +100,6 @@ class DouyinDownloader:
     async def _download_async(self, kwargs: dict, download_dir: Path) -> dict:
         """Fetch metadata via F2, then download directly via httpx."""
 
-        # F2 reconfigures its loggers when DouyinHandler is instantiated;
-        # suppress again so the user doesn't see Bark/HTTP noise.
-        _silence_f2_loggers()
-
         handler = DouyinHandler(kwargs | {"mode": "one", "path": str(download_dir),
                                           "naming": self.config.naming,
                                           "folderize": self.config.folderize,
@@ -109,11 +114,49 @@ class DouyinDownloader:
         video_data = await handler.fetch_one_video(aweme_id)
         data = video_data._to_dict()
 
-        # Step 3: Get the best available video URL
+        # Step 3: Decide media type — video, slideshow, or error
         play_urls = data.get("video_play_addr", [])
-        if not play_urls:
-            return self._error("视频链接已被作者删除或设为私密")
+        images = data.get("images", [])
+        media_type = data.get("media_type", -1)
 
+        # ── Slideshow / 图文 ────────────────────────────────────────
+        if not play_urls and images:
+            return await self._download_slideshow(
+                images, data, aweme_id, download_dir, kwargs,
+            )
+
+        # ── No playable content ────────────────────────────────────
+        if not play_urls:
+            # ── Diagnostic: log what the API did return ────────────
+            api_status = data.get("api_status_code", "N/A")
+            is_delete = data.get("is_delete", "N/A")
+            is_prohibited = data.get("is_prohibited", "N/A")
+            private_status = data.get("private_status", "N/A")
+
+            logger.warning(
+                "No video_play_addr or images for aweme_id=%s — "
+                "api_status=%s, media_type=%s, is_delete=%s, "
+                "is_prohibited=%s, private=%s, cookie_len=%d",
+                aweme_id, api_status, media_type, is_delete,
+                is_prohibited, private_status, len(kwargs.get("cookie", "")),
+            )
+
+            # Build a human-readable reason from the API flags
+            if is_delete is True or is_delete == 1:
+                return self._error("视频已被作者删除")
+            if is_prohibited is True or is_prohibited == 1:
+                return self._error("视频被平台屏蔽（违规或审核中）")
+            if private_status is True or private_status == 1:
+                return self._error("视频已设为私密，仅作者可见")
+            if api_status not in (None, 0, "0") and api_status != "N/A":
+                return self._error(f"抖音接口返回异常 (status={api_status})")
+
+            # Generic fallback
+            return self._error(
+                "视频链接已被作者删除或设为私密"
+            )
+
+        # ── Regular video ──────────────────────────────────────────
         video_url = play_urls[0]
 
         # Step 4: Build output filename
@@ -142,15 +185,94 @@ class DouyinDownloader:
 
         # Step 5: Download
         if filepath.exists():
-            logger.info("已存在: %s", filepath.name)
+            logger.info(f"{Fore.YELLOW}已存在: %s", filepath.name)
         else:
             await self._download_file(video_url, filepath, kwargs)
-            logger.info("下载完成: %s (%.1f MB)", filepath.name, filepath.stat().st_size / 1_000_000)
+            logger.info(
+                f"{Fore.GREEN}{Style.BRIGHT}[DONE] 下载完成: %s (%.1f MB)",
+                filepath.name,
+                filepath.stat().st_size / 1_000_000,
+            )
 
         return {
             "success": True,
             "filepath": str(filepath),
             "title": title,
+            "error": None,
+        }
+
+    async def _download_slideshow(
+        self, images: list, data: dict, aweme_id: str,
+        download_dir: Path, kwargs: dict,
+    ) -> dict:
+        """Download all images from a 图文 (slideshow) post."""
+        title = data.get("desc") or data.get("nickname") or "Douyin Slideshow"
+
+        # Build save path
+        create_time = data.get("create_time", "")
+        if create_time:
+            try:
+                date_str = datetime.strptime(str(create_time)[:10], "%Y-%m-%d").strftime("%Y%m%d")
+            except ValueError:
+                date_str = "unknown"
+        else:
+            date_str = "unknown"
+
+        if self.config.folderize and data.get("nickname"):
+            author_dir = _sanitize_filename(data["nickname"])[:50]
+            base_dir = download_dir / author_dir
+        else:
+            base_dir = download_dir
+
+        slide_dir_name = f"{date_str}_{aweme_id}_slides"
+        slide_dir = base_dir / slide_dir_name
+        slide_dir.mkdir(parents=True, exist_ok=True)
+
+        # Determine image extension from first URL
+        first_url = images[0] if isinstance(images[0], str) else ""
+        ext = ".webp"
+        if ".jpg" in first_url or ".jpeg" in first_url:
+            ext = ".jpg"
+        elif ".png" in first_url:
+            ext = ".png"
+
+        logger.info(
+            "Downloading %d slideshow images to %s",
+            len(images), slide_dir,
+        )
+
+        downloaded = 0
+        total_size = 0
+        for i, img_url in enumerate(images):
+            if not isinstance(img_url, str):
+                logger.warning("Skipping non-string image entry at index %d: %s", i, type(img_url))
+                continue
+
+            filename = f"{i + 1:02d}{ext}"
+            filepath = slide_dir / filename
+
+            if filepath.exists():
+                logger.info(f"{Fore.YELLOW}已存在: %s/%s", slide_dir_name, filename)
+                downloaded += 1
+                total_size += filepath.stat().st_size
+                continue
+
+            try:
+                await self._download_file(img_url, filepath, kwargs)
+                downloaded += 1
+                total_size += filepath.stat().st_size
+            except Exception as exc:
+                logger.warning("Failed to download slide %d/%d: %s", i + 1, len(images), exc)
+
+        logger.info(
+            f"{Fore.GREEN}{Style.BRIGHT}[DONE] 图文下载完成: %s (%d/%d 张, %.1f MB)",
+            slide_dir_name, downloaded, len(images), total_size / 1_000_000,
+        )
+
+        return {
+            "success": True,
+            "filepath": str(slide_dir),
+            "title": f"{title} [图文 {downloaded}/{len(images)}P]",
             "error": None,
         }
 
