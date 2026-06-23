@@ -83,10 +83,7 @@ class EmailBot:
             for msg_id in msg_ids:
                 self._process_email(mail, msg_id, cfg, bot_cfg)
         finally:
-            try:
-                mail.logout()
-            except Exception:
-                pass
+            self._safe_logout(mail)
 
     def _process_email(self, mail, msg_id: bytes, cfg, bot_cfg) -> None:
         status, data = mail.fetch(msg_id, "(RFC822)")
@@ -297,8 +294,32 @@ class EmailBot:
     def _imap_connect(self, cfg):
         logger.debug("Connecting to IMAP %s:%d", cfg.imap_server, cfg.imap_port)
         mail = imaplib.IMAP4_SSL(cfg.imap_server, cfg.imap_port)
+        # Set a socket timeout so broken connections don't hang the bot.
+        # 30s is enough for normal IMAP operations but prevents infinite hangs
+        # when the remote side has torn down the connection (SSL EOF, timeout).
+        mail.socket().settimeout(30)
         mail.login(cfg.email, cfg.password)
         return mail
+
+    @staticmethod
+    def _safe_logout(mail) -> None:
+        """Close the IMAP socket directly without protocol-level LOGOUT.
+
+        After a network error (SSL EOF, timeout), the TCP connection is
+        already broken.  Calling mail.logout() would try to send LOGOUT
+        and then block in recv() waiting for a server response that will
+        never arrive — freezing the entire bot.
+
+        Instead, we shut down the underlying socket at the TCP level
+        (no server response needed) and let the OS clean up.
+        """
+        try:
+            sock = mail.socket()
+            # SHUT_RDWR sends TCP FIN — no protocol exchange, never blocks
+            sock.shutdown(2)  # 2 = SHUT_RDWR
+            sock.close()
+        except Exception:
+            pass
 
     def _send_reply(self, cfg, to_addr: str, body: str) -> None:
         msg = MIMEText(body, "plain", "utf-8")

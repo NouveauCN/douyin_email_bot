@@ -18,7 +18,7 @@ import httpx
 
 logger = logging.getLogger("CookieExtractor")
 
-DEFAULT_PROFILE_DIR = Path.home() / ".wechat_video_download" / "firefox_profile"
+DEFAULT_PROFILE_DIR = Path.home() / ".douyin_email_bot" / "firefox_profile"
 DOUYIN_DOMAINS = frozenset({".douyin.com", "douyin.com", "www.douyin.com"})
 DOUYIN_HOMEPAGE = "https://www.douyin.com/"
 
@@ -218,7 +218,7 @@ def extract_cookies(
     and extracts cookies from the browser context.
 
     Args:
-        profile_dir: Firefox profile directory (default: ~/.wechat_video_download/firefox_profile).
+        profile_dir: Firefox profile directory (default: ~/.douyin_email_bot/firefox_profile).
         headless: True for headless, False for interactive login.
         validate: If True, test cookie validity against douyin.com.
 

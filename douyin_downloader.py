@@ -206,15 +206,14 @@ class DouyinDownloader:
         self, images: list, images_video: list, data: dict, aweme_id: str,
         download_dir: Path, kwargs: dict,
     ) -> dict:
-        """Download both static images AND animated video clips from a 图文 post.
+        """Download static images + animated video clips from a 图文 post.
 
-        Douyin slideshows return:
-          - images: static .webp images
-          - images_video: short .mp4 clips (animated version shown in-app)
+        Static images (.webp/.jpg/.png) → downloads/slides/
+        Animated clips (.mp4) → downloads/<author>/ (same as regular videos)
         """
         title = data.get("desc") or data.get("nickname") or "Douyin Slideshow"
 
-        # Build save path
+        # Build save paths
         create_time = data.get("create_time", "")
         if create_time:
             try:
@@ -224,18 +223,13 @@ class DouyinDownloader:
         else:
             date_str = "unknown"
 
-        if self.config.folderize and data.get("nickname"):
-            author_dir = _sanitize_filename(data["nickname"])[:50]
-            base_dir = download_dir / author_dir
-        else:
-            base_dir = download_dir
+        prefix = f"{date_str}_{aweme_id}"
 
-        slide_dir_name = f"{date_str}_{aweme_id}_slides"
-        slide_dir = base_dir / slide_dir_name
-        slide_dir.mkdir(parents=True, exist_ok=True)
+        # Static images → slides/
+        slides_dir = download_dir / "slides"
+        slides_dir.mkdir(parents=True, exist_ok=True)
 
         # ── Build download queues ──────────────────────────────────
-        # Static images
         static_urls = [u for u in images if isinstance(u, str)]
         static_ext = ".webp"
         if static_urls:
@@ -245,31 +239,55 @@ class DouyinDownloader:
             elif ".png" in first:
                 static_ext = ".png"
 
-        # Animated video clips
         video_urls = [u for u in images_video if isinstance(u, str)]
 
-        # Flatten into a single download list: (url, save_name, label)
-        downloads: list[tuple[str, str, str]] = []
+        # Animated clips → author folder (same logic as videos)
+        # Only create the author directory if there are actually clips to put there.
+        if video_urls and self.config.folderize and data.get("nickname"):
+            author_dir = _sanitize_filename(data["nickname"])[:50]
+            video_dir = download_dir / author_dir
+        else:
+            video_dir = download_dir
+        if video_urls:
+            video_dir.mkdir(parents=True, exist_ok=True)
+
+        # (url, filepath, label)
+        downloads: list[tuple[str, Path, str]] = []
+
+        # Static images → slides/{prefix}_{NN}.ext
         for i, url in enumerate(static_urls):
-            downloads.append((url, f"{i + 1:02d}{static_ext}", "图片"))
+            fname = f"{prefix}_{i + 1:02d}{static_ext}"
+            downloads.append((url, slides_dir / fname, "图片"))
+
+        # Animated clips → <author>/{prefix}.mp4 (or {prefix}_{NN}.mp4 if multiple)
         for i, url in enumerate(video_urls):
-            downloads.append((url, f"{i + 1:02d}.mp4", "动图"))
+            if len(video_urls) == 1:
+                fname = f"{prefix}.mp4"
+            else:
+                fname = f"{prefix}_{i + 1:02d}.mp4"
+            downloads.append((url, video_dir / fname, "动图"))
 
         if not downloads:
             return self._error("图文内容为空，无法下载")
 
+        # Determine the human-readable target dir for logging/return
+        if video_urls and video_dir != download_dir:
+            target_label = video_dir.name
+        elif video_urls:
+            target_label = "downloads"
+        else:
+            target_label = "slides"
+
         logger.info(
-            "Downloading slideshow: %d 图片 + %d 动图 to %s",
-            len(static_urls), len(video_urls), slide_dir,
+            "Downloading slideshow: %d 图片 -> slides/, %d 动图 -> %s/",
+            len(static_urls), len(video_urls), target_label,
         )
 
         done = 0
         total_size = 0
-        for url, filename, label in downloads:
-            filepath = slide_dir / filename
-
+        for url, filepath, label in downloads:
             if filepath.exists():
-                logger.info(f"{Fore.YELLOW}已存在: %s/%s", slide_dir_name, filename)
+                logger.info(f"{Fore.YELLOW}已存在: %s", filepath)
                 done += 1
                 total_size += filepath.stat().st_size
                 continue
@@ -279,18 +297,18 @@ class DouyinDownloader:
                 done += 1
                 total_size += filepath.stat().st_size
             except Exception as exc:
-                logger.warning("Failed to download %s %s: %s", label, filename, exc)
+                logger.warning("Failed to download %s %s: %s", label, filepath.name, exc)
 
         logger.info(
             f"{Fore.GREEN}{Style.BRIGHT}[DONE] 图文下载完成: %s "
             f"(%d图片+%d动图, %.1f MB)",
-            slide_dir_name, len(static_urls), len(video_urls),
+            prefix, len(static_urls), len(video_urls),
             total_size / 1_000_000,
         )
 
         return {
             "success": True,
-            "filepath": str(slide_dir),
+            "filepath": str(slides_dir if not video_urls else video_dir),
             "title": f"{title} [图文 {len(static_urls)}图+{len(video_urls)}动图]",
             "error": None,
         }

@@ -1,5 +1,5 @@
 [project]
-name = "wechat-video-download"
+name = "douyin-email-bot"
 version = "0.2.0"
 description = "Email bot that downloads Douyin videos from shared links"
 requires-python = ">=3.10"

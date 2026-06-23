@@ -105,13 +105,52 @@ from email_bot import EmailBot  # noqa: E402
 
 
 def setup_logging() -> None:
-    """Configure root logger for our own output."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout)],
+    """Configure root logger with file + optional console output.
+
+    File output always goes to logs/bot.log with ANSI codes stripped.
+    Console output is only attached when running interactively (TTY).
+    """
+    import re
+    from logging.handlers import RotatingFileHandler
+
+    class _AnsiStrippingFormatter(logging.Formatter):
+        """Strips colorama ANSI escape sequences for clean file output."""
+        _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+        def format(self, record: logging.LogRecord) -> str:
+            msg = super().format(record)
+            return self._ANSI_RE.sub("", msg)
+
+    # Ensure log directory exists
+    log_dir = Path(__file__).parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+
+    # File handler — always present, DEBUG level, ANSI-stripped
+    file_handler = RotatingFileHandler(
+        log_dir / "bot.log",
+        maxBytes=10 * 1024 * 1024,  # 10 MB
+        backupCount=5,
+        encoding="utf-8",
     )
+    file_handler.setFormatter(_AnsiStrippingFormatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    file_handler.setLevel(logging.DEBUG)
+
+    handlers: list[logging.Handler] = [file_handler]
+
+    # Console handler — only when running in an interactive terminal
+    if sys.stdout.isatty():
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+        console_handler.setLevel(logging.INFO)
+        handlers.append(console_handler)
+
+    logging.basicConfig(level=logging.DEBUG, handlers=handlers)
 
 
 def main() -> None:

@@ -49,7 +49,7 @@ bot:
 # Headless Firefox cookie extraction (optional)
 cookie_extractor:
   # Firefox profile directory for persistent cookies
-  # Leave empty to use default: ~/.wechat_video_download/firefox_profile/
+  # Leave empty to use default: ~/.douyin_email_bot/firefox_profile/
   profile_dir: ""
   # Use headless mode (no visible browser window)
   headless: true

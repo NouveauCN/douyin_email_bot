@@ -66,7 +66,7 @@ class BotConfig:
 class CookieExtractorConfig:
     """Headless Firefox cookie extraction settings."""
 
-    profile_dir: str = ""      # empty = use default ~/.wechat_video_download/firefox_profile/
+    profile_dir: str = ""      # empty = use default ~/.douyin_email_bot/firefox_profile/
     headless: bool = True      # run browser in headless mode
     validate: bool = True      # validate cookies after extraction
 
@@ -106,8 +106,13 @@ def load_config(path: Path) -> AppConfig:
 
     # ── Douyin ──
     douyin_raw = raw.get("douyin", {})
+    # Resolve relative download_path against config.yaml's directory
+    # so downloads always land in the project tree regardless of CWD.
+    _dl_path = Path(douyin_raw.get("download_path", "./downloads"))
+    if not _dl_path.is_absolute():
+        _dl_path = path.parent / _dl_path
     douyin = DouyinConfig(
-        download_path=douyin_raw.get("download_path", "./downloads"),
+        download_path=str(_dl_path.resolve()),
         cookie=os.getenv("DOUYIN_COOKIE") or douyin_raw.get("cookie", ""),
         naming=douyin_raw.get("naming", "{create}_{aweme_id}"),
         folderize=douyin_raw.get("folderize", True),
