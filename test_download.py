@@ -25,10 +25,19 @@ _orig_brm_version = _DOUYIN_CCM.brm_version.__func__
 _orig_brm_browser = _DOUYIN_CCM.brm_browser.__func__
 _orig_brm_engine = _DOUYIN_CCM.brm_engine.__func__
 
+# Platform-aware fallback values (same as main.py)
+_PLATFORM = "Linux" if sys.platform.startswith("linux") else (
+    "Darwin" if sys.platform == "darwin" else "Windows"
+)
+_BROWSER_NAME = "Firefox" if _PLATFORM == "Linux" else "Edge"
+_BROWSER_PLATFORM = "Linux x86_64" if _PLATFORM == "Linux" else (
+    "MacIntel" if _PLATFORM == "Darwin" else "Win32"
+)
+
 @classmethod  # noqa: F811
 def _safe_brm_os(cls):
     v = _orig_brm_os(cls)
-    return v if isinstance(v, dict) else {"name": "Windows", "version": "10"}
+    return v if isinstance(v, dict) else {"name": _PLATFORM, "version": "10"}
 
 @classmethod
 def _safe_brm_version(cls):
@@ -38,8 +47,10 @@ def _safe_brm_version(cls):
 @classmethod
 def _safe_brm_browser(cls):
     v = _orig_brm_browser(cls)
-    return v if isinstance(v, dict) else {"name": "Edge", "version": "130.0.0.0",
-                                            "language": "zh-CN", "platform": "Win32"}
+    return v if isinstance(v, dict) else {
+        "name": _BROWSER_NAME, "version": "130.0.0.0",
+        "language": "zh-CN", "platform": _BROWSER_PLATFORM,
+    }
 
 @classmethod
 def _safe_brm_engine(cls):

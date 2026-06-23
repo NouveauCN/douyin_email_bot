@@ -19,6 +19,11 @@ douyin_email_bot/
 ├── config.yaml             # Non-sensitive settings (email server, bot behavior, etc.)
 ├── .env.example            # Template for secrets (EMAIL_ADDRESS, EMAIL_PASSWORD, DOUYIN_COOKIE)
 ├── pyproject.toml          # uv project — deps: f2, playwright, python-dotenv, pyyaml
+├── requirements.txt        # pip deps (for Docker builds)
+├── Dockerfile              # Ubuntu 26.04 + Playwright Firefox container
+├── docker-compose.yml      # bot + web_login services
+├── .dockerignore           # exclude non-Docker files from build context
+├── web_login.py            # Flask web service — QR login on port 8080
 ├── conf/
 │   ├── conf.yaml           # F2 runtime config — Bark disabled
 │   └── app.yaml            # F2 app config — empty Bark block
@@ -70,6 +75,54 @@ Stop-ScheduledTask -TaskName "DouyinEmailBot"     # Stop the bot
 Get-ScheduledTask -TaskName "DouyinEmailBot" | Format-List State, LastRunTime, LastTaskResult
 Get-Content logs\bot.log -Tail 50                  # View recent logs
 ```
+
+### Docker deployment (Ubuntu 26 LTS)
+
+Multi-service Docker Compose setup: a persistent bot + an on-demand web QR login service.
+
+**Build & start the bot:**
+```bash
+docker compose up -d bot
+```
+
+**QR login (when you need to re-authenticate with Douyin):**
+```bash
+docker compose --profile login up web_login
+# Open http://<host>:8080 → scan QR with Douyin app → cookie auto-saved to .env
+# Ctrl+C when done, then restart bot (or rely on ENV_AUTO_RELOAD=1)
+```
+
+**Teardown:**
+```bash
+docker compose down           # stop bot
+docker compose down -v        # also delete volumes (downloads, logs, profile)
+```
+
+**Architecture:**
+- `bot` service: `restart: unless-stopped`, long-lived poll loop
+- `web_login` service: `profiles: [login]`, on-demand Flask app on port 8080
+- Shared `firefox_profile` volume so web login + bot share persistent login state
+- `ENV_AUTO_RELOAD=1` enables `.env` mtime watching — bot picks up new cookie without restart
+
+**Docker env-var overrides** (all optional, with YAML fallbacks):
+| Env Var | Config Field |
+|---|---|
+| `DOUYIN_DOWNLOAD_PATH` | `douyin.download_path` |
+| `DOUYIN_TIMEOUT` | `douyin.timeout` |
+| `DOUYIN_MAX_RETRIES` | `douyin.max_retries` |
+| `EMAIL_POLL_INTERVAL` | `email.poll_interval` |
+| `BOT_ALLOWED_SENDERS` | `bot.allowed_senders` (comma-separated) |
+| `BOT_COOLDOWN_SECONDS` | `bot.cooldown_seconds` |
+| `COOKIE_PROFILE_DIR` | `cookie_extractor.profile_dir` |
+| `ENV_AUTO_RELOAD` | Enable `.env` mtime hot-reload (`1`/`true`/`yes`) |
+
+**Web login API** (`web_login.py`):
+| Route | Method | Purpose |
+|---|---|---|
+| `/` | GET | QR scanner UI (single-page HTML) |
+| `/api/qr` | GET | Launch headless Firefox, screenshot QR → `{qr_image, success}` |
+| `/api/status` | GET | Poll auth cookies → `{status, cookie_str, auth_count}` |
+| `/api/stop` | POST | Graceful shutdown |
 
 ### Entry point (`main.py`)
 
@@ -209,7 +262,7 @@ One-shot download of a hardcoded URL. Duplicates main.py's F2 monkey-patches (bo
 
 ## Known quirks & pitfalls
 
-1. **F2 monkey-patching is fragile.** The three patches in `main.py` target specific F2 0.0.1.7 bugs. Upgrading F2 may break or obsolete these patches. The `test_download.py` file duplicates the same patches — if you change one, change the other.
+1. **F2 monkey-patching is fragile.** The three patches in `main.py` target specific F2 0.0.1.7 bugs. Upgrading F2 may break or obsolete these patches. The `test_download.py` file duplicates the same patches — if you change one, change the other. The fallback values are platform-aware (detects `sys.platform` to send `"Linux"`/`"Windows"`/`"Darwin"` as OS name to Douyin's API).
 
 2. **Firefox-only cookie extraction.** `cookie_extractor.py` only supports Firefox (Playwright `p.firefox.launch_persistent_context`). Chrome/Edge would need different API (CDP-based extraction).
 

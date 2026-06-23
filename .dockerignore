@@ -1,0 +1,51 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Tests, tools, one-shot scripts
+test_download.py
+play.py
+migrate_downloads.py
+scripts/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Runtime data (mounted as volumes — don't bake into image)
+downloads/
+logs/
+firefox_profile/
+
+# Secrets (mounted or passed via env — never in the image)
+.env
+.env.example
+
+# Docs
+*.md
+CLAUDE.md
+
+# Docker files
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# uv lock (using pip in Docker)
+uv.lock
+
+# F2 config (auto-generated at container start)
+conf/

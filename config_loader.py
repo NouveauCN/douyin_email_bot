@@ -3,6 +3,19 @@
 Sensitive values (email password, douyin cookie) are loaded from
 environment variables (typically via .env file). All other settings
 come from config.yaml with sensible defaults.
+
+Priority: env var > YAML value > dataclass default.
+
+Docker env-var overrides:
+    DOUYIN_DOWNLOAD_PATH  — overrides douyin.download_path
+    DOUYIN_TIMEOUT        — overrides douyin.timeout
+    DOUYIN_MAX_RETRIES    — overrides douyin.max_retries
+    DOUYIN_MAX_TASKS      — overrides douyin.max_tasks
+    EMAIL_POLL_INTERVAL   — overrides email.poll_interval
+    BOT_ALLOWED_SENDERS   — overrides bot.allowed_senders (comma-separated)
+    BOT_COOLDOWN_SECONDS  — overrides bot.cooldown_seconds
+    BOT_SUBJECT_KEYWORD   — overrides bot.subject_keyword
+    COOKIE_PROFILE_DIR    — overrides cookie_extractor.profile_dir
 """
 
 import os
@@ -10,6 +23,29 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
+
+
+def _env_int(name: str, fallback: int) -> int:
+    val = os.getenv(name)
+    if val is not None and val.strip():
+        try:
+            return int(val)
+        except ValueError:
+            pass
+    return fallback
+
+
+def _env_str(name: str, fallback: str) -> str:
+    return os.getenv(name) or fallback
+
+
+def _parse_allowed_senders(value) -> list[str]:
+    """Parse allowed senders from env var (comma-separated) or YAML list."""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str) and value.strip():
+        return [s.strip() for s in value.split(",") if s.strip()]
+    return []
 
 
 @dataclass
@@ -85,9 +121,9 @@ def load_config(path: Path) -> AppConfig:
     """Load configuration from YAML file, with secrets from env vars.
 
     Priority:
-        1. Environment variables for secrets (EMAIL_ADDRESS, EMAIL_PASSWORD, DOUYIN_COOKIE)
-        2. YAML file values for the same fields (fallback)
-        3. Dataclass defaults for everything else
+        1. Environment variables (os.getenv) — highest
+        2. YAML file values for the same fields — fallback
+        3. Dataclass defaults — lowest
     """
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
@@ -101,14 +137,21 @@ def load_config(path: Path) -> AppConfig:
         smtp_port=email_raw.get("smtp_port", 587),
         email=os.getenv("EMAIL_ADDRESS") or email_raw.get("email", ""),
         password=os.getenv("EMAIL_PASSWORD") or email_raw.get("password", ""),
-        poll_interval=email_raw.get("poll_interval", 30),
+        poll_interval=_env_int(
+            "EMAIL_POLL_INTERVAL",
+            email_raw.get("poll_interval", 30),
+        ),
     )
 
     # ── Douyin ──
     douyin_raw = raw.get("douyin", {})
     # Resolve relative download_path against config.yaml's directory
     # so downloads always land in the project tree regardless of CWD.
-    _dl_path = Path(douyin_raw.get("download_path", "./downloads"))
+    # DOUYIN_DOWNLOAD_PATH env var takes precedence over YAML.
+    _dl_path = Path(_env_str(
+        "DOUYIN_DOWNLOAD_PATH",
+        douyin_raw.get("download_path", "./downloads"),
+    ))
     if not _dl_path.is_absolute():
         _dl_path = path.parent / _dl_path
     douyin = DouyinConfig(
@@ -116,9 +159,9 @@ def load_config(path: Path) -> AppConfig:
         cookie=os.getenv("DOUYIN_COOKIE") or douyin_raw.get("cookie", ""),
         naming=douyin_raw.get("naming", "{create}_{aweme_id}"),
         folderize=douyin_raw.get("folderize", True),
-        timeout=douyin_raw.get("timeout", 30),
-        max_retries=douyin_raw.get("max_retries", 3),
-        max_tasks=douyin_raw.get("max_tasks", 5),
+        timeout=_env_int("DOUYIN_TIMEOUT", douyin_raw.get("timeout", 30)),
+        max_retries=_env_int("DOUYIN_MAX_RETRIES", douyin_raw.get("max_retries", 3)),
+        max_tasks=_env_int("DOUYIN_MAX_TASKS", douyin_raw.get("max_tasks", 5)),
     )
 
     # ── Bot ──
@@ -129,16 +172,28 @@ def load_config(path: Path) -> AppConfig:
         cookie_auto=cmd_raw.get("cookie_auto", "自动获取cookie"),
     )
     bot = BotConfig(
-        allowed_senders=bot_raw.get("allowed_senders", []),
-        cooldown_seconds=bot_raw.get("cooldown_seconds", 5),
-        subject_keyword=bot_raw.get("subject_keyword", "下载"),
+        allowed_senders=_parse_allowed_senders(
+            os.getenv("BOT_ALLOWED_SENDERS")
+            or bot_raw.get("allowed_senders", [])
+        ),
+        cooldown_seconds=_env_int(
+            "BOT_COOLDOWN_SECONDS",
+            bot_raw.get("cooldown_seconds", 5),
+        ),
+        subject_keyword=_env_str(
+            "BOT_SUBJECT_KEYWORD",
+            bot_raw.get("subject_keyword", "下载"),
+        ),
         commands=bot_commands,
     )
 
     # ── Cookie Extractor ──
     extractor_raw = raw.get("cookie_extractor", {})
     cookie_extractor = CookieExtractorConfig(
-        profile_dir=extractor_raw.get("profile_dir", ""),
+        profile_dir=_env_str(
+            "COOKIE_PROFILE_DIR",
+            extractor_raw.get("profile_dir", ""),
+        ),
         headless=extractor_raw.get("headless", True),
         validate=extractor_raw.get("validate", True),
     )

@@ -10,6 +10,7 @@ Usage:
     cookie, msg = extract_cookies(headless=True)
 """
 
+import base64
 import logging
 from pathlib import Path
 from typing import Optional
@@ -263,3 +264,191 @@ def extract_cookies(
 def _has_login_state(profile_dir: Path) -> bool:
     """Check if the profile directory has signs of prior browser use."""
     return (profile_dir / "cookies.sqlite").exists()
+
+
+# ── QR code screenshot (for web login service) ─────────────────────
+
+def screenshot_qr_code(
+    profile_dir: Path,
+    timeout: int = 30000,
+) -> tuple[Optional[str], str]:
+    """Launch headless Firefox, navigate to douyin.com, screenshot the QR login element.
+
+    Args:
+        profile_dir: Firefox profile directory.
+        timeout: Navigation timeout in milliseconds.
+
+    Returns:
+        (base64_data_uri_or_None, status_message).
+        The base64 string is a ``data:image/png;base64,...`` URI ready for <img src>.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None, "Playwright 未安装"
+
+    profile_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with sync_playwright() as p:
+            browser = p.firefox.launch_persistent_context(
+                user_data_dir=str(profile_dir),
+                headless=True,
+                viewport={"width": 1280, "height": 720},
+            )
+            page = browser.pages[0] if browser.pages else browser.new_page()
+
+            try:
+                page.goto(
+                    DOUYIN_HOMEPAGE,
+                    wait_until="domcontentloaded",
+                    timeout=timeout,
+                )
+            except Exception:
+                pass  # page may have loaded enough for the QR to render
+
+            page.wait_for_timeout(3000)  # let JS render the login modal
+
+            # Try common QR element selectors (Douyin login modal)
+            qr_element = None
+            selectors = [
+                ".qrcode-img",
+                ".qrcode-image",
+                "img[class*='qrcode']",
+                "canvas[class*='qrcode']",
+                ".login-modal img",
+                "#qrcode img",
+                "img[src*='qrcode']",
+                "img[src*='qr_code']",
+            ]
+            for sel in selectors:
+                try:
+                    el = page.locator(sel).first
+                    if el.is_visible(timeout=1000):
+                        qr_element = el
+                        break
+                except Exception:
+                    continue
+
+            if qr_element:
+                screenshot_bytes = qr_element.screenshot(type="png")
+                logger.debug("QR element found via selector: %s", sel)
+            else:
+                # Fallback: screenshot the visible viewport
+                screenshot_bytes = page.screenshot(type="png", full_page=False)
+                logger.debug("QR element not found, using full viewport screenshot")
+
+            browser.close()
+
+        b64 = base64.b64encode(screenshot_bytes).decode("ascii")
+        return f"data:image/png;base64,{b64}", "QR code captured"
+
+    except Exception as exc:
+        logger.error("QR screenshot failed: %s", exc)
+        return None, f"浏览器错误: {exc}"
+
+
+def check_auth_cookies(profile_dir: Path) -> dict:
+    """Check whether the Firefox profile has valid Douyin auth cookies.
+
+    Launches a headless browser, reads cookies from the persistent profile,
+    and checks whether the user has logged in (QR code scanned in the Douyin app).
+
+    Args:
+        profile_dir: Firefox profile directory.
+
+    Returns:
+        Dict with keys:
+            status: "logged_in" | "expired" | "pending" | "error"
+            cookie_str: str | None  — semicolon-joined cookies (if logged_in)
+            auth_count: int  — number of recognised auth tokens found
+            message: str  — human-readable status
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return {
+            "status": "error", "cookie_str": None, "auth_count": 0,
+            "message": "Playwright 未安装",
+        }
+
+    profile_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with sync_playwright() as p:
+            browser = p.firefox.launch_persistent_context(
+                user_data_dir=str(profile_dir),
+                headless=True,
+                viewport={"width": 1280, "height": 720},
+            )
+            page = browser.pages[0] if browser.pages else browser.new_page()
+
+            try:
+                page.goto(
+                    DOUYIN_HOMEPAGE,
+                    wait_until="domcontentloaded",
+                    timeout=15000,
+                )
+            except Exception:
+                pass
+
+            # Check for QR expiry text on the page
+            page_text = ""
+            try:
+                page_text = page.inner_text("body")
+            except Exception:
+                pass
+
+            qr_expired = any(
+                kw in page_text
+                for kw in ["二维码已过期", "点击刷新", "请重新扫码"]
+            )
+
+            all_cookies = browser.cookies()
+            cookies_dict = {
+                c["name"]: c["value"]
+                for c in all_cookies
+                if c.get("domain", "") in DOUYIN_DOMAINS
+            }
+
+            auth_found = [
+                name for name in _AUTH_COOKIE_NAMES if name in cookies_dict
+            ]
+
+            browser.close()
+
+        if len(auth_found) >= 2:
+            cookie_str = "; ".join(
+                f"{k}={v}" for k, v in cookies_dict.items()
+            )
+            return {
+                "status": "logged_in",
+                "cookie_str": cookie_str,
+                "auth_count": len(auth_found),
+                "message": f"检测到登录态: {', '.join(auth_found[:3])}",
+            }
+
+        if qr_expired:
+            return {
+                "status": "expired",
+                "cookie_str": None,
+                "auth_count": 0,
+                "message": "二维码已过期，请刷新",
+            }
+
+        return {
+            "status": "pending",
+            "cookie_str": None,
+            "auth_count": len(auth_found),
+            "message": (
+                f"等待扫码... ({len(auth_found)} 个认证 token，需要 ≥2)"
+                if auth_found else "等待扫码..."
+            ),
+        }
+
+    except Exception as exc:
+        logger.error("Auth cookie check failed: %s", exc)
+        return {
+            "status": "error", "cookie_str": None, "auth_count": 0,
+            "message": f"浏览器错误: {exc}",
+        }

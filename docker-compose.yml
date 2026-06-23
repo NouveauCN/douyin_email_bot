@@ -1,0 +1,43 @@
+services:
+  bot:
+    build: .
+    container_name: douyin_email_bot
+    restart: unless-stopped
+    volumes:
+      - downloads:/app/downloads
+      - logs:/app/logs
+      - firefox_profile:/app/firefox_profile
+      - ./config.yaml:/app/config.yaml:ro
+      - ./.env:/app/.env
+    environment:
+      - DOUYIN_DOWNLOAD_PATH=/app/downloads
+      - COOKIE_PROFILE_DIR=/app/firefox_profile
+      - TZ=Asia/Shanghai
+      # Optional: enable .env auto-reload so bot picks up cookie
+      # changes without restart (requires web_login to write to .env)
+      - ENV_AUTO_RELOAD=1
+
+  web_login:
+    build: .
+    container_name: douyin_web_login
+    restart: "no"
+    ports:
+      - "8080:8080"
+    volumes:
+      - firefox_profile:/app/firefox_profile
+      - ./.env:/app/.env
+      - ./config.yaml:/app/config.yaml:ro
+    environment:
+      - COOKIE_PROFILE_DIR=/app/firefox_profile
+      - TZ=Asia/Shanghai
+    command: ["python3", "web_login.py"]
+    profiles:
+      - login
+
+volumes:
+  downloads:
+    driver: local
+  logs:
+    driver: local
+  firefox_profile:
+    driver: local

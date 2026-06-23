@@ -40,6 +40,16 @@ class EmailBot:
         self._project_dir = Path(__file__).parent
         self._seen_ids: set[str] = set()  # dedup across poll cycles
 
+        # Optional .env auto-reload (for Docker: web_login writes cookie → bot picks it up)
+        self._env_path = self._project_dir / ".env"
+        self._env_watch = os.getenv("ENV_AUTO_RELOAD", "").lower() in ("1", "true", "yes")
+        if self._env_watch:
+            try:
+                self._env_mtime: float = self._env_path.stat().st_mtime if self._env_path.exists() else 0.0
+            except OSError:
+                self._env_mtime = 0.0
+            logger.debug(".env auto-reload enabled")
+
     def run(self) -> None:
         cfg = self.config.email
         bot_cfg = self.config.bot
@@ -66,7 +76,31 @@ class EmailBot:
 
     # ── Poll cycle ────────────────────────────────────────────────
 
+    def _check_env_reload(self) -> None:
+        """If .env was modified externally (e.g. by web_login), hot-reload cookie."""
+        if not self._env_watch:
+            return
+        try:
+            mtime = self._env_path.stat().st_mtime
+        except OSError:
+            return
+        if mtime <= self._env_mtime:
+            return
+        self._env_mtime = mtime
+
+        # Re-read .env
+        from dotenv import load_dotenv
+        load_dotenv(self._env_path, override=True)
+        new_cookie = os.getenv("DOUYIN_COOKIE", "")
+        if new_cookie and new_cookie != self.downloader.config.cookie:
+            self.downloader.config.cookie = new_cookie
+            os.environ["DOUYIN_COOKIE"] = new_cookie
+            logger.info(
+                "Hot-reloaded DOUYIN_COOKIE from .env (%d chars)", len(new_cookie)
+            )
+
     def _poll_once(self, cfg, bot_cfg) -> None:
+        self._check_env_reload()
         mail = self._imap_connect(cfg)
         try:
             mail.select("INBOX")
