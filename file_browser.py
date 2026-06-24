@@ -11,9 +11,11 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import os
 import re
+import shutil
 from pathlib import Path
 from urllib.parse import quote
 
@@ -304,6 +306,46 @@ def raw_file(filepath):
     return send_from_directory(directory, filename, mimetype=_mime_type(filename))
 
 
+@app.route("/api/delete", methods=["POST"])
+def api_delete():
+    """Delete a file/directory, or slides by prefix. JSON: {"path": "..."} or {"prefix": "..."}."""
+    data = request.get_json(silent=True) or {}
+    subpath = data.get("path", "").strip()
+    prefix = data.get("prefix", "").strip()
+
+    if prefix:
+        slides_dir = _DOWNLOAD_DIR / "slides"
+        if not slides_dir.is_dir():
+            return {"success": False, "error": "slides 目录不存在"}, 404
+        deleted = 0
+        for f in sorted(slides_dir.iterdir()):
+            if f.is_file() and f.name.startswith(prefix + "_"):
+                f.unlink()
+                deleted += 1
+        if deleted == 0:
+            return {"success": False, "error": "未找到匹配文件"}, 404
+        log.info("Deleted %d slides with prefix %s", deleted, prefix)
+        return {"success": True}
+
+    if not subpath:
+        return {"success": False, "error": "缺少 path 或 prefix 参数"}, 400
+
+    target = _safe_subpath(subpath)
+    if not target.exists():
+        return {"success": False, "error": "文件或目录不存在"}, 404
+
+    try:
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+        log.info("Deleted: %s", target)
+        return {"success": True}
+    except OSError as e:
+        log.error("Failed to delete %s: %s", target, e)
+        return {"success": False, "error": str(e)}, 500
+
+
 # ── Error handlers ────────────────────────────────────────────────────
 
 @app.errorhandler(403)
@@ -364,11 +406,14 @@ _COMMON_CSS = """
   }
   .card {
     background: #fff; border-radius: 12px; padding: 20px;
-    text-decoration: none; color: #333; display: block;
     transition: background 0.15s, transform 0.15s;
     box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+    position: relative;
   }
   .card:hover { background: #fafafa; transform: translateY(-1px); }
+  .card-inner {
+    display: block; text-decoration: none; color: #333;
+  }
   .card h3 { font-size: 16px; color: #111; margin-bottom: 6px; }
   .card .meta { font-size: 12px; color: #999; line-height: 1.6; }
   .card .icon { font-size: 28px; margin-bottom: 10px; }
@@ -389,6 +434,15 @@ _COMMON_CSS = """
     text-decoration: none; transition: opacity 0.2s;
   }
   .btn:hover { opacity: 0.85; }
+  .del-btn {
+    position: absolute; top: 8px; right: 8px;
+    width: 28px; height: 28px; border-radius: 50%; border: none;
+    background: rgba(0,0,0,0.08); color: #999; font-size: 16px;
+    cursor: pointer; transition: all 0.15s; line-height: 1;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .del-btn:hover { background: #fe2c55; color: #fff; }
+  .card { position: relative; }
   video:focus, img:focus { outline: none; }
 """
 
@@ -426,14 +480,17 @@ INDEX_HTML = (
   <div class="section-title">📹 视频 · {{ authors | length }} 位作者</div>
   <div class="card-grid">
   {% for a in authors %}
-    <a class="card" href="{{ url_for('browse', subpath=a.path) }}">
-      <div class="icon">🎬</div>
-      <h3>{{ a.name }}</h3>
-      <div class="meta">
-        <span class="stat">{{ a.video_count }} 个视频</span>
-        <span class="stat">{{ a.size_fmt }}</span>
-      </div>
-    </a>
+    <div class="card">
+      <a class="card-inner" href="{{ url_for('browse', subpath=a.path) }}">
+        <div class="icon">🎬</div>
+        <h3>{{ a.name }}</h3>
+        <div class="meta">
+          <span class="stat">{{ a.video_count }} 个视频</span>
+          <span class="stat">{{ a.size_fmt }}</span>
+        </div>
+      </a>
+      <button class="del-btn" onclick="confirmDelete(event, '{{ a.path|e }}', '{{ a.name|e }} 的全部视频')" title="删除作者">✕</button>
+    </div>
   {% endfor %}
   </div>
   {% endif %}
@@ -442,18 +499,50 @@ INDEX_HTML = (
   <div class="section-title">🖼️ 图集 · {{ slides | length }} 组</div>
   <div class="card-grid">
   {% for s in slides %}
-    <a class="card" href="{{ url_for('view_slideshow', prefix=s.prefix) }}">
-      <div class="icon">🖼️</div>
-      <h3>{{ s.date }}</h3>
-      <div class="meta">
-        <span class="stat">{{ s.image_count }} 张图片</span>
-        <span class="stat">{{ s.size_fmt }}</span>
-      </div>
-    </a>
+    <div class="card">
+      <a class="card-inner" href="{{ url_for('view_slideshow', prefix=s.prefix) }}">
+        <div class="icon">🖼️</div>
+        <h3>{{ s.date }}</h3>
+        <div class="meta">
+          <span class="stat">{{ s.image_count }} 张图片</span>
+          <span class="stat">{{ s.size_fmt }}</span>
+        </div>
+      </a>
+      <button class="del-btn" onclick="confirmDeleteSlides(event, '{{ s.prefix|e }}', '{{ s.date|e }}')" title="删除图集">✕</button>
+    </div>
   {% endfor %}
   </div>
   {% endif %}
 </div>
+
+<script>
+function confirmDelete(event, path, label) {
+  event.stopPropagation();
+  event.preventDefault();
+  if (!confirm('确定删除 ' + label + '？此操作不可撤销。')) return;
+  fetch('/api/delete', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({path: path})
+  }).then(r => r.json()).then(function(data) {
+    if (data.success) location.reload();
+    else alert('删除失败: ' + (data.error || '未知错误'));
+  }).catch(function(e) { alert('请求失败: ' + e.message); });
+}
+function confirmDeleteSlides(event, prefix, label) {
+  event.stopPropagation();
+  event.preventDefault();
+  if (!confirm('确定删除图集 ' + label + '？此操作不可撤销。')) return;
+  fetch('/api/delete', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({prefix: prefix})
+  }).then(r => r.json()).then(function(data) {
+    if (data.success) location.reload();
+    else alert('删除失败: ' + (data.error || '未知错误'));
+  }).catch(function(e) { alert('请求失败: ' + e.message); });
+}
+</script>
 </body>
 </html>"""  # noqa: E501
 )
@@ -539,8 +628,9 @@ VIDEO_HTML = (
     "<style>" + _COMMON_CSS + """
   .video-wrapper {
     background: #000; border-radius: 12px; overflow: hidden;
-    margin-bottom: 16px; box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+    margin: 0 auto 16px; box-shadow: 0 4px 20px rgba(0,0,0,0.5);
     position: relative; aspect-ratio: 16 / 9; max-height: 70vh;
+    max-width: 1000px;
   }
   .video-wrapper video {
     position: absolute; top: 0; left: 0;
@@ -737,8 +827,9 @@ PLAYLIST_HTML = (
   .player-section { margin-bottom: 16px; }
   .video-wrapper {
     background: #000; border-radius: 12px; overflow: hidden;
-    box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+    margin: 0 auto; box-shadow: 0 4px 20px rgba(0,0,0,0.5);
     position: relative; aspect-ratio: 16 / 9; max-height: 60vh;
+    max-width: 1000px;
   }
   .video-wrapper video {
     position: absolute; top: 0; left: 0;
