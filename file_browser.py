@@ -35,7 +35,7 @@ from config_loader import load_config  # noqa: E402
 
 _config = load_config(_PROJECT_DIR / "config.yaml")
 _DOWNLOAD_DIR = Path(_config.douyin.download_path)
-_THUMB_CACHE = _DOWNLOAD_DIR / ".thumb_cache"
+_THUMB_CACHE = Path("/app/.thumb_cache")
 
 # ── App setup ─────────────────────────────────────────────────────────
 
@@ -309,7 +309,7 @@ def thumb(filepath):
             subprocess.run([
                 "ffmpeg", "-y", "-i", str(safe),
                 "-vframes", "1",
-                "-vf", "scale=320:180:force_original_aspect_ratio=increase,crop=320:180",
+                "-vf", "scale=180:320:force_original_aspect_ratio=increase,crop=180:320",
                 "-f", "mjpeg", "-q:v", "3",
                 str(thumb_path),
             ], check=True, timeout=30, capture_output=True)
@@ -399,7 +399,7 @@ _COMMON_CSS = """
   h1 { font-size: 22px; font-weight: 600; color: #111; margin-bottom: 4px; }
   .subtitle { font-size: 13px; color: #999; margin-bottom: 24px; }
   .card-grid {
-    display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
     gap: 14px; margin-bottom: 32px;
   }
   .card {
@@ -464,8 +464,8 @@ INDEX_HTML = (
   .collapsible-body { transition: opacity 0.2s; }
   .collapsible-body.collapsed { display: none; }
   .card-thumb {
-    width: 100%; height: 130px; object-fit: cover; border-radius: 8px;
-    background: #eee; margin-bottom: 10px;
+    width: 100%; aspect-ratio: 9 / 16; object-fit: cover; border-radius: 8px;
+    background: #e8e8e8; margin-bottom: 10px;
   }
   .card .vname { font-size: 14px; color: #333; word-break: break-all; line-height: 1.3; }
 </style>
