@@ -11,11 +11,13 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import os
 import re
 import shutil
+import subprocess
 from pathlib import Path
 from urllib.parse import quote
 
@@ -33,6 +35,7 @@ from config_loader import load_config  # noqa: E402
 
 _config = load_config(_PROJECT_DIR / "config.yaml")
 _DOWNLOAD_DIR = Path(_config.douyin.download_path)
+_THUMB_CACHE = _DOWNLOAD_DIR / ".thumb_cache"
 
 # ── App setup ─────────────────────────────────────────────────────────
 
@@ -79,7 +82,7 @@ def _scan_downloads() -> dict:
         return {"videos": videos, "slides": slides, "empty": True}
 
     for entry in sorted(_DOWNLOAD_DIR.iterdir()):
-        if not entry.is_dir():
+        if not entry.is_dir() or entry.name.startswith("."):
             continue
         if entry.name == "slides":
             for img in sorted(entry.iterdir(), reverse=True):
@@ -288,6 +291,35 @@ def raw_file(filepath):
     return send_from_directory(directory, filename, mimetype=_mime_type(filename))
 
 
+@app.route("/thumb/<path:filepath>")
+def thumb(filepath):
+    """Serve a JPEG thumbnail for a video. Generated via ffmpeg and cached on disk."""
+    safe = _safe_subpath(filepath)
+    if not safe.is_file():
+        abort(404, "File not found")
+
+    # Cache key: hex hash of relative path
+    cache_key = hashlib.sha256(filepath.encode()).hexdigest()[:16]
+    _THUMB_CACHE.mkdir(exist_ok=True)
+    thumb_path = _THUMB_CACHE / f"{cache_key}.jpg"
+
+    # Regenerate if missing or source is newer
+    if not thumb_path.exists() or thumb_path.stat().st_mtime < safe.stat().st_mtime:
+        try:
+            subprocess.run([
+                "ffmpeg", "-y", "-i", str(safe),
+                "-vframes", "1",
+                "-vf", "scale=320:180:force_original_aspect_ratio=increase,crop=320:180",
+                "-f", "mjpeg", "-q:v", "3",
+                str(thumb_path),
+            ], check=True, timeout=30, capture_output=True)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            log.error("Thumbnail generation failed for %s: %s", filepath, e)
+            abort(500, "Thumbnail generation failed")
+
+    return send_from_directory(str(_THUMB_CACHE), thumb_path.name, mimetype="image/jpeg")
+
+
 @app.route("/api/delete", methods=["POST"])
 def api_delete():
     """Delete a file or directory under downloads. JSON: {"path": "author/..."}."""
@@ -466,7 +498,7 @@ INDEX_HTML = (
   {% for v in videos %}
     <div class="card">
       <a class="card-inner" href="{{ url_for('view_video', filepath=v.relpath) }}">
-        <div class="icon">🎬</div>
+        <img class="card-thumb" src="{{ url_for('thumb', filepath=v.relpath) }}" loading="lazy" alt="">
         <div class="vname">{{ v.name }}</div>
         <div class="meta" style="margin-top:4px">
           <span class="stat">{{ v.author }}</span>
@@ -489,6 +521,7 @@ INDEX_HTML = (
   {% for s in slides %}
     <div class="card">
       <a class="card-inner" href="{{ url_for('raw_file', filepath=s.relpath) }}" target="_blank">
+        <img class="card-thumb" src="{{ url_for('raw_file', filepath=s.relpath) }}" loading="lazy" alt="">
         <div class="vname">{{ s.name }}</div>
         <div class="meta" style="margin-top:4px">
           <span class="stat">{{ s.date }}</span>
@@ -908,7 +941,7 @@ PLAYLIST_HTML = (
     </div>
     <div id="playlist">
       {% for v in videos %}
-      <div class="playlist-item" id="item-{{ loop.index0 }}" onclick="playIndex({{ loop.index0 }})">
+      <div class="playlist-item" id="item-{{ loop.index0 }}" onclick="playIndex({{ loop.index0 }}, true)">
         <span class="idx">{{ loop.index }}</span>
         <div class="info">
           <div class="vname">{{ v.name }}</div>
@@ -966,12 +999,16 @@ function currentVideo() {
 // ── Playback ──
 const player = document.getElementById('player');
 
-function playIndex(queueIdx) {
+function playIndex(queueIdx, scroll) {
   currentQueueIdx = queueIdx;
   const v = currentVideo();
   player.src = "{{ url_for('raw_file', filepath='') }}" + v.relpath;
   player.play().catch(function() {});
   updateUI();
+  if (scroll) {
+    var item = document.getElementById('item-' + currentVideoIndex());
+    if (item) item.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+  }
 }
 
 function nextVideo() {
@@ -1028,7 +1065,6 @@ function updateUI() {
   var activeItem = document.getElementById('item-' + vidIdx);
   if (activeItem) {
     activeItem.classList.add('current');
-    activeItem.scrollIntoView({behavior: 'smooth', block: 'nearest'});
   }
 }
 
