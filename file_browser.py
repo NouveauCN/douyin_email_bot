@@ -308,12 +308,41 @@ def raw_file(filepath):
 
 @app.errorhandler(403)
 def _forbidden(e):
-    return render_template_string(ERROR_HTML, code=403, message=str(e)), 403
+    explanation = "路径包含非法字符或试图访问下载目录以外的文件。"
+    suggestion = "请从首页正常浏览，不要手动修改 URL 路径。"
+    return render_template_string(
+        ERROR_HTML, code=403,
+        title="访问被拒绝",
+        explanation=explanation,
+        suggestion=suggestion,
+        detail=str(e),
+    ), 403
 
 
 @app.errorhandler(404)
 def _not_found(e):
-    return render_template_string(ERROR_HTML, code=404, message="Page not found"), 404
+    explanation = "请求的文件或目录不存在。可能已被移动、删除，或下载尚未完成。"
+    suggestion = "返回首页查看当前可用的下载内容。如果文件刚被下载，可能需要等待几秒刷新。"
+    return render_template_string(
+        ERROR_HTML, code=404,
+        title="内容未找到",
+        explanation=explanation,
+        suggestion=suggestion,
+        detail=str(e),
+    ), 404
+
+
+@app.errorhandler(500)
+def _server_error(e):
+    explanation = "服务器内部错误。可能是文件系统权限问题、配置错误或代码异常。"
+    suggestion = "请通过 SSH 查看容器日志：sudo docker logs douyin_file_browser --tail 30"
+    return render_template_string(
+        ERROR_HTML, code=500,
+        title="服务器错误",
+        explanation=explanation,
+        suggestion=suggestion,
+        detail=str(e),
+    ), 500
 
 
 # ── Templates ─────────────────────────────────────────────────────────
@@ -973,19 +1002,48 @@ ERROR_HTML = (
     '<html lang="zh-CN">\n<head>\n'
     '<meta charset="UTF-8">\n'
     '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
-    "<title>{{ code }} — Error</title>\n"
+    "<title>{{ code }} — {{ title }}</title>\n"
     "<style>" + _COMMON_CSS + """
-  .error-box { text-align: center; padding: 80px 20px; }
-  .error-box .code { font-size: 72px; font-weight: 700; color: #fe2c55; }
-  .error-box .msg { font-size: 16px; color: #888; margin: 12px 0 24px; }
+  .error-box { text-align: center; padding: 60px 20px 40px; }
+  .error-box .code { font-size: 72px; font-weight: 700; color: #fe2c55; line-height: 1; }
+  .error-box .title { font-size: 20px; color: #333; margin: 8px 0 20px; font-weight: 600; }
+  .error-box .section {
+    max-width: 480px; margin: 0 auto 16px; text-align: left;
+    background: #fff; border-radius: 10px; padding: 18px 20px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+  }
+  .error-box .section .label {
+    font-size: 11px; font-weight: 700; color: #999; text-transform: uppercase;
+    letter-spacing: 1px; margin-bottom: 6px;
+  }
+  .error-box .section .text { font-size: 14px; color: #555; line-height: 1.7; }
+  .error-box .detail {
+    font-size: 11px; color: #bbb; margin-top: 16px; font-family: monospace;
+    word-break: break-all;
+  }
 </style>
 </head>
 <body>
 <div class="container">
   <div class="error-box">
     <div class="code">{{ code }}</div>
-    <div class="msg">{{ message }}</div>
+    <div class="title">{{ title }}</div>
+
+    <div class="section">
+      <div class="label">📋 发生了什么</div>
+      <div class="text">{{ explanation }}</div>
+    </div>
+
+    <div class="section">
+      <div class="label">💡 怎么办</div>
+      <div class="text">{{ suggestion }}</div>
+    </div>
+
     <a class="btn" href="{{ url_for('index') }}">← 返回首页</a>
+
+    {% if detail %}
+    <div class="detail">调试信息：{{ detail }}</div>
+    {% endif %}
   </div>
 </div>
 </body>
