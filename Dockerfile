@@ -1,4 +1,4 @@
-FROM ubuntu:26.04
+FROM python:3.12-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -6,16 +6,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# ── System deps ────────────────────────────────────────────────────
+# ── System deps + ffmpeg ───────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 \
-    python3-pip \
-    python3-venv \
-    ca-certificates \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
-
-# Convenience: python3 -> python
-RUN ln -sf /usr/bin/python3 /usr/bin/python
 
 WORKDIR /app
 

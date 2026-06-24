@@ -20,10 +20,11 @@ douyin_email_bot/
 ├── .env.example            # Template for secrets (EMAIL_ADDRESS, EMAIL_PASSWORD, DOUYIN_COOKIE)
 ├── pyproject.toml          # uv project — deps: f2, playwright, python-dotenv, pyyaml
 ├── requirements.txt        # pip deps (for Docker builds)
-├── Dockerfile              # Ubuntu 26.04 + Playwright Firefox container
-├── docker-compose.yml      # bot + web_login services
+├── Dockerfile              # python:3.12-slim + ffmpeg + Playwright Firefox container
+├── docker-compose.yml      # bot + web_login + file_browser services
 ├── .dockerignore           # exclude non-Docker files from build context
 ├── web_login.py            # Flask web service — QR login on port 8080
+├── file_browser.py          # Flask file browser — serve downloads on port 8081
 ├── conf/
 │   ├── conf.yaml           # F2 runtime config — Bark disabled
 │   └── app.yaml            # F2 app config — empty Bark block
@@ -76,7 +77,7 @@ Get-ScheduledTask -TaskName "DouyinEmailBot" | Format-List State, LastRunTime, L
 Get-Content logs\bot.log -Tail 50                  # View recent logs
 ```
 
-### Docker deployment (Ubuntu 26 LTS)
+### Docker deployment
 
 Multi-service Docker Compose setup: a persistent bot + an on-demand web QR login service.
 
@@ -101,6 +102,7 @@ docker compose down -v        # also delete volumes (downloads, logs, profile)
 **Architecture:**
 - `bot` service: `restart: unless-stopped`, long-lived poll loop
 - `web_login` service: `profiles: [login]`, on-demand Flask app on port 8080
+- `file_browser` service: `restart: unless-stopped`, LAN web UI for browsing downloads on port 8081
 - Shared `firefox_profile` volume so web login + bot share persistent login state
 - `ENV_AUTO_RELOAD=1` enables `.env` mtime watching — bot picks up new cookie without restart
 
@@ -115,6 +117,36 @@ docker compose down -v        # also delete volumes (downloads, logs, profile)
 | `BOT_COOLDOWN_SECONDS` | `bot.cooldown_seconds` |
 | `COOKIE_PROFILE_DIR` | `cookie_extractor.profile_dir` |
 | `ENV_AUTO_RELOAD` | Enable `.env` mtime hot-reload (`1`/`true`/`yes`) |
+
+### Deployment workflow
+
+Code sync via GitHub, execution on LAN server. The remote server is **execution-only** — never modifies code.
+
+**Remote server:**
+```
+ssh nouveau@192.168.0.103         # LAN Docker host
+~/douyin_email_bot/               # project root on remote
+```
+
+**Git remote:**
+```
+origin  https://github.com/NouveauCN/douyin_email_bot.git
+```
+
+**Typical workflow:**
+```bash
+# 1. Push changes from dev machine
+git push origin feat/docker-webserver
+
+# 2. Pull on remote server
+ssh nouveau@192.168.0.103 "cd ~/douyin_email_bot && git pull origin feat/docker-webserver"
+
+# 3. SCP secrets (.env — never committed to git)
+scp .env nouveau@192.168.0.103:~/douyin_email_bot/
+
+# 4. Rebuild + restart
+ssh nouveau@192.168.0.103 "cd ~/douyin_email_bot && docker compose up -d --build bot file_browser"
+```
 
 **Web login API** (`web_login.py`):
 | Route | Method | Purpose |
@@ -279,6 +311,8 @@ One-shot download of a hardcoded URL. Duplicates main.py's F2 monkey-patches (bo
 8. **`download_path` is resolved to absolute in `config_loader.py`.** The `"./downloads"` default is resolved against the `config.yaml` directory at load time so downloads always land in the project tree regardless of CWD. No change needed in `config.yaml`.
 
 9. **`_safe_logout` replaces `mail.logout()` in `finally`.** After a network error (SSL EOF, timeout), the TCP connection is already broken. Calling `mail.logout()` would send the IMAP `LOGOUT` command and then block in `recv()` waiting for a server response that never arrives — freezing the entire bot inside the `finally` block. `_safe_logout()` instead calls `sock.shutdown(SHUT_RDWR)` + `sock.close()` at the TCP level, which never blocks. `_imap_connect()` also sets a 30s socket timeout (`mail.socket().settimeout(30)`) so future operations on a stale connection fail fast rather than hang.
+
+10. **Docker base image is pinned to `python:3.12-slim`.** F2 depends on `pydantic-core` which has no precompiled wheels for Python 3.14 (the default Python in Ubuntu 26.04). Using `ubuntu:26.04` as the base image causes a Rust compilation failure during `pip install pydantic-core`. The fix is to use `python:3.12-slim` and install `ffmpeg` via apt separately. Upgrading to a newer Python version requires waiting for upstream pydantic-core wheel support.
 
 ## Network error handling
 
