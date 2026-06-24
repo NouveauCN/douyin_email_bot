@@ -541,7 +541,7 @@ VIDEO_HTML = (
     background: #000; border-radius: 12px; overflow: hidden;
     margin-bottom: 16px; box-shadow: 0 4px 20px rgba(0,0,0,0.5);
   }
-  .video-wrapper video { width: 100%; display: block; max-height: 70vh; }
+  .video-wrapper video { max-width: 100%; max-height: 70vh; display: block; margin: 0 auto; }
   .info-bar {
     display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
     background: #fff; border-radius: 10px; padding: 16px 20px;
@@ -735,7 +735,7 @@ PLAYLIST_HTML = (
     background: #000; border-radius: 12px; overflow: hidden;
     box-shadow: 0 4px 20px rgba(0,0,0,0.5);
   }
-  .video-wrapper video { width: 100%; display: block; max-height: 60vh; }
+  .video-wrapper video { max-width: 100%; max-height: 60vh; display: block; margin: 0 auto; }
   .now-playing {
     background: #fff; border-radius: 10px; padding: 14px 18px; margin-top: 12px;
     display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between;
