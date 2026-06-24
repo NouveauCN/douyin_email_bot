@@ -355,7 +355,7 @@ _COMMON_CSS = """
     background: #f5f5f5; color: #333;
     min-height: 100vh; padding: 20px;
   }
-  .container { max-width: 960px; margin: 0 auto; }
+  .container { width: 100%; max-width: 100%; margin: 0 auto; padding: 0 16px; }
   h1 { font-size: 22px; font-weight: 600; color: #111; margin-bottom: 4px; }
   .subtitle { font-size: 13px; color: #999; margin-bottom: 24px; }
   .card-grid {
