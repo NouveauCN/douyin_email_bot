@@ -71,65 +71,47 @@ def _format_date(prefix: str) -> str:
 
 
 def _scan_downloads() -> dict:
-    """Scan the downloads directory and return structured data."""
-    authors = []
+    """Scan the downloads directory and return flat lists of videos and slides."""
+    videos = []
     slides = []
-    slide_groups: dict[str, list[dict]] = {}
 
     if not _DOWNLOAD_DIR.is_dir():
-        return {"authors": authors, "slides": slides, "empty": True}
+        return {"videos": videos, "slides": slides, "empty": True}
 
     for entry in sorted(_DOWNLOAD_DIR.iterdir()):
-        if entry.is_dir():
-            if entry.name == "slides":
-                # Group slideshow files by prefix
-                for img in sorted(entry.iterdir()):
-                    if not img.is_file():
-                        continue
-                    m = _SLIDE_RE.match(img.name)
-                    if m:
-                        prefix = m.group(1)
-                        slide_groups.setdefault(prefix, []).append({
-                            "name": img.name,
-                            "size": img.stat().st_size,
-                        })
-                # Build slides list
-                for prefix in sorted(slide_groups.keys(), reverse=True):
-                    images = slide_groups[prefix]
-                    total_size = sum(i["size"] for i in images)
+        if not entry.is_dir():
+            continue
+        if entry.name == "slides":
+            for img in sorted(entry.iterdir(), reverse=True):
+                if img.is_file():
+                    relpath = str(img.relative_to(_DOWNLOAD_DIR)).replace("\\", "/")
+                    date_str = _format_date(img.name[:8]) if len(img.name) >= 8 else ""
                     slides.append({
-                        "prefix": prefix,
-                        "date": _format_date(prefix),
-                        "image_count": len(images),
-                        "total_size": total_size,
-                        "size_fmt": _format_size(total_size),
-                        "first_image": f"slides/{images[0]['name']}",
+                        "name": img.name,
+                        "relpath": relpath,
+                        "size": img.stat().st_size,
+                        "size_fmt": _format_size(img.stat().st_size),
+                        "date": date_str,
                     })
-            else:
-                # Author folder
-                videos = []
-                for vid in sorted(entry.iterdir()):
-                    if vid.is_file():
-                        videos.append({
-                            "name": vid.name,
-                            "size": vid.stat().st_size,
-                            "size_fmt": _format_size(vid.stat().st_size),
-                            "date": _format_date(vid.name[:8]) if len(vid.name) >= 8 else "",
-                        })
-                if videos:
-                    total_size = sum(v["size"] for v in videos)
-                    authors.append({
-                        "name": entry.name,
-                        "path": entry.name,
-                        "video_count": len(videos),
-                        "total_size": total_size,
-                        "size_fmt": _format_size(total_size),
+        else:
+            # Author folder — collect all .mp4 files
+            for vid in sorted(entry.iterdir(), reverse=True):
+                if vid.is_file() and vid.suffix.lower() == ".mp4":
+                    relpath = str(vid.relative_to(_DOWNLOAD_DIR)).replace("\\", "/")
+                    date_str = _format_date(vid.name[:8]) if len(vid.name) >= 8 else ""
+                    videos.append({
+                        "name": vid.name,
+                        "author": entry.name,
+                        "relpath": relpath,
+                        "size": vid.stat().st_size,
+                        "size_fmt": _format_size(vid.stat().st_size),
+                        "date": date_str,
                     })
 
     return {
-        "authors": authors,
+        "videos": videos,
         "slides": slides,
-        "empty": not authors and not slides,
+        "empty": not videos and not slides,
     }
 
 
@@ -308,27 +290,11 @@ def raw_file(filepath):
 
 @app.route("/api/delete", methods=["POST"])
 def api_delete():
-    """Delete a file/directory, or slides by prefix. JSON: {"path": "..."} or {"prefix": "..."}."""
+    """Delete a file or directory under downloads. JSON: {"path": "author/..."}."""
     data = request.get_json(silent=True) or {}
     subpath = data.get("path", "").strip()
-    prefix = data.get("prefix", "").strip()
-
-    if prefix:
-        slides_dir = _DOWNLOAD_DIR / "slides"
-        if not slides_dir.is_dir():
-            return {"success": False, "error": "slides 目录不存在"}, 404
-        deleted = 0
-        for f in sorted(slides_dir.iterdir()):
-            if f.is_file() and f.name.startswith(prefix + "_"):
-                f.unlink()
-                deleted += 1
-        if deleted == 0:
-            return {"success": False, "error": "未找到匹配文件"}, 404
-        log.info("Deleted %d slides with prefix %s", deleted, prefix)
-        return {"success": True}
-
     if not subpath:
-        return {"success": False, "error": "缺少 path 或 prefix 参数"}, 400
+        return {"success": False, "error": "缺少 path 参数"}, 400
 
     target = _safe_subpath(subpath)
     if not target.exists():
@@ -453,8 +419,23 @@ INDEX_HTML = (
     '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
     "<title>下载浏览 — Douyin Email Bot</title>\n"
     "<style>" + _COMMON_CSS + """
-  .stat { display: inline-block; font-size: 12px; color: #888;
-          background: #eee; padding: 2px 8px; border-radius: 4px; margin-right: 4px; }
+  .section-header {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 16px; font-weight: 600; color: #888; margin-bottom: 14px;
+    padding-bottom: 8px; border-bottom: 1px solid #e8e8e8;
+    cursor: pointer; user-select: none; transition: color 0.15s;
+  }
+  .section-header:hover { color: #555; }
+  .section-header .arrow { transition: transform 0.2s; font-size: 12px; display: inline-block; }
+  .section-header.collapsed .arrow { transform: rotate(-90deg); }
+  .section-count { font-size: 13px; font-weight: 400; color: #bbb; margin-left: auto; }
+  .collapsible-body { transition: opacity 0.2s; }
+  .collapsible-body.collapsed { display: none; }
+  .card-thumb {
+    width: 100%; height: 130px; object-fit: cover; border-radius: 8px;
+    background: #eee; margin-bottom: 10px;
+  }
+  .card .vname { font-size: 14px; color: #333; word-break: break-all; line-height: 1.3; }
 </style>
 </head>
 <body>
@@ -462,7 +443,7 @@ INDEX_HTML = (
   <h1>📦 下载浏览</h1>
   <p class="subtitle">Douyin Email Bot — LAN File Browser</p>
 
-  {% if authors %}
+  {% if videos %}
   <div style="margin-bottom:24px">
     <a class="btn" href="{{ url_for('playlist') }}">▶ 全部播放（随机）</a>
   </div>
@@ -476,39 +457,45 @@ INDEX_HTML = (
   </div>
   {% endif %}
 
-  {% if authors %}
-  <div class="section-title">📹 视频 · {{ authors | length }} 位作者</div>
-  <div class="card-grid">
-  {% for a in authors %}
+  {% if videos %}
+  <div class="section-header" onclick="toggleSection(this)" title="点击折叠/展开">
+    <span class="arrow">▼</span> 📹 视频
+    <span class="section-count">{{ videos | length }} 个</span>
+  </div>
+  <div class="collapsible-body card-grid">
+  {% for v in videos %}
     <div class="card">
-      <a class="card-inner" href="{{ url_for('browse', subpath=a.path) }}">
+      <a class="card-inner" href="{{ url_for('view_video', filepath=v.relpath) }}">
         <div class="icon">🎬</div>
-        <h3>{{ a.name }}</h3>
-        <div class="meta">
-          <span class="stat">{{ a.video_count }} 个视频</span>
-          <span class="stat">{{ a.size_fmt }}</span>
+        <div class="vname">{{ v.name }}</div>
+        <div class="meta" style="margin-top:4px">
+          <span class="stat">{{ v.author }}</span>
+          <span class="stat">{{ v.size_fmt }}</span>
         </div>
       </a>
-      <button class="del-btn" onclick="confirmDelete(event, '{{ a.path|e }}', '{{ a.name|e }} 的全部视频')" title="删除作者">✕</button>
+      <button class="del-btn" onclick="confirmDelete(event, '{{ v.relpath|e }}', '视频 {{ v.name|e }}')" title="删除">✕</button>
     </div>
   {% endfor %}
   </div>
   {% endif %}
 
   {% if slides %}
-  <div class="section-title">🖼️ 图集 · {{ slides | length }} 组</div>
-  <div class="card-grid">
+  <div class="section-header" onclick="toggleSection(this)" title="点击折叠/展开"
+       style="margin-top:{% if videos %}10{% else %}0{% endif %}px">
+    <span class="arrow">▼</span> 🖼️ 图片
+    <span class="section-count">{{ slides | length }} 张</span>
+  </div>
+  <div class="collapsible-body card-grid">
   {% for s in slides %}
     <div class="card">
-      <a class="card-inner" href="{{ url_for('view_slideshow', prefix=s.prefix) }}">
-        <div class="icon">🖼️</div>
-        <h3>{{ s.date }}</h3>
-        <div class="meta">
-          <span class="stat">{{ s.image_count }} 张图片</span>
+      <a class="card-inner" href="{{ url_for('raw_file', filepath=s.relpath) }}" target="_blank">
+        <div class="vname">{{ s.name }}</div>
+        <div class="meta" style="margin-top:4px">
+          <span class="stat">{{ s.date }}</span>
           <span class="stat">{{ s.size_fmt }}</span>
         </div>
       </a>
-      <button class="del-btn" onclick="confirmDeleteSlides(event, '{{ s.prefix|e }}', '{{ s.date|e }}')" title="删除图集">✕</button>
+      <button class="del-btn" onclick="confirmDelete(event, '{{ s.relpath|e }}', '图片 {{ s.name|e }}')" title="删除">✕</button>
     </div>
   {% endfor %}
   </div>
@@ -516,6 +503,10 @@ INDEX_HTML = (
 </div>
 
 <script>
+function toggleSection(header) {
+  header.classList.toggle('collapsed');
+  header.nextElementSibling.classList.toggle('collapsed');
+}
 function confirmDelete(event, path, label) {
   event.stopPropagation();
   event.preventDefault();
@@ -524,19 +515,6 @@ function confirmDelete(event, path, label) {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({path: path})
-  }).then(r => r.json()).then(function(data) {
-    if (data.success) location.reload();
-    else alert('删除失败: ' + (data.error || '未知错误'));
-  }).catch(function(e) { alert('请求失败: ' + e.message); });
-}
-function confirmDeleteSlides(event, prefix, label) {
-  event.stopPropagation();
-  event.preventDefault();
-  if (!confirm('确定删除图集 ' + label + '？此操作不可撤销。')) return;
-  fetch('/api/delete', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({prefix: prefix})
   }).then(r => r.json()).then(function(data) {
     if (data.success) location.reload();
     else alert('删除失败: ' + (data.error || '未知错误'));
