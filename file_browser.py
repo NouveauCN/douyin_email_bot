@@ -18,7 +18,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from dotenv import load_dotenv
-from flask import Flask, abort, render_template_string, send_from_directory
+from flask import Flask, abort, render_template_string, request, send_from_directory
 
 # ── Bootstrap ────────────────────────────────────────────────────────
 _PROJECT_DIR = Path(__file__).parent
@@ -144,6 +144,30 @@ def _mime_type(filepath: str) -> str:
     }.get(ext, "application/octet-stream")
 
 
+def _collect_videos(author: str | None = None) -> list[dict]:
+    """Collect all .mp4 videos, optionally filtered by author folder."""
+    videos = []
+    if not _DOWNLOAD_DIR.is_dir():
+        return videos
+    for entry in sorted(_DOWNLOAD_DIR.iterdir()):
+        if not entry.is_dir() or entry.name == "slides":
+            continue
+        if author and entry.name != author:
+            continue
+        for vid in sorted(entry.iterdir()):
+            if vid.is_file() and vid.suffix.lower() == ".mp4":
+                relpath = str(vid.relative_to(_DOWNLOAD_DIR)).replace("\\", "/")
+                videos.append({
+                    "name": vid.name,
+                    "author": entry.name,
+                    "relpath": relpath,
+                    "size": vid.stat().st_size,
+                    "size_fmt": _format_size(vid.stat().st_size),
+                    "date": _format_date(vid.name[:8]) if len(vid.name) >= 8 else "",
+                })
+    return videos
+
+
 # ── Routes ────────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -243,6 +267,31 @@ def view_slideshow(prefix):
     )
 
 
+@app.route("/playlist")
+def playlist():
+    """Auto-play playlist with shuffle, prev/next, and keyboard shortcuts."""
+    author = request.args.get("author", "")
+    videos = _collect_videos(author if author else None)
+
+    if not videos:
+        return render_template_string(
+            PLAYLIST_EMPTY_HTML,
+            author=author,
+        )
+
+    import json
+    videos_json = json.dumps(videos, ensure_ascii=False)
+
+    return render_template_string(
+        PLAYLIST_HTML,
+        videos=videos,
+        videos_json=videos_json,
+        total=len(videos),
+        author=author,
+        title=f"🎬 {author} · 全部播放" if author else "🎬 全部播放",
+    )
+
+
 @app.route("/raw/<path:filepath>")
 def raw_file(filepath):
     """Serve raw file bytes with correct Content-Type and Range support."""
@@ -330,6 +379,12 @@ INDEX_HTML = (
   <h1>📦 下载浏览</h1>
   <p class="subtitle">Douyin Email Bot — LAN File Browser</p>
 
+  {% if authors %}
+  <div style="margin-bottom:24px">
+    <a class="btn" href="{{ url_for('playlist') }}">▶ 全部播放（随机）</a>
+  </div>
+  {% endif %}
+
   {% if empty %}
   <div class="empty-state">
     <div class="icon">📭</div>
@@ -411,6 +466,12 @@ BROWSE_HTML = (
   <a class="back-link" href="{{ url_for('index') }}">← 返回首页</a>
   <h1>📁 {{ parent_name }}</h1>
   <p class="subtitle">{{ entries | length }} 个文件</p>
+
+  {% if entries | selectattr('is_video') | list | length > 0 %}
+  <div style="margin-bottom:18px">
+    <a class="btn" href="{{ url_for('playlist', author=parent_name) }}">▶ 播放全部（随机）</a>
+  </div>
+  {% endif %}
 
   {% if empty %}
   <div class="empty-state">
@@ -603,6 +664,301 @@ document.addEventListener('keydown', function(e) {
   if (e.key === 'ArrowLeft') { e.preventDefault(); navigate(-1); }
   if (e.key === 'ArrowRight') { e.preventDefault(); navigate(1); }
 });
+</script>
+</body>
+</html>"""  # noqa: E501
+)
+
+PLAYLIST_EMPTY_HTML = (
+    "<!DOCTYPE html>\n"
+    '<html lang="zh-CN">\n<head>\n'
+    '<meta charset="UTF-8">\n'
+    '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
+    "<title>播放列表 — 无视频</title>\n"
+    "<style>" + _COMMON_CSS + """
+</style>
+</head>
+<body>
+<div class="container">
+  <a class="back-link" href="{{ url_for('index') }}">← 返回首页</a>
+  <div class="empty-state">
+    <div class="icon">📭</div>
+    <p>{% if author %}<b>{{ author }}</b> 中没有视频{% else %}暂无下载视频{% endif %}</p>
+    <p style="font-size:13px;margin-top:8px">发送抖音链接到邮箱，机器人会自动下载</p>
+  </div>
+</div>
+</body>
+</html>"""
+)
+
+PLAYLIST_HTML = (
+    "<!DOCTYPE html>\n"
+    '<html lang="zh-CN">\n<head>\n'
+    '<meta charset="UTF-8">\n'
+    '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
+    "<title>{{ title }}</title>\n"
+    "<style>" + _COMMON_CSS + """
+  .player-section { margin-bottom: 16px; }
+  .video-wrapper {
+    background: #000; border-radius: 12px; overflow: hidden;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+  }
+  .video-wrapper video { width: 100%; display: block; max-height: 60vh; }
+  .now-playing {
+    background: #1a1a1a; border-radius: 10px; padding: 14px 18px; margin-top: 12px;
+    display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between;
+  }
+  .now-playing .info { font-size: 13px; color: #888; }
+  .now-playing .info strong { color: #e0e0e0; }
+  .now-playing .info .author-tag {
+    display: inline-block; background: #fe2c55; color: #fff; font-size: 11px;
+    padding: 2px 8px; border-radius: 4px; margin-right: 8px;
+  }
+  .controls {
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    margin: 14px 0;
+  }
+  .ctrl-btn {
+    padding: 8px 18px; border-radius: 8px; border: none; font-size: 13px;
+    cursor: pointer; background: #333; color: #e0e0e0;
+    transition: background 0.15s; text-decoration: none; display: inline-block;
+  }
+  .ctrl-btn:hover { background: #444; }
+  .ctrl-btn.primary { background: #fe2c55; color: #fff; }
+  .ctrl-btn.primary:hover { opacity: 0.85; }
+  .ctrl-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+  .playlist-panel { margin-top: 20px; }
+  .playlist-header {
+    font-size: 14px; font-weight: 600; color: #aaa; margin-bottom: 10px;
+    padding-bottom: 8px; border-bottom: 1px solid #2a2a2a;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .playlist-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 14px; border-radius: 8px; cursor: pointer;
+    transition: background 0.1s; margin-bottom: 2px;
+  }
+  .playlist-item:hover { background: #1e1e1e; }
+  .playlist-item.current { background: #2a1a20; }
+  .playlist-item.current .idx { color: #fe2c55; font-weight: 700; }
+  .playlist-item .idx { width: 32px; text-align: right; font-size: 12px; color: #666; flex-shrink: 0; }
+  .playlist-item .info { flex: 1; min-width: 0; }
+  .playlist-item .info .vname { font-size: 13px; color: #e0e0e0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .playlist-item .info .vmeta { font-size: 11px; color: #888; }
+  .playlist-item .vsize { font-size: 11px; color: #666; flex-shrink: 0; }
+  .key-hint {
+    font-size: 11px; color: #555; text-align: center; margin-top: 20px;
+    padding: 12px; background: #141414; border-radius: 8px;
+  }
+  .key-hint kbd {
+    display: inline-block; background: #2a2a2a; color: #999; padding: 1px 7px;
+    border-radius: 4px; font-family: monospace; font-size: 11px; margin: 0 2px;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  {% if author %}
+  <a class="back-link" href="{{ url_for('browse', subpath=author) }}">← 返回 {{ author }}</a>
+  {% else %}
+  <a class="back-link" href="{{ url_for('index') }}">← 返回首页</a>
+  {% endif %}
+  <h1>{{ title }}</h1>
+  <p class="subtitle" id="statusLine">{{ total }} 个视频 · 随机播放</p>
+
+  <!-- Video player -->
+  <div class="player-section">
+    <div class="video-wrapper">
+      <video id="player" controls autoplay playsinline></video>
+    </div>
+
+    <div class="now-playing">
+      <div class="info">
+        <span id="npTitle">—</span>
+      </div>
+      <div class="info">
+        <span id="npSize">—</span> · <span id="npDate">—</span>
+      </div>
+    </div>
+
+    <div class="controls">
+      <button class="ctrl-btn" id="prevBtn" onclick="prevVideo()" title="上一个">◀ 上一个</button>
+      <button class="ctrl-btn primary" id="shuffleBtn" onclick="toggleShuffle()">
+        🔀 <span id="shuffleLabel">随机: 开</span>
+      </button>
+      <button class="ctrl-btn" id="nextBtn" onclick="nextVideo()" title="下一个">下一个 ▶</button>
+    </div>
+  </div>
+
+  <!-- Playlist -->
+  <div class="playlist-panel">
+    <div class="playlist-header">
+      <span>📋 播放列表</span>
+      <span style="font-size:12px;color:#666">{{ total }} 个视频</span>
+    </div>
+    <div id="playlist">
+      {% for v in videos %}
+      <div class="playlist-item" id="item-{{ loop.index0 }}" onclick="playIndex({{ loop.index0 }})">
+        <span class="idx">{{ loop.index }}</span>
+        <div class="info">
+          <div class="vname">{{ v.name }}</div>
+          <div class="vmeta"><span class="author-tag">{{ v.author }}</span>{{ v.date }}</div>
+        </div>
+        <span class="vsize">{{ v.size_fmt }}</span>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="key-hint">
+    💡 键盘快捷键：
+    <kbd>←</kbd> 上一个 &nbsp;
+    <kbd>→</kbd> 下一个 &nbsp;
+    <kbd>Space</kbd> 播放/暂停 &nbsp;
+    <kbd>S</kbd> 切换随机
+  </div>
+</div>
+
+<script>
+// ── State ──
+const VIDEOS = {{ videos_json | safe }};
+let queue = VIDEOS.map((v, i) => i);
+let currentQueueIdx = 0;
+let shuffleOn = true;
+
+// ── Shuffle (Fisher-Yates) ──
+function shuffleArray(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+}
+
+function buildQueue() {
+  const currentVidIdx = currentVideoIndex();
+  queue = VIDEOS.map((v, i) => i);
+  if (shuffleOn) {
+    const cur = queue.splice(currentVidIdx, 1)[0];
+    shuffleArray(queue);
+    queue.unshift(cur);
+  }
+  currentQueueIdx = 0;
+}
+
+function currentVideoIndex() {
+  return queue[currentQueueIdx];
+}
+
+function currentVideo() {
+  return VIDEOS[currentVideoIndex()];
+}
+
+// ── Playback ──
+const player = document.getElementById('player');
+
+function playIndex(queueIdx) {
+  currentQueueIdx = queueIdx;
+  const v = currentVideo();
+  player.src = "{{ url_for('raw_file', filepath='') }}" + v.relpath;
+  player.play().catch(function() {});
+  updateUI();
+}
+
+function nextVideo() {
+  if (currentQueueIdx < queue.length - 1) {
+    playIndex(currentQueueIdx + 1);
+  }
+}
+
+function prevVideo() {
+  if (player.currentTime > 3) {
+    player.currentTime = 0;
+    player.play().catch(function() {});
+    return;
+  }
+  if (currentQueueIdx > 0) {
+    playIndex(currentQueueIdx - 1);
+  }
+}
+
+function toggleShuffle() {
+  shuffleOn = !shuffleOn;
+  buildQueue();
+  updateUI();
+}
+
+// ── UI ──
+function updateUI() {
+  const v = currentVideo();
+  const vidIdx = currentVideoIndex();
+
+  document.getElementById('npTitle').innerHTML =
+    '<span class="author-tag">' + v.author + '</span><strong>' + v.name + '</strong>';
+  document.getElementById('npSize').textContent = '📦 ' + v.size_fmt;
+  document.getElementById('npDate').textContent = '📅 ' + v.date;
+
+  document.getElementById('statusLine').textContent =
+    (currentQueueIdx + 1) + ' / ' + queue.length +
+    ' · ' + (shuffleOn ? '随机播放' : '顺序播放');
+
+  document.getElementById('prevBtn').disabled = (currentQueueIdx === 0);
+  document.getElementById('nextBtn').disabled = (currentQueueIdx >= queue.length - 1);
+
+  var lbl = document.getElementById('shuffleLabel');
+  var btn = document.getElementById('shuffleBtn');
+  if (shuffleOn) {
+    lbl.textContent = '随机: 开';
+    btn.classList.add('primary');
+  } else {
+    lbl.textContent = '随机: 关';
+    btn.classList.remove('primary');
+  }
+
+  document.querySelectorAll('.playlist-item').forEach(function(el) { el.classList.remove('current'); });
+  var activeItem = document.getElementById('item-' + vidIdx);
+  if (activeItem) {
+    activeItem.classList.add('current');
+    activeItem.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+  }
+}
+
+// ── Events ──
+player.addEventListener('ended', function() {
+  if (currentQueueIdx < queue.length - 1) {
+    playIndex(currentQueueIdx + 1);
+  }
+});
+
+player.addEventListener('error', function() {
+  setTimeout(function() {
+    if (currentQueueIdx < queue.length - 1) {
+      nextVideo();
+    }
+  }, 1500);
+});
+
+document.addEventListener('keydown', function(e) {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+
+  switch (e.key) {
+    case 'ArrowLeft':  e.preventDefault(); prevVideo(); break;
+    case 'ArrowRight': e.preventDefault(); nextVideo(); break;
+    case ' ':
+      e.preventDefault();
+      if (player.paused) player.play().catch(function() {});
+      else player.pause();
+      break;
+    case 's': case 'S': e.preventDefault(); toggleShuffle(); break;
+  }
+});
+
+// ── Init ──
+if (shuffleOn) shuffleArray(queue);
+if (queue.length > 0) {
+  var firstV = VIDEOS[queue[0]];
+  player.src = "{{ url_for('raw_file', filepath='') }}" + firstV.relpath;
+  updateUI();
+}
 </script>
 </body>
 </html>"""  # noqa: E501
