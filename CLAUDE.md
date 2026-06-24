@@ -81,22 +81,24 @@ Get-Content logs\bot.log -Tail 50                  # View recent logs
 
 Multi-service Docker Compose setup: a persistent bot + an on-demand web QR login service.
 
+All Docker commands require `sudo` (passwordless for `nouveau` on the remote server).
+
 **Build & start the bot:**
 ```bash
-docker compose up -d bot
+sudo docker compose up -d bot
 ```
 
 **QR login (when you need to re-authenticate with Douyin):**
 ```bash
-docker compose --profile login up web_login
+sudo docker compose --profile login up web_login
 # Open http://<host>:8080 → scan QR with Douyin app → cookie auto-saved to .env
 # Ctrl+C when done, then restart bot (or rely on ENV_AUTO_RELOAD=1)
 ```
 
 **Teardown:**
 ```bash
-docker compose down           # stop bot
-docker compose down -v        # also delete volumes (downloads, logs, profile)
+sudo docker compose down           # stop bot
+sudo docker compose down -v        # also delete volumes (downloads, logs, profile)
 ```
 
 **Architecture:**
@@ -144,8 +146,8 @@ ssh nouveau@192.168.0.103 "cd ~/douyin_email_bot && git pull origin feat/docker-
 # 3. SCP secrets (.env — never committed to git)
 scp .env nouveau@192.168.0.103:~/douyin_email_bot/
 
-# 4. Rebuild + restart
-ssh nouveau@192.168.0.103 "cd ~/douyin_email_bot && docker compose up -d --build bot file_browser"
+# 4. Rebuild + restart (sudo is passwordless on remote)
+ssh nouveau@192.168.0.103 "cd ~/douyin_email_bot && sudo docker compose up -d --build bot file_browser"
 ```
 
 **Web login API** (`web_login.py`):
