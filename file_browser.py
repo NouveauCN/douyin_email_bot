@@ -540,8 +540,12 @@ VIDEO_HTML = (
   .video-wrapper {
     background: #000; border-radius: 12px; overflow: hidden;
     margin-bottom: 16px; box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+    position: relative; aspect-ratio: 16 / 9; max-height: 70vh;
   }
-  .video-wrapper video { max-width: 100%; max-height: 70vh; display: block; margin: 0 auto; }
+  .video-wrapper video {
+    position: absolute; top: 0; left: 0;
+    width: 100%; height: 100%; object-fit: contain;
+  }
   .info-bar {
     display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
     background: #fff; border-radius: 10px; padding: 16px 20px;
@@ -734,8 +738,12 @@ PLAYLIST_HTML = (
   .video-wrapper {
     background: #000; border-radius: 12px; overflow: hidden;
     box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+    position: relative; aspect-ratio: 16 / 9; max-height: 60vh;
   }
-  .video-wrapper video { max-width: 100%; max-height: 60vh; display: block; margin: 0 auto; }
+  .video-wrapper video {
+    position: absolute; top: 0; left: 0;
+    width: 100%; height: 100%; object-fit: contain;
+  }
   .now-playing {
     background: #fff; border-radius: 10px; padding: 14px 18px; margin-top: 12px;
     display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between;
