@@ -323,34 +323,34 @@ _COMMON_CSS = """
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
     font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
-    background: #0f0f0f; color: #e0e0e0;
+    background: #f5f5f5; color: #333;
     min-height: 100vh; padding: 20px;
   }
   .container { max-width: 960px; margin: 0 auto; }
-  h1 { font-size: 22px; font-weight: 600; color: #fff; margin-bottom: 4px; }
-  .subtitle { font-size: 13px; color: #888; margin-bottom: 24px; }
+  h1 { font-size: 22px; font-weight: 600; color: #111; margin-bottom: 4px; }
+  .subtitle { font-size: 13px; color: #999; margin-bottom: 24px; }
   .card-grid {
     display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
     gap: 14px; margin-bottom: 32px;
   }
   .card {
-    background: #1a1a1a; border-radius: 12px; padding: 20px;
-    text-decoration: none; color: #e0e0e0; display: block;
+    background: #fff; border-radius: 12px; padding: 20px;
+    text-decoration: none; color: #333; display: block;
     transition: background 0.15s, transform 0.15s;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+    box-shadow: 0 1px 4px rgba(0,0,0,0.06);
   }
-  .card:hover { background: #242424; transform: translateY(-1px); }
-  .card h3 { font-size: 16px; color: #fff; margin-bottom: 6px; }
-  .card .meta { font-size: 12px; color: #888; line-height: 1.6; }
+  .card:hover { background: #fafafa; transform: translateY(-1px); }
+  .card h3 { font-size: 16px; color: #111; margin-bottom: 6px; }
+  .card .meta { font-size: 12px; color: #999; line-height: 1.6; }
   .card .icon { font-size: 28px; margin-bottom: 10px; }
   .section-title {
-    font-size: 16px; font-weight: 600; color: #aaa; margin-bottom: 14px;
-    padding-bottom: 8px; border-bottom: 1px solid #2a2a2a;
+    font-size: 16px; font-weight: 600; color: #888; margin-bottom: 14px;
+    padding-bottom: 8px; border-bottom: 1px solid #e8e8e8;
   }
-  .empty-state { text-align: center; padding: 60px 20px; color: #666; }
+  .empty-state { text-align: center; padding: 60px 20px; color: #999; }
   .empty-state .icon { font-size: 48px; margin-bottom: 16px; }
   .back-link {
-    display: inline-block; color: #888; text-decoration: none; font-size: 13px;
+    display: inline-block; color: #999; text-decoration: none; font-size: 13px;
     margin-bottom: 16px; transition: color 0.15s;
   }
   .back-link:hover { color: #fe2c55; }
@@ -370,8 +370,8 @@ INDEX_HTML = (
     '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
     "<title>下载浏览 — Douyin Email Bot</title>\n"
     "<style>" + _COMMON_CSS + """
-  .stat { display: inline-block; font-size: 12px; color: #666;
-          background: #222; padding: 2px 8px; border-radius: 4px; margin-right: 4px; }
+  .stat { display: inline-block; font-size: 12px; color: #888;
+          background: #eee; padding: 2px 8px; border-radius: 4px; margin-right: 4px; }
 </style>
 </head>
 <body>
@@ -438,14 +438,15 @@ BROWSE_HTML = (
     "<style>" + _COMMON_CSS + """
   .file-row {
     display: flex; align-items: center; gap: 14px;
-    background: #1a1a1a; border-radius: 10px; padding: 14px 18px;
+    background: #fff; border-radius: 10px; padding: 14px 18px;
     margin-bottom: 8px; transition: background 0.15s;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
   }
-  .file-row:hover { background: #242424; }
+  .file-row:hover { background: #fafafa; }
   .file-icon { font-size: 24px; flex-shrink: 0; width: 36px; text-align: center; }
   .file-info { flex: 1; min-width: 0; }
-  .file-info .fname { font-size: 14px; color: #e0e0e0; word-break: break-all; }
-  .file-info .fmeta { font-size: 12px; color: #888; margin-top: 2px; }
+  .file-info .fname { font-size: 14px; color: #333; word-break: break-all; }
+  .file-info .fmeta { font-size: 12px; color: #999; margin-top: 2px; }
   .file-action { flex-shrink: 0; }
   .play-btn {
     display: inline-block; padding: 6px 16px; border-radius: 6px;
@@ -455,10 +456,10 @@ BROWSE_HTML = (
   .play-btn:hover { opacity: 0.85; }
   .dl-btn {
     display: inline-block; padding: 6px 12px; border-radius: 6px;
-    background: #333; color: #ccc; text-decoration: none; font-size: 12px;
+    background: #eee; color: #666; text-decoration: none; font-size: 12px;
     margin-left: 6px; transition: background 0.15s;
   }
-  .dl-btn:hover { background: #444; }
+  .dl-btn:hover { background: #ddd; }
 </style>
 </head>
 <body>
@@ -514,10 +515,11 @@ VIDEO_HTML = (
   .video-wrapper video { width: 100%; display: block; max-height: 70vh; }
   .info-bar {
     display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
-    background: #1a1a1a; border-radius: 10px; padding: 16px 20px;
+    background: #fff; border-radius: 10px; padding: 16px 20px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
   }
-  .info-item { font-size: 13px; color: #888; }
-  .info-item strong { color: #e0e0e0; }
+  .info-item { font-size: 13px; color: #999; }
+  .info-item strong { color: #333; }
   .actions { margin-top: 14px; display: flex; gap: 10px; flex-wrap: wrap; }
 </style>
 </head>
@@ -542,7 +544,7 @@ VIDEO_HTML = (
 
   <div class="actions">
     <a class="btn" href="{{ url_for('raw_file', filepath=relpath) }}" download>⬇ 下载视频</a>
-    <a class="btn" href="{{ url_for('browse', subpath=parent_path) }}" style="background:#333">📂 查看更多</a>
+    <a class="btn" href="{{ url_for('browse', subpath=parent_path) }}" style="background:#eee;color:#555">📂 查看更多</a>
   </div>
 </div>
 </body>
@@ -579,10 +581,11 @@ SLIDESHOW_HTML = (
   .nav-next { right: 12px; }
   .gallery-info {
     display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: center;
-    background: #1a1a1a; border-radius: 10px; padding: 16px 20px; margin-bottom: 14px;
+    background: #fff; border-radius: 10px; padding: 16px 20px; margin-bottom: 14px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
   }
   .gallery-info .counter { font-size: 18px; font-weight: 600; color: #fe2c55; }
-  .gallery-info .meta { font-size: 13px; color: #888; }
+  .gallery-info .meta { font-size: 13px; color: #999; }
   .thumb-strip {
     display: flex; gap: 6px; overflow-x: auto; padding: 8px 0;
     scroll-behavior: smooth;
@@ -594,7 +597,7 @@ SLIDESHOW_HTML = (
   }
   .thumb-strip img.active { border-color: #fe2c55; opacity: 1; }
   .thumb-strip img:hover { opacity: 0.85; }
-  .key-hint { font-size: 11px; color: #555; text-align: center; margin-top: 10px; }
+  .key-hint { font-size: 11px; color: #999; text-align: center; margin-top: 10px; }
 </style>
 </head>
 <body>
@@ -705,11 +708,12 @@ PLAYLIST_HTML = (
   }
   .video-wrapper video { width: 100%; display: block; max-height: 60vh; }
   .now-playing {
-    background: #1a1a1a; border-radius: 10px; padding: 14px 18px; margin-top: 12px;
+    background: #fff; border-radius: 10px; padding: 14px 18px; margin-top: 12px;
     display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
   }
-  .now-playing .info { font-size: 13px; color: #888; }
-  .now-playing .info strong { color: #e0e0e0; }
+  .now-playing .info { font-size: 13px; color: #999; }
+  .now-playing .info strong { color: #333; }
   .now-playing .info .author-tag {
     display: inline-block; background: #fe2c55; color: #fff; font-size: 11px;
     padding: 2px 8px; border-radius: 4px; margin-right: 8px;
@@ -720,17 +724,17 @@ PLAYLIST_HTML = (
   }
   .ctrl-btn {
     padding: 8px 18px; border-radius: 8px; border: none; font-size: 13px;
-    cursor: pointer; background: #333; color: #e0e0e0;
+    cursor: pointer; background: #eee; color: #555;
     transition: background 0.15s; text-decoration: none; display: inline-block;
   }
-  .ctrl-btn:hover { background: #444; }
+  .ctrl-btn:hover { background: #ddd; }
   .ctrl-btn.primary { background: #fe2c55; color: #fff; }
   .ctrl-btn.primary:hover { opacity: 0.85; }
   .ctrl-btn:disabled { opacity: 0.3; cursor: not-allowed; }
   .playlist-panel { margin-top: 20px; }
   .playlist-header {
-    font-size: 14px; font-weight: 600; color: #aaa; margin-bottom: 10px;
-    padding-bottom: 8px; border-bottom: 1px solid #2a2a2a;
+    font-size: 14px; font-weight: 600; color: #888; margin-bottom: 10px;
+    padding-bottom: 8px; border-bottom: 1px solid #e8e8e8;
     display: flex; justify-content: space-between; align-items: center;
   }
   .playlist-item {
@@ -738,20 +742,20 @@ PLAYLIST_HTML = (
     padding: 10px 14px; border-radius: 8px; cursor: pointer;
     transition: background 0.1s; margin-bottom: 2px;
   }
-  .playlist-item:hover { background: #1e1e1e; }
-  .playlist-item.current { background: #2a1a20; }
+  .playlist-item:hover { background: #f5f5f5; }
+  .playlist-item.current { background: #fff0f3; }
   .playlist-item.current .idx { color: #fe2c55; font-weight: 700; }
-  .playlist-item .idx { width: 32px; text-align: right; font-size: 12px; color: #666; flex-shrink: 0; }
+  .playlist-item .idx { width: 32px; text-align: right; font-size: 12px; color: #ccc; flex-shrink: 0; }
   .playlist-item .info { flex: 1; min-width: 0; }
-  .playlist-item .info .vname { font-size: 13px; color: #e0e0e0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .playlist-item .info .vmeta { font-size: 11px; color: #888; }
-  .playlist-item .vsize { font-size: 11px; color: #666; flex-shrink: 0; }
+  .playlist-item .info .vname { font-size: 13px; color: #333; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .playlist-item .info .vmeta { font-size: 11px; color: #999; }
+  .playlist-item .vsize { font-size: 11px; color: #999; flex-shrink: 0; }
   .key-hint {
-    font-size: 11px; color: #555; text-align: center; margin-top: 20px;
-    padding: 12px; background: #141414; border-radius: 8px;
+    font-size: 11px; color: #999; text-align: center; margin-top: 20px;
+    padding: 12px; background: #f0f0f0; border-radius: 8px;
   }
   .key-hint kbd {
-    display: inline-block; background: #2a2a2a; color: #999; padding: 1px 7px;
+    display: inline-block; background: #e0e0e0; color: #666; padding: 1px 7px;
     border-radius: 4px; font-family: monospace; font-size: 11px; margin: 0 2px;
   }
 </style>
