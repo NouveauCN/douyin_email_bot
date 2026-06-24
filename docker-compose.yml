@@ -34,6 +34,20 @@ services:
     profiles:
       - login
 
+  file_browser:
+    build: .
+    container_name: douyin_file_browser
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    volumes:
+      - downloads:/app/downloads:ro
+      - ./config.yaml:/app/config.yaml:ro
+    environment:
+      - DOUYIN_DOWNLOAD_PATH=/app/downloads
+      - TZ=Asia/Shanghai
+    command: ["python3", "file_browser.py"]
+
 volumes:
   downloads:
     driver: local
