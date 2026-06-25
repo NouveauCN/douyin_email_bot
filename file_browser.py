@@ -111,6 +111,10 @@ def _scan_downloads() -> dict:
                         "date": date_str,
                     })
 
+    # Sort by filename descending (YYYYMMDD prefix = newest first)
+    videos.sort(key=lambda v: v["name"], reverse=True)
+    slides.sort(key=lambda s: s["name"], reverse=True)
+
     return {
         "videos": videos,
         "slides": slides,
