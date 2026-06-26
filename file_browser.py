@@ -627,19 +627,16 @@ INDEX_HTML = (
   <h1>📦 下载浏览</h1>
   <p class="subtitle">Douyin Email Bot — LAN File Browser</p>
 
-  <div style="margin-bottom:20px;display:flex;gap:10px;align-items:center">
+  <div style="margin-bottom:24px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
     <input type="file" id="uploadInput" style="display:none" accept="video/*,image/*" onchange="handleUpload(event)">
     <button class="btn" onclick="document.getElementById('uploadInput').click()" style="background:#25a55a">
       📤 上传文件
     </button>
+    {% if videos %}
+    <a class="btn" href="{{ url_for('playlist') }}">▶ 全部播放（随机）</a>
+    {% endif %}
     <span id="uploadStatus" style="font-size:12px;color:#999"></span>
   </div>
-
-  {% if videos %}
-  <div style="margin-bottom:24px">
-    <a class="btn" href="{{ url_for('playlist') }}">▶ 全部播放（随机）</a>
-  </div>
-  {% endif %}
 
   {% if empty %}
   <div class="empty-state">
