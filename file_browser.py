@@ -176,7 +176,7 @@ def _media_to_image(filepath: Path) -> Image.Image:
 def _compute_dhash(img: Image.Image) -> int:
     """64-bit difference hash (9×8 grayscale)."""
     gray = img.convert("L").resize((9, 8), Image.LANCZOS)
-    pixels = list(gray.getdata())
+    pixels = list(gray.get_flattened_data())
     h = 0
     for row in range(8):
         row_off = row * 9
