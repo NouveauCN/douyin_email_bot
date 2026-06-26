@@ -886,7 +886,6 @@ INDEX_HTML = (
     <a class="btn" href="{{ url_for('playlist') }}">▶ 全部播放（随机）</a>
     {% endif %}
     <span id="uploadStatus" style="font-size:12px;color:#999"></span>
-    <script>document.getElementById('uploadStatus').textContent = 'JS ✓';</script>
   </div>
 
   <!-- Pending duplicates section (populated by JS) -->
@@ -991,7 +990,7 @@ function handleUpload(e) {
           status.style.color = '#155724';
           status.textContent = '✅ ' + label + ' ' + data.filename + ' 上传成功！刷新中...';
         }
-        setTimeout(function() { location.reload(); }, 800);
+        setTimeout(function() { location.reload(); }, 1500);
       } else {
         status.style.background = '#f8d7da';
         status.style.color = '#721c24';
@@ -1104,6 +1103,7 @@ function resolveDup(path, action) {
   }).catch(function(e) { alert('请求失败: ' + e.message); });
 }
 loadDups();
+document.getElementById('uploadStatus').textContent = '就绪';
 </script>
 </body>
 </html>"""  # noqa: E501
