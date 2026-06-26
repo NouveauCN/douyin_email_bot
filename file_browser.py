@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -380,6 +381,47 @@ def api_delete():
         return {"success": False, "error": str(e)}, 500
 
 
+@app.route("/api/upload", methods=["POST"])
+def api_upload():
+    """Upload a file to downloads/uploads/, renamed with upload timestamp."""
+    if "file" not in request.files:
+        return {"success": False, "error": "缺少 file 参数"}, 400
+
+    file = request.files["file"]
+    if not file or not file.filename:
+        return {"success": False, "error": "未选择文件"}, 400
+
+    original_name = Path(file.filename).name
+    if "." in original_name:
+        stem, ext = original_name.rsplit(".", 1)
+        ext = "." + ext.lower()
+    else:
+        stem, ext = original_name, ""
+
+    safe_stem = re.sub(r"[^\w\-.\\u4e00-\\u9fff]", "_", stem).strip("_") or "upload"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    new_name = f"{timestamp}_{safe_stem}{ext}"
+
+    upload_dir = _DOWNLOAD_DIR / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    dest = upload_dir / new_name
+
+    try:
+        file.save(str(dest))
+        relpath = str(dest.relative_to(_DOWNLOAD_DIR)).replace("\\", "/")
+        log.info("Uploaded: %s (%s)", relpath, _format_size(dest.stat().st_size))
+        return {
+            "success": True,
+            "filename": new_name,
+            "relpath": relpath,
+            "size": dest.stat().st_size,
+            "size_fmt": _format_size(dest.stat().st_size),
+        }
+    except OSError as e:
+        log.error("Upload failed: %s", e)
+        return {"success": False, "error": str(e)}, 500
+
+
 # ── Error handlers ────────────────────────────────────────────────────
 
 @app.errorhandler(403)
@@ -511,6 +553,14 @@ INDEX_HTML = (
   <h1>📦 下载浏览</h1>
   <p class="subtitle">Douyin Email Bot — LAN File Browser</p>
 
+  <div style="margin-bottom:20px;display:flex;gap:10px;align-items:center">
+    <input type="file" id="uploadInput" style="display:none" onchange="handleUpload(event)">
+    <button class="btn" onclick="document.getElementById('uploadInput').click()" style="background:#25a55a">
+      📤 上传文件
+    </button>
+    <span id="uploadStatus" style="font-size:12px;color:#999"></span>
+  </div>
+
   {% if videos %}
   <div style="margin-bottom:24px">
     <a class="btn" href="{{ url_for('playlist') }}">▶ 全部播放（随机）</a>
@@ -588,6 +638,21 @@ function confirmDelete(event, path, label) {
     if (data.success) location.reload();
     else alert('删除失败: ' + (data.error || '未知错误'));
   }).catch(function(e) { alert('请求失败: ' + e.message); });
+}
+function handleUpload(e) {
+  var file = e.target.files[0];
+  if (!file) return;
+  var status = document.getElementById('uploadStatus');
+  status.textContent = '上传中...';
+  var form = new FormData();
+  form.append('file', file);
+  fetch('/api/upload', {method:'POST', body:form})
+    .then(r => r.json())
+    .then(function(data) {
+      if (data.success) { location.reload(); }
+      else { status.textContent = '上传失败: ' + (data.error || '未知错误'); }
+    })
+    .catch(function(err) { status.textContent = '上传失败: ' + err.message; });
 }
 </script>
 </body>
