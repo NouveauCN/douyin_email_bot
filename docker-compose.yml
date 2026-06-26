@@ -4,7 +4,7 @@ services:
     container_name: douyin_email_bot
     restart: unless-stopped
     volumes:
-      - downloads:/app/downloads
+      - /srv/nas_data/douyin_downloads:/app/downloads
       - logs:/app/logs
       - firefox_profile:/app/firefox_profile
       - ./config.yaml:/app/config.yaml:ro
@@ -44,7 +44,7 @@ services:
     ports:
       - "8081:8081"
     volumes:
-      - downloads:/app/downloads
+      - /srv/nas_data/douyin_downloads:/app/downloads
       - ./config.yaml:/app/config.yaml:ro
     environment:
       - DOUYIN_DOWNLOAD_PATH=/app/downloads
@@ -52,8 +52,6 @@ services:
     command: ["python3", "file_browser.py"]
 
 volumes:
-  downloads:
-    driver: local
   logs:
     driver: local
   firefox_profile:
