@@ -886,6 +886,7 @@ INDEX_HTML = (
     <a class="btn" href="{{ url_for('playlist') }}">▶ 全部播放（随机）</a>
     {% endif %}
     <span id="uploadStatus" style="font-size:12px;color:#999"></span>
+    <script>document.getElementById('uploadStatus').textContent = 'JS ✓';</script>
   </div>
 
   <!-- Pending duplicates section (populated by JS) -->
