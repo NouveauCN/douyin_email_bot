@@ -19,8 +19,11 @@ import re
 import shutil
 import subprocess
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote
+
+from PIL import Image
 
 from dotenv import load_dotenv
 from flask import Flask, abort, render_template_string, request, send_from_directory
@@ -147,6 +150,79 @@ def _scan_downloads() -> dict:
 _VIDEO_EXTS = {".mp4", ".webm"}
 # Video extensions that need ffmpeg conversion to .mp4
 _VIDEO_CONVERT_EXTS = {".mov", ".mkv", ".avi"}
+
+# ── Dedup state ──────────────────────────────────────────────────────
+
+_IMAGE_EXTS = {".webp", ".jpg", ".jpeg", ".png", ".gif"}
+_DEDUP_INDEX: dict[str, tuple[int, bytes]] = {}  # relpath → (dhash, 32×32 thumb bytes)
+_PENDING_DUPS: list[dict] = []  # pending duplicate confirmations
+_DHASH_THRESHOLD = 5
+_MSE_THRESHOLD = 50.0
+
+
+def _media_to_image(filepath: Path) -> Image.Image:
+    """Return an RGB PIL Image for a media file (image or video first frame)."""
+    ext = filepath.suffix.lower()
+    if ext in _IMAGE_EXTS:
+        return Image.open(filepath).convert("RGB")
+    # Video: extract first frame via ffmpeg, pipe JPEG to PIL
+    proc = subprocess.run([
+        "ffmpeg", "-y", "-i", str(filepath),
+        "-vframes", "1", "-f", "image2pipe", "-c:v", "mjpeg", "-q:v", "3", "-",
+    ], check=True, timeout=30, capture_output=True)
+    return Image.open(BytesIO(proc.stdout)).convert("RGB")
+
+
+def _compute_dhash(img: Image.Image) -> int:
+    """64-bit difference hash (9×8 grayscale)."""
+    gray = img.convert("L").resize((9, 8), Image.LANCZOS)
+    pixels = list(gray.getdata())
+    h = 0
+    for row in range(8):
+        row_off = row * 9
+        for col in range(8):
+            if pixels[row_off + col] > pixels[row_off + col + 1]:
+                h |= 1 << (row * 8 + col)
+    return h
+
+
+def _compute_thumbnail(img: Image.Image) -> bytes:
+    """32×32 grayscale raw bytes for MSE comparison."""
+    return img.convert("L").resize((32, 32), Image.LANCZOS).tobytes()
+
+
+def _hamming(a: int, b: int) -> int:
+    return (a ^ b).bit_count()
+
+
+def _mse(a: bytes, b: bytes) -> float:
+    n = len(a)
+    return sum((a[i] - b[i]) ** 2 for i in range(n)) / n
+
+
+def _build_dedup_index():
+    """Scan all media files under downloads/ and build the dedup index."""
+    global _DEDUP_INDEX
+    _DEDUP_INDEX.clear()
+    if not _DOWNLOAD_DIR.is_dir():
+        return
+    for entry in sorted(_DOWNLOAD_DIR.iterdir()):
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        # slides/ contains images, author dirs contain videos
+        for f in sorted(entry.iterdir()):
+            if not f.is_file():
+                continue
+            ext = f.suffix.lower()
+            if ext not in (_VIDEO_EXTS | _IMAGE_EXTS):
+                continue
+            try:
+                rel = str(f.relative_to(_DOWNLOAD_DIR)).replace("\\", "/")
+                img = _media_to_image(f)
+                _DEDUP_INDEX[rel] = (_compute_dhash(img), _compute_thumbnail(img))
+            except Exception as e:
+                log.warning("Dedup index: skipping %s — %s", f, e)
+    log.info("Dedup index built: %d files", len(_DEDUP_INDEX))
 
 
 def _mime_type(filepath: str) -> str:
@@ -375,6 +451,24 @@ def api_delete():
         log.info("Deleted: %s", target)
         if removed_dirs:
             log.info("Removed empty parent directories: %s", removed_dirs)
+
+        # Clean up dedup state
+        deleted_rel = str(target.relative_to(_DOWNLOAD_DIR)).replace("\\", "/")
+        global _DEDUP_INDEX, _PENDING_DUPS
+        if target.is_dir():
+            prefix = deleted_rel + "/"
+            _DEDUP_INDEX = {k: v for k, v in _DEDUP_INDEX.items()
+                            if not k.startswith(prefix) and k != deleted_rel}
+            _PENDING_DUPS = [d for d in _PENDING_DUPS
+                             if d["new_file"] != deleted_rel
+                             and not d["new_file"].startswith(prefix)
+                             and not d["match_file"].startswith(prefix)]
+        else:
+            _DEDUP_INDEX.pop(deleted_rel, None)
+            _PENDING_DUPS = [d for d in _PENDING_DUPS
+                             if d["new_file"] != deleted_rel
+                             and d["match_file"] != deleted_rel]
+
         download_root = _DOWNLOAD_DIR.resolve()
         return {
             "success": True,
@@ -420,8 +514,6 @@ def api_upload():
     else:
         stem, ext = original_name, ""
 
-    IMAGE_EXTS = {".webp", ".jpg", ".jpeg", ".png", ".gif"}
-
     needs_convert = False
     if ext in _VIDEO_EXTS:
         file_type = "video"
@@ -432,12 +524,12 @@ def api_upload():
         subdir = "uploads"
         out_ext = ".mp4"
         needs_convert = True
-    elif ext in IMAGE_EXTS:
+    elif ext in _IMAGE_EXTS:
         file_type = "image"
         subdir = "slides"
         out_ext = ext
     else:
-        all_allowed = _VIDEO_EXTS | _VIDEO_CONVERT_EXTS | IMAGE_EXTS
+        all_allowed = _VIDEO_EXTS | _VIDEO_CONVERT_EXTS | _IMAGE_EXTS
         return {
             "success": False,
             "error": f"不支持的文件类型 {ext}，仅支持: {', '.join(sorted(all_allowed))}",
@@ -482,7 +574,41 @@ def api_upload():
 
         relpath = str(dest.relative_to(_DOWNLOAD_DIR)).replace("\\", "/")
         log.info("Uploaded [%s]: %s (%s)", file_type, relpath, _format_size(dest.stat().st_size))
-        return {
+
+        # ── Dedup check ──
+        dup_result = None
+        try:
+            img = _media_to_image(dest)
+            new_dhash = _compute_dhash(img)
+            new_thumb = _compute_thumbnail(img)
+            for existing_rel, (existing_dhash, existing_thumb) in _DEDUP_INDEX.items():
+                if _hamming(new_dhash, existing_dhash) > _DHASH_THRESHOLD:
+                    continue
+                mse_val = _mse(new_thumb, existing_thumb)
+                if mse_val < _MSE_THRESHOLD:
+                    similarity = max(0, 100 - int(mse_val / _MSE_THRESHOLD * 100))
+                    dup_result = {
+                        "duplicate_of": existing_rel,
+                        "dhash_dist": _hamming(new_dhash, existing_dhash),
+                        "mse": round(mse_val, 1),
+                        "similarity_pct": similarity,
+                    }
+                    _PENDING_DUPS.append({
+                        "new_file": relpath,
+                        "match_file": existing_rel,
+                        "dhash_dist": dup_result["dhash_dist"],
+                        "mse": dup_result["mse"],
+                        "similarity_pct": similarity,
+                    })
+                    log.info("Duplicate candidate: %s ≈ %s (dist=%d, mse=%.1f)",
+                             relpath, existing_rel, dup_result["dhash_dist"], dup_result["mse"])
+                    break
+            if not dup_result:
+                _DEDUP_INDEX[relpath] = (new_dhash, new_thumb)
+        except Exception as e:
+            log.warning("Dedup check skipped for %s: %s", relpath, e)
+
+        response = {
             "success": True,
             "filename": new_name,
             "relpath": relpath,
@@ -491,9 +617,100 @@ def api_upload():
             "type": file_type,
             "converted": needs_convert,
         }
+        if dup_result:
+            response["duplicate"] = dup_result
+        return response
     except OSError as e:
         log.error("Upload failed: %s", e)
         return {"success": False, "error": str(e)}, 500
+
+
+@app.route("/api/dups")
+def api_list_dups():
+    """List pending duplicate confirmations with file metadata."""
+    result = []
+    for d in _PENDING_DUPS:
+        new_info = _file_info(d["new_file"])
+        match_info = _file_info(d["match_file"])
+        if new_info and match_info:
+            result.append({
+                "new_file": new_info,
+                "match_file": match_info,
+                "dhash_dist": d["dhash_dist"],
+                "mse": d["mse"],
+                "similarity_pct": d["similarity_pct"],
+            })
+    return result
+
+
+@app.route("/api/dup/delete", methods=["POST"])
+def api_dup_delete():
+    """Confirm duplicate — delete the newly uploaded file."""
+    data = request.get_json(silent=True) or {}
+    path = data.get("path", "").strip()
+    if not path:
+        return {"success": False, "error": "缺少 path 参数"}, 400
+
+    target = _safe_subpath(path)
+    if not target.exists():
+        return {"success": False, "error": "文件不存在"}, 404
+
+    try:
+        target.unlink()
+        _cleanup_empty_parents(target.parent)
+        # Remove from pending list and dedup index
+        global _PENDING_DUPS, _DEDUP_INDEX
+        _PENDING_DUPS = [d for d in _PENDING_DUPS if d["new_file"] != path]
+        _DEDUP_INDEX.pop(path, None)
+        log.info("Dup-confirmed deleted: %s", path)
+        return {"success": True}
+    except OSError as e:
+        log.error("Dup delete failed: %s", e)
+        return {"success": False, "error": str(e)}, 500
+
+
+@app.route("/api/dup/keep", methods=["POST"])
+def api_dup_keep():
+    """Mark as not a duplicate — keep file and add to dedup index."""
+    data = request.get_json(silent=True) or {}
+    path = data.get("path", "").strip()
+    if not path:
+        return {"success": False, "error": "缺少 path 参数"}, 400
+
+    target = _safe_subpath(path)
+    if not target.exists():
+        return {"success": False, "error": "文件不存在"}, 404
+
+    try:
+        # Add to dedup index
+        img = _media_to_image(target)
+        _DEDUP_INDEX[path] = (_compute_dhash(img), _compute_thumbnail(img))
+        # Remove from pending
+        global _PENDING_DUPS
+        _PENDING_DUPS = [d for d in _PENDING_DUPS if d["new_file"] != path]
+        log.info("Dup-kept: %s → added to index", path)
+        return {"success": True}
+    except Exception as e:
+        log.error("Dup keep failed: %s", e)
+        return {"success": False, "error": str(e)}, 500
+
+
+def _file_info(relpath: str) -> dict | None:
+    """Build a small info dict for a file by relative path."""
+    target = _DOWNLOAD_DIR / relpath
+    try:
+        if not target.is_file():
+            return None
+        st = target.stat()
+        return {
+            "name": target.name,
+            "relpath": relpath,
+            "size": st.st_size,
+            "size_fmt": _format_size(st.st_size),
+            "is_video": target.suffix.lower() in _VIDEO_EXTS,
+        }
+    except OSError:
+        return None
 
 
 # ── Error handlers ────────────────────────────────────────────────────
@@ -620,6 +837,37 @@ INDEX_HTML = (
     background: #e8e8e8; margin-bottom: 10px;
   }
   .card .vname { font-size: 14px; color: #333; word-break: break-all; line-height: 1.3; }
+  /* ── Pending duplicates ── */
+  .dup-section { margin-bottom: 24px; }
+  .dup-card {
+    display: flex; gap: 16px; align-items: center;
+    background: #fff3cd; border-radius: 12px; padding: 16px 20px;
+    margin-bottom: 10px; border: 1px solid #ffc107;
+    flex-wrap: wrap;
+  }
+  .dup-compare { display: flex; gap: 20px; align-items: center; flex: 1; min-width: 0; flex-wrap: wrap; }
+  .dup-file { text-align: center; min-width: 120px; }
+  .dup-file .thumb {
+    width: 120px; aspect-ratio: 9 / 16; object-fit: cover; border-radius: 8px;
+    background: #e8e8e8; margin-bottom: 6px;
+  }
+  .dup-file .fname { font-size: 12px; color: #333; word-break: break-all; line-height: 1.3; max-width: 120px; }
+  .dup-file .fsize { font-size: 11px; color: #999; }
+  .dup-vs { font-size: 24px; color: #ccc; flex-shrink: 0; }
+  .dup-info { text-align: center; flex-shrink: 0; }
+  .dup-info .pct { font-size: 28px; font-weight: 700; color: #e67e22; }
+  .dup-info .label { font-size: 11px; color: #999; }
+  .dup-actions { display: flex; gap: 8px; flex-shrink: 0; }
+  .dup-actions .keep-btn {
+    padding: 8px 16px; border-radius: 6px; border: none; cursor: pointer;
+    background: #27ae60; color: #fff; font-size: 13px; transition: opacity 0.15s;
+  }
+  .dup-actions .keep-btn:hover { opacity: 0.85; }
+  .dup-actions .del-btn2 {
+    padding: 8px 16px; border-radius: 6px; border: none; cursor: pointer;
+    background: #e74c3c; color: #fff; font-size: 13px; transition: opacity 0.15s;
+  }
+  .dup-actions .del-btn2:hover { opacity: 0.85; }
 </style>
 </head>
 <body>
@@ -637,6 +885,9 @@ INDEX_HTML = (
     {% endif %}
     <span id="uploadStatus" style="font-size:12px;color:#999"></span>
   </div>
+
+  <!-- Pending duplicates section (populated by JS) -->
+  <div id="dupSection"></div>
 
   {% if empty %}
   <div class="empty-state">
@@ -722,14 +973,69 @@ function handleUpload(e) {
     .then(function(data) {
       if (data.success) {
         var label = data.type === 'video' ? '视频' : '图片';
-        status.textContent = label + ' ' + data.filename + ' 上传成功，刷新中...';
-        setTimeout(function() { location.reload(); }, 800);
+        if (data.duplicate) {
+          status.textContent = '⚠️ ' + label + ' ' + data.filename + ' 已标记为待确认重复，刷新中...';
+        } else {
+          status.textContent = label + ' ' + data.filename + ' 上传成功，刷新中...';
+        }
+        setTimeout(function() { location.reload(); }, 1000);
       } else {
         status.textContent = '上传失败: ' + (data.error || '未知错误');
       }
     })
     .catch(function(err) { status.textContent = '上传失败: ' + err.message; });
 }
+// ── Pending duplicates ──
+function loadDups() {
+  fetch('/api/dups')
+    .then(r => r.json())
+    .then(function(dups) {
+      var container = document.getElementById('dupSection');
+      if (!dups.length) { container.innerHTML = ''; return; }
+      var html = '<div class="section-header" onclick="toggleSection(this)" title="点击折叠/展开">' +
+        '<span class="arrow">▼</span> ⚠️ 待确认重复' +
+        '<span class="section-count">' + dups.length + ' 项</span></div>' +
+        '<div class="collapsible-body dup-section">';
+      dups.forEach(function(d) {
+        var newThumb = d.new_file.is_video
+          ? '<div class="thumb" style="background:#ddd;display:flex;align-items:center;justify-content:center;font-size:32px">🎬</div>'
+          : '<img class="thumb" src="/raw/' + d.new_file.relpath + '" loading="lazy">';
+        var matchThumb = d.match_file.is_video
+          ? '<div class="thumb" style="background:#ddd;display:flex;align-items:center;justify-content:center;font-size:32px">🎬</div>'
+          : '<img class="thumb" src="/raw/' + d.match_file.relpath + '" loading="lazy">';
+        html += '<div class="dup-card">' +
+          '<div class="dup-compare">' +
+            '<div class="dup-file">' + newThumb +
+              '<div class="fname">📥 ' + d.new_file.name + '</div>' +
+              '<div class="fsize">' + d.new_file.size_fmt + '</div></div>' +
+            '<div class="dup-vs">≈</div>' +
+            '<div class="dup-file">' + matchThumb +
+              '<div class="fname">📁 ' + d.match_file.name + '</div>' +
+              '<div class="fsize">' + d.match_file.size_fmt + '</div></div>' +
+          '</div>' +
+          '<div class="dup-info"><div class="pct">' + d.similarity_pct + '%</div>' +
+            '<div class="label">相似度 (d=' + d.dhash_dist + ')</div></div>' +
+          '<div class="dup-actions">' +
+            '<button class="keep-btn" onclick="resolveDup(\'' + d.new_file.relpath + '\', \'keep\')">✅ 保留</button>' +
+            '<button class="del-btn2" onclick="resolveDup(\'' + d.new_file.relpath + '\', \'delete\')">🗑 删除</button>' +
+          '</div></div>';
+      });
+      html += '</div>';
+      container.innerHTML = html;
+    }).catch(function() {});
+}
+function resolveDup(path, action) {
+  var endpoint = action === 'delete' ? '/api/dup/delete' : '/api/dup/keep';
+  fetch(endpoint, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({path: path})
+  }).then(r => r.json()).then(function(data) {
+    if (data.success) location.reload();
+    else alert('操作失败: ' + (data.error || '未知错误'));
+  }).catch(function(e) { alert('请求失败: ' + e.message); });
+}
+loadDups();
 </script>
 </body>
 </html>"""  # noqa: E501
@@ -1358,6 +1664,8 @@ def main():
 
     log.info("Starting file browser on http://%s:%d", args.host, args.port)
     log.info("Serving downloads from: %s", _DOWNLOAD_DIR)
+
+    _build_dedup_index()
 
     try:
         app.run(host=args.host, port=args.port, debug=args.debug)
