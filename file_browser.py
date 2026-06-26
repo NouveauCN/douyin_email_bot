@@ -118,9 +118,9 @@ def _scan_downloads() -> dict:
                         "date": date_str,
                     })
         else:
-            # Author folder — collect all .mp4 files
+            # Author folder — collect all video files
             for vid in sorted(entry.iterdir(), reverse=True):
-                if vid.is_file() and vid.suffix.lower() == ".mp4":
+                if vid.is_file() and vid.suffix.lower() in _VIDEO_EXTS:
                     relpath = str(vid.relative_to(_DOWNLOAD_DIR)).replace("\\", "/")
                     date_str = _format_date(vid.name[:8]) if len(vid.name) >= 8 else ""
                     videos.append({
@@ -143,11 +143,18 @@ def _scan_downloads() -> dict:
     }
 
 
+# Video extensions browsers can play natively
+_VIDEO_EXTS = {".mp4", ".webm"}
+# Video extensions that need ffmpeg conversion to .mp4
+_VIDEO_CONVERT_EXTS = {".mov", ".mkv", ".avi"}
+
+
 def _mime_type(filepath: str) -> str:
     """Map file extension to MIME type."""
     ext = Path(filepath).suffix.lower()
     return {
         ".mp4": "video/mp4",
+        ".webm": "video/webm",
         ".webp": "image/webp",
         ".jpg": "image/jpeg",
         ".jpeg": "image/jpeg",
@@ -157,7 +164,7 @@ def _mime_type(filepath: str) -> str:
 
 
 def _collect_videos(author: str | None = None) -> list[dict]:
-    """Collect all .mp4 videos, optionally filtered by author folder."""
+    """Collect all videos, optionally filtered by author folder."""
     videos = []
     if not _DOWNLOAD_DIR.is_dir():
         return videos
@@ -167,7 +174,7 @@ def _collect_videos(author: str | None = None) -> list[dict]:
         if author and entry.name != author:
             continue
         for vid in sorted(entry.iterdir()):
-            if vid.is_file() and vid.suffix.lower() == ".mp4":
+            if vid.is_file() and vid.suffix.lower() in _VIDEO_EXTS:
                 relpath = str(vid.relative_to(_DOWNLOAD_DIR)).replace("\\", "/")
                 videos.append({
                     "name": vid.name,
@@ -205,7 +212,7 @@ def browse(subpath):
                 "size": f.stat().st_size,
                 "size_fmt": _format_size(f.stat().st_size),
                 "relpath": str(f.relative_to(_DOWNLOAD_DIR)).replace("\\", "/"),
-                "is_video": f.suffix.lower() == ".mp4",
+                "is_video": f.suffix.lower() in _VIDEO_EXTS,
                 "is_image": f.suffix.lower() in (".webp", ".jpg", ".jpeg", ".png", ".gif"),
                 "date": _format_date(f.name[:8]) if len(f.name) >= 8 else "",
             })
@@ -381,9 +388,24 @@ def api_delete():
         return {"success": False, "error": str(e)}, 500
 
 
+def _convert_video(src: Path, dst: Path) -> bool:
+    """Convert video to H.264/AAC mp4 via ffmpeg. Returns True on success."""
+    try:
+        subprocess.run([
+            "ffmpeg", "-y", "-i", str(src),
+            "-c:v", "libx264", "-c:a", "aac",
+            "-movflags", "+faststart",
+            str(dst),
+        ], check=True, timeout=300, capture_output=True)
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        log.error("Video conversion failed for %s: %s", src, e)
+        return False
+
+
 @app.route("/api/upload", methods=["POST"])
 def api_upload():
-    """Upload a file; images → slides/, videos → uploads/. Renamed with timestamp."""
+    """Upload a file; images → slides/, videos → uploads/ (convert if needed)."""
     if "file" not in request.files:
         return {"success": False, "error": "缺少 file 参数"}, 400
 
@@ -398,32 +420,66 @@ def api_upload():
     else:
         stem, ext = original_name, ""
 
-    VIDEO_EXTS = {".mp4"}
     IMAGE_EXTS = {".webp", ".jpg", ".jpeg", ".png", ".gif"}
 
-    if ext in VIDEO_EXTS:
+    needs_convert = False
+    if ext in _VIDEO_EXTS:
         file_type = "video"
         subdir = "uploads"
+        out_ext = ext
+    elif ext in _VIDEO_CONVERT_EXTS:
+        file_type = "video"
+        subdir = "uploads"
+        out_ext = ".mp4"
+        needs_convert = True
     elif ext in IMAGE_EXTS:
         file_type = "image"
         subdir = "slides"
+        out_ext = ext
     else:
-        allowed = ", ".join(sorted(VIDEO_EXTS | IMAGE_EXTS))
+        all_allowed = _VIDEO_EXTS | _VIDEO_CONVERT_EXTS | IMAGE_EXTS
         return {
             "success": False,
-            "error": f"不支持的文件类型 {ext}，仅支持: {allowed}",
+            "error": f"不支持的文件类型 {ext}，仅支持: {', '.join(sorted(all_allowed))}",
         }, 400
 
     safe_stem = re.sub(r"[^\w\-.\\u4e00-\\u9fff]", "_", stem).strip("_") or "upload"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    new_name = f"{timestamp}_{safe_stem}{ext}"
+    new_name = f"{timestamp}_{safe_stem}{out_ext}"
 
     dest_dir = _DOWNLOAD_DIR / subdir
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / new_name
 
+    # For conversion: save as temp file first, then convert
+    if needs_convert:
+        tmp_name = f"{timestamp}_{safe_stem}{ext}"
+        tmp_path = dest_dir / tmp_name
+    else:
+        tmp_path = None
+
     try:
-        file.save(str(dest))
+        save_path = tmp_path if needs_convert else dest
+        file.save(str(save_path))
+        log.info("Saved upload: %s (%s)", save_path, _format_size(save_path.stat().st_size))
+
+        if needs_convert:
+            log.info("Converting %s → %s ...", tmp_path.name, new_name)
+            if not _convert_video(tmp_path, dest):
+                # Clean up both files on failure
+                for p in (tmp_path, dest):
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+                return {"success": False, "error": "视频转码失败，请检查文件格式"}, 500
+            # Remove the original after successful conversion
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+            log.info("Conversion complete: %s", new_name)
+
         relpath = str(dest.relative_to(_DOWNLOAD_DIR)).replace("\\", "/")
         log.info("Uploaded [%s]: %s (%s)", file_type, relpath, _format_size(dest.stat().st_size))
         return {
@@ -433,6 +489,7 @@ def api_upload():
             "size": dest.stat().st_size,
             "size_fmt": _format_size(dest.stat().st_size),
             "type": file_type,
+            "converted": needs_convert,
         }
     except OSError as e:
         log.error("Upload failed: %s", e)
@@ -571,7 +628,7 @@ INDEX_HTML = (
   <p class="subtitle">Douyin Email Bot — LAN File Browser</p>
 
   <div style="margin-bottom:20px;display:flex;gap:10px;align-items:center">
-    <input type="file" id="uploadInput" style="display:none" accept="video/mp4,image/*" onchange="handleUpload(event)">
+    <input type="file" id="uploadInput" style="display:none" accept="video/*,image/*" onchange="handleUpload(event)">
     <button class="btn" onclick="document.getElementById('uploadInput').click()" style="background:#25a55a">
       📤 上传文件
     </button>
