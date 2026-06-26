@@ -26,7 +26,7 @@ from urllib.parse import quote
 from PIL import Image
 
 from dotenv import load_dotenv
-from flask import Flask, abort, render_template_string, request, send_from_directory
+from flask import Flask, abort, make_response, render_template_string, request, send_from_directory
 
 # ── Bootstrap ────────────────────────────────────────────────────────
 _PROJECT_DIR = Path(__file__).parent
@@ -269,7 +269,9 @@ def _collect_videos(author: str | None = None) -> list[dict]:
 def index():
     """Top-level index: author folders + slideshow groups."""
     data = _scan_downloads()
-    return render_template_string(INDEX_HTML, **data)
+    resp = make_response(render_template_string(INDEX_HTML, **data))
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return resp
 
 
 @app.route("/browse/<path:subpath>")
@@ -965,7 +967,13 @@ function handleUpload(e) {
   var file = e.target.files[0];
   if (!file) return;
   var status = document.getElementById('uploadStatus');
-  status.textContent = '上传中...';
+  status.style.display = 'inline-block';
+  status.style.padding = '6px 14px';
+  status.style.borderRadius = '6px';
+  status.style.fontWeight = '600';
+  status.textContent = '⏳ 上传中...';
+  status.style.background = '#fff3cd';
+  status.style.color = '#856404';
   var form = new FormData();
   form.append('file', file);
   fetch('/api/upload', {method:'POST', body:form})
@@ -974,22 +982,25 @@ function handleUpload(e) {
       if (data.success) {
         var label = data.type === 'video' ? '视频' : '图片';
         if (data.duplicate) {
-          var msg = '⚠️ 已标记为待确认重复！\n相似度: ' + data.duplicate.similarity_pct + '%\n与已有文件: ' + data.duplicate.duplicate_of;
-          alert(msg);
-          status.textContent = '已标记为待确认重复，刷新中...';
+          status.style.background = '#fff3cd';
+          status.style.color = '#856404';
+          status.textContent = '⚠️ 重复候选！相似度 ' + data.duplicate.similarity_pct + '%，刷新中...';
         } else {
-          alert(label + ' ' + data.filename + ' 上传成功！');
-          status.textContent = '上传成功，刷新中...';
+          status.style.background = '#d4edda';
+          status.style.color = '#155724';
+          status.textContent = '✅ ' + label + ' ' + data.filename + ' 上传成功！刷新中...';
         }
-        setTimeout(function() { location.reload(); }, 500);
+        setTimeout(function() { location.reload(); }, 800);
       } else {
-        alert('上传失败: ' + (data.error || '未知错误'));
-        status.textContent = '上传失败: ' + (data.error || '未知错误');
+        status.style.background = '#f8d7da';
+        status.style.color = '#721c24';
+        status.textContent = '❌ 上传失败: ' + (data.error || '未知错误');
       }
     })
     .catch(function(err) {
-      alert('请求失败: ' + err.message);
-      status.textContent = '上传失败: ' + err.message;
+      status.style.background = '#f8d7da';
+      status.style.color = '#721c24';
+      status.textContent = '❌ 请求失败: ' + err.message;
     });
 }
 // ── Pending duplicates ──
