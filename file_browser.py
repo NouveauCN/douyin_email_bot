@@ -647,11 +647,22 @@ def api_list_dups():
 
 @app.route("/api/dup/delete", methods=["POST"])
 def api_dup_delete():
-    """Confirm duplicate — delete the newly uploaded file."""
+    """Delete one file from a duplicate pair — path may be new or match."""
+    global _PENDING_DUPS, _DEDUP_INDEX
+
     data = request.get_json(silent=True) or {}
     path = data.get("path", "").strip()
     if not path:
         return {"success": False, "error": "缺少 path 参数"}, 400
+
+    # Find the pending entry by either new_file or match_file
+    entry = None
+    for d in _PENDING_DUPS:
+        if d["new_file"] == path or d["match_file"] == path:
+            entry = d
+            break
+    if not entry:
+        return {"success": False, "error": "未找到对应的重复记录"}, 404
 
     target = _safe_subpath(path)
     if not target.exists():
@@ -660,11 +671,24 @@ def api_dup_delete():
     try:
         target.unlink()
         _cleanup_empty_parents(target.parent)
-        # Remove from pending list and dedup index
-        global _PENDING_DUPS, _DEDUP_INDEX
-        _PENDING_DUPS = [d for d in _PENDING_DUPS if d["new_file"] != path]
+
+        # If deleting the match (existing) file, index the new file
+        if path == entry["match_file"]:
+            new_target = _safe_subpath(entry["new_file"])
+            if new_target.exists():
+                img = _media_to_image(new_target)
+                _DEDUP_INDEX[entry["new_file"]] = (
+                    _compute_dhash(img),
+                    _compute_thumbnail(img),
+                )
+                log.info("Dup resolved: deleted match %s, indexed new %s",
+                         path, entry["new_file"])
+        else:
+            log.info("Dup resolved: deleted new %s, kept match %s",
+                     path, entry["match_file"])
+
+        _PENDING_DUPS = [d for d in _PENDING_DUPS if d != entry]
         _DEDUP_INDEX.pop(path, None)
-        log.info("Dup-confirmed deleted: %s", path)
         return {"success": True}
     except OSError as e:
         log.error("Dup delete failed: %s", e)
@@ -908,7 +932,7 @@ INDEX_HTML = (
   {% for v in videos %}
     <div class="card">
       <a class="card-inner" href="{{ url_for('view_video', filepath=v.relpath) }}">
-        <img class="card-thumb" src="{{ url_for('thumb', filepath=v.relpath) }}" loading="lazy" alt="">
+        <img class="card-thumb" src="{{ url_for('thumb', filepath=v.relpath) }}" loading="lazy" alt="" width="180" height="320">
         <div class="vname">{{ v.name }}</div>
         <div class="meta" style="margin-top:4px">
           <span class="stat">{{ v.author }}</span>
@@ -931,7 +955,7 @@ INDEX_HTML = (
   {% for s in slides %}
     <div class="card">
       <a class="card-inner" href="{{ url_for('raw_file', filepath=s.relpath) }}" target="_blank">
-        <img class="card-thumb" src="{{ url_for('raw_file', filepath=s.relpath) }}" loading="lazy" alt="">
+        <img class="card-thumb" src="{{ url_for('raw_file', filepath=s.relpath) }}" loading="lazy" alt="" width="180" height="320">
         <div class="vname">{{ s.name }}</div>
         <div class="meta" style="margin-top:4px">
           <span class="stat">{{ s.date }}</span>
@@ -1036,7 +1060,7 @@ function loadDups() {
         if (d.new_file.is_video) {
           newFile.innerHTML = '<div class="thumb" style="background:#ddd;display:flex;align-items:center;justify-content:center;font-size:32px">🎬</div>';
         } else {
-          newFile.innerHTML = '<img class="thumb" src="/raw/' + d.new_file.relpath + '" loading="lazy">';
+          newFile.innerHTML = '<img class="thumb" src="/raw/' + d.new_file.relpath + '" loading="lazy" width="120" height="213">';
         }
         newFile.innerHTML += '<div class="fname">📥 ' + d.new_file.name + '</div>' +
           '<div class="fsize">' + d.new_file.size_fmt + '</div>';
@@ -1052,7 +1076,7 @@ function loadDups() {
         if (d.match_file.is_video) {
           matchFile.innerHTML = '<div class="thumb" style="background:#ddd;display:flex;align-items:center;justify-content:center;font-size:32px">🎬</div>';
         } else {
-          matchFile.innerHTML = '<img class="thumb" src="/raw/' + d.match_file.relpath + '" loading="lazy">';
+          matchFile.innerHTML = '<img class="thumb" src="/raw/' + d.match_file.relpath + '" loading="lazy" width="120" height="213">';
         }
         matchFile.innerHTML += '<div class="fname">📁 ' + d.match_file.name + '</div>' +
           '<div class="fsize">' + d.match_file.size_fmt + '</div>';
@@ -1071,17 +1095,27 @@ function loadDups() {
         var actions = document.createElement('div');
         actions.className = 'dup-actions';
 
-        var keepBtn = document.createElement('button');
-        keepBtn.className = 'keep-btn';
-        keepBtn.textContent = '✅ 保留';
-        keepBtn.onclick = function() { resolveDup(d.new_file.relpath, 'keep'); };
-        actions.appendChild(keepBtn);
+        var keepNewBtn = document.createElement('button');
+        keepNewBtn.className = 'keep-btn';
+        keepNewBtn.textContent = '⭐ 保留新版';
+        keepNewBtn.title = '删除旧文件，保留新上传的文件';
+        keepNewBtn.onclick = function() { resolveDup(d.match_file.relpath, 'delete', '旧文件 ' + d.match_file.name); };
+        actions.appendChild(keepNewBtn);
 
-        var delBtn = document.createElement('button');
-        delBtn.className = 'del-btn2';
-        delBtn.textContent = '🗑 删除';
-        delBtn.onclick = function() { resolveDup(d.new_file.relpath, 'delete'); };
-        actions.appendChild(delBtn);
+        var keepOldBtn = document.createElement('button');
+        keepOldBtn.className = 'del-btn2';
+        keepOldBtn.textContent = '📁 保留旧版';
+        keepOldBtn.title = '删除新文件，保留已有的文件';
+        keepOldBtn.onclick = function() { resolveDup(d.new_file.relpath, 'delete', '新文件 ' + d.new_file.name); };
+        actions.appendChild(keepOldBtn);
+
+        var keepBothBtn = document.createElement('button');
+        keepBothBtn.className = 'keep-btn';
+        keepBothBtn.style.background = '#3498db';
+        keepBothBtn.textContent = '✅ 都保留';
+        keepBothBtn.title = '两个文件都保留';
+        keepBothBtn.onclick = function() { resolveDup(d.new_file.relpath, 'keep'); };
+        actions.appendChild(keepBothBtn);
 
         card.appendChild(actions);
         body.appendChild(card);
@@ -1090,8 +1124,8 @@ function loadDups() {
       container.appendChild(body);
     }).catch(function() {});
 }
-function resolveDup(path, action) {
-  if (action === 'delete' && !confirm('确定删除这个重复文件吗？')) return;
+function resolveDup(path, action, label) {
+  if (action === 'delete' && !confirm('确定删除' + (label || '这个文件') + '吗？')) return;
   var endpoint = action === 'delete' ? '/api/dup/delete' : '/api/dup/keep';
   fetch(endpoint, {
     method: 'POST',
