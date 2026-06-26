@@ -18,7 +18,6 @@ The repository also includes:
 - a Flask QR-code login service;
 - a Flask LAN file browser and playlist UI;
 - a local random video player;
-- Windows Task Scheduler scripts;
 - Docker Compose deployment for the bot and web services.
 
 ## Repository map
@@ -40,7 +39,6 @@ The repository also includes:
 ├── test_download.py        # One-shot integration smoke test
 ├── config.yaml             # Non-secret application configuration
 ├── conf/                   # F2 runtime configuration
-├── scripts/                # Windows scheduled-task setup and launcher scripts
 ├── Dockerfile
 └── docker-compose.yml
 ```
@@ -321,19 +319,6 @@ assumptions.
 The remote host is execution-only. Code changes should be made in a development
 checkout, reviewed and pushed through Git, then pulled on the server.
 
-## Windows background service
-
-The scripts under `scripts/` register the bot as a hidden scheduled task:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\setup_task.ps1
-powershell -ExecutionPolicy Bypass -File scripts\teardown_task.ps1
-```
-
-`scripts/launcher.ps1` locates `uv.exe`, switches to the project root, and runs
-`uv run python main.py`. `main.py` writes DEBUG logs to
-`logs/bot.log` using a 10 MB rotating handler with five backups. Console logging
-is attached only for an interactive TTY.
 
 ## Change guidelines and known pitfalls
 
