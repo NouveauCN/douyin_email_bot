@@ -383,7 +383,7 @@ def api_delete():
 
 @app.route("/api/upload", methods=["POST"])
 def api_upload():
-    """Upload a file to downloads/uploads/, renamed with upload timestamp."""
+    """Upload a file; images → slides/, videos → uploads/. Renamed with timestamp."""
     if "file" not in request.files:
         return {"success": False, "error": "缺少 file 参数"}, 400
 
@@ -398,24 +398,41 @@ def api_upload():
     else:
         stem, ext = original_name, ""
 
+    VIDEO_EXTS = {".mp4"}
+    IMAGE_EXTS = {".webp", ".jpg", ".jpeg", ".png", ".gif"}
+
+    if ext in VIDEO_EXTS:
+        file_type = "video"
+        subdir = "uploads"
+    elif ext in IMAGE_EXTS:
+        file_type = "image"
+        subdir = "slides"
+    else:
+        allowed = ", ".join(sorted(VIDEO_EXTS | IMAGE_EXTS))
+        return {
+            "success": False,
+            "error": f"不支持的文件类型 {ext}，仅支持: {allowed}",
+        }, 400
+
     safe_stem = re.sub(r"[^\w\-.\\u4e00-\\u9fff]", "_", stem).strip("_") or "upload"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     new_name = f"{timestamp}_{safe_stem}{ext}"
 
-    upload_dir = _DOWNLOAD_DIR / "uploads"
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    dest = upload_dir / new_name
+    dest_dir = _DOWNLOAD_DIR / subdir
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / new_name
 
     try:
         file.save(str(dest))
         relpath = str(dest.relative_to(_DOWNLOAD_DIR)).replace("\\", "/")
-        log.info("Uploaded: %s (%s)", relpath, _format_size(dest.stat().st_size))
+        log.info("Uploaded [%s]: %s (%s)", file_type, relpath, _format_size(dest.stat().st_size))
         return {
             "success": True,
             "filename": new_name,
             "relpath": relpath,
             "size": dest.stat().st_size,
             "size_fmt": _format_size(dest.stat().st_size),
+            "type": file_type,
         }
     except OSError as e:
         log.error("Upload failed: %s", e)
@@ -554,7 +571,7 @@ INDEX_HTML = (
   <p class="subtitle">Douyin Email Bot — LAN File Browser</p>
 
   <div style="margin-bottom:20px;display:flex;gap:10px;align-items:center">
-    <input type="file" id="uploadInput" style="display:none" onchange="handleUpload(event)">
+    <input type="file" id="uploadInput" style="display:none" accept="video/mp4,image/*" onchange="handleUpload(event)">
     <button class="btn" onclick="document.getElementById('uploadInput').click()" style="background:#25a55a">
       📤 上传文件
     </button>
@@ -649,8 +666,13 @@ function handleUpload(e) {
   fetch('/api/upload', {method:'POST', body:form})
     .then(r => r.json())
     .then(function(data) {
-      if (data.success) { location.reload(); }
-      else { status.textContent = '上传失败: ' + (data.error || '未知错误'); }
+      if (data.success) {
+        var label = data.type === 'video' ? '视频' : '图片';
+        status.textContent = label + ' ' + data.filename + ' 上传成功，刷新中...';
+        setTimeout(function() { location.reload(); }, 800);
+      } else {
+        status.textContent = '上传失败: ' + (data.error || '未知错误');
+      }
     })
     .catch(function(err) { status.textContent = '上传失败: ' + err.message; });
 }
