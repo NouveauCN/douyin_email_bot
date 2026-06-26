@@ -44,7 +44,7 @@ services:
     ports:
       - "8081:8081"
     volumes:
-      - downloads:/app/downloads:ro
+      - downloads:/app/downloads
       - ./config.yaml:/app/config.yaml:ro
     environment:
       - DOUYIN_DOWNLOAD_PATH=/app/downloads
