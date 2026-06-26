@@ -969,68 +969,124 @@ function handleUpload(e) {
   var form = new FormData();
   form.append('file', file);
   fetch('/api/upload', {method:'POST', body:form})
-    .then(r => r.json())
+    .then(function(r) { return r.json(); })
     .then(function(data) {
       if (data.success) {
         var label = data.type === 'video' ? '视频' : '图片';
         if (data.duplicate) {
-          status.textContent = '⚠️ ' + label + ' ' + data.filename + ' 已标记为待确认重复，刷新中...';
+          var msg = '⚠️ 已标记为待确认重复！\n相似度: ' + data.duplicate.similarity_pct + '%\n与已有文件: ' + data.duplicate.duplicate_of;
+          alert(msg);
+          status.textContent = '已标记为待确认重复，刷新中...';
         } else {
-          status.textContent = label + ' ' + data.filename + ' 上传成功，刷新中...';
+          alert(label + ' ' + data.filename + ' 上传成功！');
+          status.textContent = '上传成功，刷新中...';
         }
-        setTimeout(function() { location.reload(); }, 1000);
+        setTimeout(function() { location.reload(); }, 500);
       } else {
+        alert('上传失败: ' + (data.error || '未知错误'));
         status.textContent = '上传失败: ' + (data.error || '未知错误');
       }
     })
-    .catch(function(err) { status.textContent = '上传失败: ' + err.message; });
+    .catch(function(err) {
+      alert('请求失败: ' + err.message);
+      status.textContent = '上传失败: ' + err.message;
+    });
 }
 // ── Pending duplicates ──
 function loadDups() {
   fetch('/api/dups')
-    .then(r => r.json())
+    .then(function(r) { return r.json(); })
     .then(function(dups) {
       var container = document.getElementById('dupSection');
-      if (!dups.length) { container.innerHTML = ''; return; }
-      var html = '<div class="section-header" onclick="toggleSection(this)" title="点击折叠/展开">' +
-        '<span class="arrow">▼</span> ⚠️ 待确认重复' +
-        '<span class="section-count">' + dups.length + ' 项</span></div>' +
-        '<div class="collapsible-body dup-section">';
+      container.innerHTML = '';
+      if (!dups.length) return;
+
+      var header = document.createElement('div');
+      header.className = 'section-header';
+      header.title = '点击折叠/展开';
+      header.onclick = function() { toggleSection(header); };
+      header.innerHTML = '<span class="arrow">▼</span> ⚠️ 待确认重复' +
+        '<span class="section-count">' + dups.length + ' 项</span>';
+      container.appendChild(header);
+
+      var body = document.createElement('div');
+      body.className = 'collapsible-body dup-section';
+
       dups.forEach(function(d) {
-        var newThumb = d.new_file.is_video
-          ? '<div class="thumb" style="background:#ddd;display:flex;align-items:center;justify-content:center;font-size:32px">🎬</div>'
-          : '<img class="thumb" src="/raw/' + d.new_file.relpath + '" loading="lazy">';
-        var matchThumb = d.match_file.is_video
-          ? '<div class="thumb" style="background:#ddd;display:flex;align-items:center;justify-content:center;font-size:32px">🎬</div>'
-          : '<img class="thumb" src="/raw/' + d.match_file.relpath + '" loading="lazy">';
-        html += '<div class="dup-card">' +
-          '<div class="dup-compare">' +
-            '<div class="dup-file">' + newThumb +
-              '<div class="fname">📥 ' + d.new_file.name + '</div>' +
-              '<div class="fsize">' + d.new_file.size_fmt + '</div></div>' +
-            '<div class="dup-vs">≈</div>' +
-            '<div class="dup-file">' + matchThumb +
-              '<div class="fname">📁 ' + d.match_file.name + '</div>' +
-              '<div class="fsize">' + d.match_file.size_fmt + '</div></div>' +
-          '</div>' +
-          '<div class="dup-info"><div class="pct">' + d.similarity_pct + '%</div>' +
-            '<div class="label">相似度 (d=' + d.dhash_dist + ')</div></div>' +
-          '<div class="dup-actions">' +
-            '<button class="keep-btn" onclick="resolveDup(\'' + d.new_file.relpath + '\', \'keep\')">✅ 保留</button>' +
-            '<button class="del-btn2" onclick="resolveDup(\'' + d.new_file.relpath + '\', \'delete\')">🗑 删除</button>' +
-          '</div></div>';
+        var card = document.createElement('div');
+        card.className = 'dup-card';
+
+        // Compare section
+        var compare = document.createElement('div');
+        compare.className = 'dup-compare';
+
+        var newFile = document.createElement('div');
+        newFile.className = 'dup-file';
+        if (d.new_file.is_video) {
+          newFile.innerHTML = '<div class="thumb" style="background:#ddd;display:flex;align-items:center;justify-content:center;font-size:32px">🎬</div>';
+        } else {
+          newFile.innerHTML = '<img class="thumb" src="/raw/' + d.new_file.relpath + '" loading="lazy">';
+        }
+        newFile.innerHTML += '<div class="fname">📥 ' + d.new_file.name + '</div>' +
+          '<div class="fsize">' + d.new_file.size_fmt + '</div>';
+        compare.appendChild(newFile);
+
+        var vs = document.createElement('div');
+        vs.className = 'dup-vs';
+        vs.textContent = '≈';
+        compare.appendChild(vs);
+
+        var matchFile = document.createElement('div');
+        matchFile.className = 'dup-file';
+        if (d.match_file.is_video) {
+          matchFile.innerHTML = '<div class="thumb" style="background:#ddd;display:flex;align-items:center;justify-content:center;font-size:32px">🎬</div>';
+        } else {
+          matchFile.innerHTML = '<img class="thumb" src="/raw/' + d.match_file.relpath + '" loading="lazy">';
+        }
+        matchFile.innerHTML += '<div class="fname">📁 ' + d.match_file.name + '</div>' +
+          '<div class="fsize">' + d.match_file.size_fmt + '</div>';
+        compare.appendChild(matchFile);
+
+        card.appendChild(compare);
+
+        // Info
+        var info = document.createElement('div');
+        info.className = 'dup-info';
+        info.innerHTML = '<div class="pct">' + d.similarity_pct + '%</div>' +
+          '<div class="label">相似度 (d=' + d.dhash_dist + ')</div>';
+        card.appendChild(info);
+
+        // Actions — closure captures d, no escaping issues
+        var actions = document.createElement('div');
+        actions.className = 'dup-actions';
+
+        var keepBtn = document.createElement('button');
+        keepBtn.className = 'keep-btn';
+        keepBtn.textContent = '✅ 保留';
+        keepBtn.onclick = function() { resolveDup(d.new_file.relpath, 'keep'); };
+        actions.appendChild(keepBtn);
+
+        var delBtn = document.createElement('button');
+        delBtn.className = 'del-btn2';
+        delBtn.textContent = '🗑 删除';
+        delBtn.onclick = function() { resolveDup(d.new_file.relpath, 'delete'); };
+        actions.appendChild(delBtn);
+
+        card.appendChild(actions);
+        body.appendChild(card);
       });
-      html += '</div>';
-      container.innerHTML = html;
+
+      container.appendChild(body);
     }).catch(function() {});
 }
 function resolveDup(path, action) {
+  if (action === 'delete' && !confirm('确定删除这个重复文件吗？')) return;
   var endpoint = action === 'delete' ? '/api/dup/delete' : '/api/dup/keep';
   fetch(endpoint, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({path: path})
-  }).then(r => r.json()).then(function(data) {
+  }).then(function(r) { return r.json(); }).then(function(data) {
     if (data.success) location.reload();
     else alert('操作失败: ' + (data.error || '未知错误'));
   }).catch(function(e) { alert('请求失败: ' + e.message); });
