@@ -17,6 +17,13 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# yutto conflicts with F2's pinned aiofiles/pydantic dependency set, so keep it
+# in an isolated CLI environment and expose only the executable to the bot.
+RUN python3 -m venv /opt/yutto \
+    && /opt/yutto/bin/pip install --no-cache-dir "yutto>=2.2.0" \
+    && ln -s /opt/yutto/bin/yutto /usr/local/bin/yutto \
+    && yutto --help >/dev/null
+
 # ── Playwright Firefox (browser binary + system libs) ──────────────
 RUN python3 -m playwright install-deps firefox
 RUN python3 -m playwright install firefox

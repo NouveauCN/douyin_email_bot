@@ -11,6 +11,13 @@ Docker env-var overrides:
     DOUYIN_TIMEOUT        — overrides douyin.timeout
     DOUYIN_MAX_RETRIES    — overrides douyin.max_retries
     DOUYIN_MAX_TASKS      — overrides douyin.max_tasks
+    BILIBILI_DOWNLOAD_PATH — overrides bilibili.download_path
+    BILIBILI_AUTH         — overrides bilibili.auth
+    BILIBILI_AUTH_FILE    — overrides bilibili.auth_file
+    BILIBILI_TIMEOUT      — overrides bilibili.timeout
+    BILIBILI_BATCH        — overrides bilibili.batch
+    BILIBILI_VIDEO_QUALITY — overrides bilibili.video_quality
+    BILIBILI_YUTTO_BIN    — overrides bilibili.yutto_bin
     EMAIL_POLL_INTERVAL   — overrides email.poll_interval
     BOT_ALLOWED_SENDERS   — overrides bot.allowed_senders (comma-separated)
     BOT_COOLDOWN_SECONDS  — overrides bot.cooldown_seconds
@@ -37,6 +44,13 @@ def _env_int(name: str, fallback: int) -> int:
 
 def _env_str(name: str, fallback: str) -> str:
     return os.getenv(name) or fallback
+
+
+def _env_bool(name: str, fallback: bool) -> bool:
+    val = os.getenv(name)
+    if val is None or not val.strip():
+        return fallback
+    return val.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _parse_allowed_senders(value) -> list[str]:
@@ -81,6 +95,22 @@ class DouyinConfig:
 
 
 @dataclass
+class BilibiliConfig:
+    """Bilibili download settings.
+
+    auth is loaded from BILIBILI_AUTH env var, not YAML.
+    """
+
+    download_path: str = "./downloads/bilibili"
+    auth: str = ""          # From BILIBILI_AUTH env var
+    auth_file: str = ""     # From BILIBILI_AUTH_FILE env var
+    timeout: int = 3600
+    batch: bool = False
+    video_quality: int = 127
+    yutto_bin: str = "yutto"
+
+
+@dataclass
 class BotCommands:
     """Email subject keywords that trigger special actions."""
 
@@ -113,6 +143,7 @@ class AppConfig:
 
     email: EmailConfig
     douyin: DouyinConfig
+    bilibili: BilibiliConfig
     bot: BotConfig
     cookie_extractor: CookieExtractorConfig
 
@@ -164,6 +195,27 @@ def load_config(path: Path) -> AppConfig:
         max_tasks=_env_int("DOUYIN_MAX_TASKS", douyin_raw.get("max_tasks", 5)),
     )
 
+    # ── Bilibili ──
+    bilibili_raw = raw.get("bilibili", {})
+    _bili_dl_path = Path(_env_str(
+        "BILIBILI_DOWNLOAD_PATH",
+        bilibili_raw.get("download_path", str(_dl_path / "bilibili")),
+    ))
+    if not _bili_dl_path.is_absolute():
+        _bili_dl_path = path.parent / _bili_dl_path
+    bilibili = BilibiliConfig(
+        download_path=str(_bili_dl_path.resolve()),
+        auth=os.getenv("BILIBILI_AUTH") or bilibili_raw.get("auth", ""),
+        auth_file=_env_str("BILIBILI_AUTH_FILE", bilibili_raw.get("auth_file", "")),
+        timeout=_env_int("BILIBILI_TIMEOUT", bilibili_raw.get("timeout", 3600)),
+        batch=_env_bool("BILIBILI_BATCH", bilibili_raw.get("batch", False)),
+        video_quality=_env_int(
+            "BILIBILI_VIDEO_QUALITY",
+            bilibili_raw.get("video_quality", 127),
+        ),
+        yutto_bin=_env_str("BILIBILI_YUTTO_BIN", bilibili_raw.get("yutto_bin", "yutto")),
+    )
+
     # ── Bot ──
     bot_raw = raw.get("bot", {})
     cmd_raw = bot_raw.get("commands", {})
@@ -199,5 +251,9 @@ def load_config(path: Path) -> AppConfig:
     )
 
     return AppConfig(
-        email=email, douyin=douyin, bot=bot, cookie_extractor=cookie_extractor
+        email=email,
+        douyin=douyin,
+        bilibili=bilibili,
+        bot=bot,
+        cookie_extractor=cookie_extractor,
     )

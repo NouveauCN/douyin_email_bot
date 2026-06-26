@@ -1,4 +1,4 @@
-"""EmailBot — polls an IMAP inbox for Douyin links and replies via SMTP.
+"""EmailBot — polls an IMAP inbox for video links and replies via SMTP.
 
 Also supports cookie management commands via email:
 - "更新cookie" in subject → body contains new cookie → write to .env
@@ -16,18 +16,45 @@ from email.header import decode_header
 from email.mime.text import MIMEText
 from pathlib import Path
 
+from bilibili_downloader import BilibiliDownloader
 from colorama import Fore, Style
 from douyin_downloader import DouyinDownloader
-from url_extractor import UrlExtractor
+from url_extractor import UrlExtractor, detect_platform
 
 logger = logging.getLogger("EmailBot")
 
 _ADDR_RE = re.compile(r"<([^>]+)>")
 
 
+def _format_success_reply(result: dict, filepath: str, prefix: str = "下载完成！") -> str:
+    """Format a download success reply, including multi-file Bilibili results."""
+    title = result.get("title") or "未知标题"
+    lines = [prefix, f"标题：{title}", f"保存位置：{filepath}"]
+
+    files = result.get("files") or []
+    file_count = result.get("file_count") or len(files)
+    if file_count > 1:
+        lines.append(f"文件数量：{file_count}")
+        lines.append("文件列表：")
+        for path in files[:10]:
+            lines.append(f"- {path}")
+        if file_count > 10:
+            lines.append(f"- ...另有 {file_count - 10} 个文件")
+
+    covers = result.get("covers") or []
+    if covers:
+        lines.append("封面：")
+        for path in covers[:5]:
+            lines.append(f"- {path}")
+        if len(covers) > 5:
+            lines.append(f"- ...另有 {len(covers) - 5} 张封面")
+
+    return "\n".join(lines)
+
+
 
 class EmailBot:
-    """Monitors an inbox for emails containing Douyin links and downloads videos.
+    """Monitors an inbox for emails containing supported links and downloads videos.
 
     Also handles cookie management commands.
     """
@@ -35,6 +62,7 @@ class EmailBot:
     def __init__(self, config):
         self.config = config
         self.downloader = DouyinDownloader(config.douyin)
+        self.bilibili_downloader = BilibiliDownloader(config.bilibili)
         self.extractor = UrlExtractor()
         self._cooldowns: dict[str, float] = {}
         self._project_dir = Path(__file__).parent
@@ -174,12 +202,13 @@ class EmailBot:
 
         url = self.extractor.extract(subject + " " + body)
         if url is None:
-            logger.info("No Douyin URL found from %s (subject: %s)", sender, subject)
-            self._send_reply(cfg, sender, "未在邮件中找到抖音分享链接，请检查链接是否正确。")
+            logger.info("No supported URL found from %s (subject: %s)", sender, subject)
+            self._send_reply(cfg, sender, "未在邮件中找到支持的视频链接，请发送抖音或 B 站分享链接。")
             _mark_seen(mail, msg_id)
             return
 
-        logger.info(f"{Fore.CYAN}收到下载请求: %s", sender)
+        platform = detect_platform(url)
+        logger.info(f"{Fore.CYAN}收到下载请求: %s (%s)", sender, platform or "unknown")
 
         # Cooldown
         now = time.time()
@@ -190,7 +219,7 @@ class EmailBot:
                 logger.info("Sender %s in cooldown (%ds remaining)", sender, remaining)
                 return
 
-        result = self.downloader.download(url)
+        result = self._download_url(url)
 
         if result["success"]:
             self._cooldowns[sender] = time.time()
@@ -202,16 +231,19 @@ class EmailBot:
             )
             self._send_reply(
                 cfg, sender,
-                f"下载完成！\n标题：{result['title']}\n保存位置：{filepath}",
+                _format_success_reply(result, filepath),
             )
         else:
             error_msg = result["error"]
-            # ── Auto-refresh cookie and retry once ──────────────────
+            # ── Douyin-only: auto-refresh cookie and retry once ─────
             is_cookie_issue = (
+                platform == "douyin"
+                and (
                 "删" in error_msg
                 or "私密" in error_msg
                 or "cookie" in error_msg.lower()
                 or "异常" in error_msg
+                )
             )
             if is_cookie_issue:
                 logger.info("Attempting auto cookie refresh from Firefox profile...")
@@ -238,7 +270,11 @@ class EmailBot:
                         )
                         self._send_reply(
                             cfg, sender,
-                            f"下载完成！（cookie 已自动刷新）\n标题：{retry_result['title']}\n保存位置：{filepath}",
+                            _format_success_reply(
+                                retry_result,
+                                filepath,
+                                prefix="下载完成！（cookie 已自动刷新）",
+                            ),
                         )
                         _mark_seen(mail, msg_id)
                         return
@@ -249,12 +285,29 @@ class EmailBot:
             # Build helpful hints
             error_msg += (
                 "\n\n解决方案："
-                "\n1. 发送主题含「更新cookie」的邮件，正文粘贴浏览器中获取的完整 cookie"
-                "\n2. 发送主题含「自动获取cookie」的邮件，让机器人从 Firefox 配置文件提取"
+                "\n1. 抖音链接：发送主题含「更新cookie」的邮件，正文粘贴完整 cookie"
+                "\n2. 抖音链接：发送主题含「自动获取cookie」的邮件，让机器人从 Firefox 配置文件提取"
+                "\n3. B站链接：如需登录内容，请在 .env 配置 BILIBILI_AUTH"
             )
             self._send_reply(cfg, sender, f"下载失败：{error_msg}")
 
         _mark_seen(mail, msg_id)
+
+    def _download_url(self, url: str) -> dict:
+        """Dispatch a supported URL to the correct downloader."""
+        platform = detect_platform(url)
+        if platform == "douyin":
+            return self.downloader.download(url)
+        if platform == "bilibili":
+            return self.bilibili_downloader.download(url)
+        return {
+            "success": False,
+            "filepath": None,
+            "files": [],
+            "file_count": 0,
+            "title": None,
+            "error": "暂不支持该链接类型",
+        }
 
     # ── Cookie command handlers ───────────────────────────────────
 

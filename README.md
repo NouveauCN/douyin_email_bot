@@ -1,17 +1,19 @@
-# Email Bot for Douyin Video Download
+# Email Bot for Douyin / Bilibili Video Download
 
-邮箱机器人 —— 发邮件给机器人，自动下载抖音视频到本地。
+邮箱机器人 —— 发邮件给机器人，自动下载抖音或 B 站视频到本地。
 
 ## 工作原理
 
 ```
-你发邮件（含抖音链接）→ 机器人轮询收件箱 → 下载视频 → 邮件回复结果
+你发邮件（含抖音/B站链接）→ 机器人轮询收件箱 → 下载视频 → 邮件回复结果
 ```
 
 ## 环境要求
 
-- Python 3.10+
+- Python 3.11+
 - [uv](https://docs.astral.sh/uv/)（Python 包管理器）
+- FFmpeg（Docker 镜像会自动安装）
+- yutto CLI（Docker 镜像会隔离安装；本机开发只在需要 B 站下载时单独安装）
 - 一个 QQ 邮箱账号（作为机器人邮箱）
 - 无需特定操作系统（Windows / macOS / Linux 均可）
 
@@ -49,6 +51,7 @@ cp .env.example .env
 EMAIL_ADDRESS=your_bot@qq.com
 EMAIL_PASSWORD=你的QQ邮箱授权码
 DOUYIN_COOKIE=你的抖音cookie
+BILIBILI_AUTH="SESSDATA=...; bili_jct=..."  # 可选
 ```
 
 `.env` 已被 `.gitignore` 排除，不会被提交到 Git。
@@ -75,9 +78,25 @@ uv run python main.py
 
 从白名单邮箱向机器人邮箱发送邮件：
 - **主题**：需包含"下载"（可自定义 `bot.subject_keyword`）
-- **正文**：包含抖音分享链接
+- **正文**：包含抖音或 B 站分享链接
 
 机器人收到后会下载视频并回复邮件。
+
+## B站下载
+
+B站链接由 [yutto](https://github.com/yutto-dev/yutto) CLI 下载，支持 BV/av 投稿视频、番剧 ep/ss 以及 b23.tv 短链接。默认保存到 `downloads/bilibili/`。
+
+注意：yutto 与 F2 的部分依赖版本约束冲突，因此 Docker 镜像会把 yutto 安装到独立的 `/opt/yutto` 虚拟环境，再通过 `yutto` 命令提供给机器人。不要把 yutto 加回主项目的 `requirements.txt` 或 `pyproject.toml`。
+
+单个 B 站链接可能解析出多个视频文件（例如多 P、合集或启用批量模式的番剧/系列）。机器人回复会包含保存位置、文件数量，并列出前 10 个文件路径。
+
+封面图片会保存到 `downloads/slides/`，文件名带 `bilibili_` 前缀，方便和抖音图集一起浏览。
+
+普通公开视频通常不需要登录信息；如遇到登录、大会员或受限内容，在 `.env` 中配置：
+
+```env
+BILIBILI_AUTH="SESSDATA=xxxxx; bili_jct=yyyyy"
+```
 
 ## Cookie 管理
 
@@ -113,6 +132,12 @@ uv run python main.py
 | `email.poll_interval` | int | `30` | 收件箱轮询间隔（秒） |
 | `douyin.cookie` | str | `""` | **必填**（.env `DOUYIN_COOKIE`），抖音登录 cookie |
 | `douyin.download_path` | str | `"./downloads"` | 视频下载目录 |
+| `bilibili.download_path` | str | `"./downloads/bilibili"` | B站视频下载目录 |
+| `bilibili.auth` | str | `""` | 可选（.env `BILIBILI_AUTH`），B站登录 cookie |
+| `bilibili.auth_file` | str | `""` | 可选（env `BILIBILI_AUTH_FILE`），yutto 扫码登录认证文件 |
+| `bilibili.video_quality` | int | `127` | yutto 视频清晰度，127=请求最高可用画质 |
+| `bilibili.batch` | bool | `false` | 是否默认启用 yutto 批量下载 |
+| `bilibili.yutto_bin` | str | `"yutto"` | yutto CLI 路径，可由 `BILIBILI_YUTTO_BIN` 覆盖 |
 | `bot.allowed_senders` | list | `[]` | 允许的发件人邮箱（空=允许所有人） |
 | `bot.subject_keyword` | str | `"下载"` | 触发下载的邮件主题关键词 |
 | `bot.cooldown_seconds` | int | `5` | 同一发件人冷却时间 |
@@ -129,6 +154,11 @@ uv run python main.py
 ### 抖音下载失败
 - 确认 `.env` 中 `DOUYIN_COOKIE` 已正确填写
 - 抖音 cookie 有时效性，过期后需重新获取
+
+### B站下载失败
+- Docker 部署时重新构建镜像，确认镜像内已安装 yutto 和 FFmpeg
+- 本机直接运行且需要 B站下载时，需在主项目环境外单独安装 yutto CLI
+- 登录/大会员/受限内容需配置 `.env` 中的 `BILIBILI_AUTH`，或用 `yutto auth login --auth-file` 生成认证文件
 
 ### 邮件发不出去
 - QQ 邮箱 SMTP 有频率限制，建议 `poll_interval` 不小于 30 秒

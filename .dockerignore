@@ -37,7 +37,6 @@ firefox_profile/
 
 # Docs
 *.md
-CLAUDE.md
 
 # Docker files
 Dockerfile

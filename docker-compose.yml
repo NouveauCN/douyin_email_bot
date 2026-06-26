@@ -11,6 +11,9 @@ services:
       - ./.env:/app/.env
     environment:
       - DOUYIN_DOWNLOAD_PATH=/app/downloads
+      - BILIBILI_DOWNLOAD_PATH=/app/downloads/bilibili
+      - BILIBILI_AUTH_FILE=/app/firefox_profile/yutto_auth.json
+      - BILIBILI_YUTTO_BIN=yutto
       - COOKIE_PROFILE_DIR=/app/firefox_profile
       - TZ=Asia/Shanghai
       # Optional: enable .env auto-reload so bot picks up cookie

@@ -56,6 +56,26 @@ def _safe_subpath(subpath: str) -> Path:
     return p
 
 
+def _cleanup_empty_parents(start: Path) -> list[Path]:
+    """Remove empty parent directories under the download root."""
+    removed = []
+    root = _DOWNLOAD_DIR.resolve()
+    current = start.resolve()
+
+    while current != root and root in current.parents:
+        try:
+            current.rmdir()
+        except FileNotFoundError:
+            current = current.parent
+            continue
+        except OSError:
+            break
+        removed.append(current)
+        current = current.parent
+
+    return removed
+
+
 def _format_size(size_bytes: int) -> str:
     """Human-readable file size."""
     for unit in ("B", "KB", "MB", "GB", "TB"):
@@ -337,12 +357,24 @@ def api_delete():
         return {"success": False, "error": "文件或目录不存在"}, 404
 
     try:
+        cleanup_start = target.parent
         if target.is_dir():
             shutil.rmtree(target)
+            cleanup_start = target.parent
         else:
             target.unlink()
+        removed_dirs = _cleanup_empty_parents(cleanup_start)
         log.info("Deleted: %s", target)
-        return {"success": True}
+        if removed_dirs:
+            log.info("Removed empty parent directories: %s", removed_dirs)
+        download_root = _DOWNLOAD_DIR.resolve()
+        return {
+            "success": True,
+            "removed_empty_dirs": [
+                str(path.relative_to(download_root)).replace("\\", "/")
+                for path in removed_dirs
+            ],
+        }
     except OSError as e:
         log.error("Failed to delete %s: %s", target, e)
         return {"success": False, "error": str(e)}, 500

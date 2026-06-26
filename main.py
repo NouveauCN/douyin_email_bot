@@ -1,6 +1,6 @@
-"""Email Bot for downloading Douyin videos.
+"""Email Bot for downloading Douyin and Bilibili videos.
 
-Monitors an IMAP inbox for emails containing Douyin share links,
+Monitors an IMAP inbox for emails containing supported share links,
 downloads the videos, and replies with the result via SMTP.
 
 Usage:

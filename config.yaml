@@ -31,6 +31,22 @@ douyin:
   #       See .env.example:
   #         DOUYIN_COOKIE=your_douyin_cookie
 
+# Bilibili download settings (via yutto)
+bilibili:
+  # Download save path (relative to project root)
+  download_path: "./downloads/bilibili"
+  # Max wall-clock time for one yutto process (seconds)
+  timeout: 3600
+  # Default video quality. 127 requests the highest available stream (8K tier,
+  # with yutto falling back when that tier is unavailable).
+  video_quality: 127
+  # Batch mode for series/bangumi URLs (default: single item only)
+  batch: false
+  # yutto executable path. Docker exposes an isolated yutto CLI at "yutto".
+  yutto_bin: "yutto"
+  # NOTE: Bilibili auth is loaded from .env file if needed:
+  #       BILIBILI_AUTH="SESSDATA=...; bili_jct=..."
+
 # Bot behavior
 bot:
   # Allowed sender email addresses (empty = allow all)
