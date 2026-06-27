@@ -2,9 +2,11 @@
 
 import re
 
-# Match Douyin short links and full video/note URLs
+# Match Douyin short links and full video/note URLs.  Short links are a single
+# path token; email clients may append HTML entities like &nbsp; immediately
+# after the copied URL.
 DOUYIN_URL_PATTERN = re.compile(
-    r"https?://(?:v\.douyin\.com/\S+|www\.douyin\.com/(?:video|note)/\d+)"
+    r"https?://(?:v\.douyin\.com/[A-Za-z0-9_-]+/?|www\.douyin\.com/(?:video|note)/\d+)"
 )
 
 # Match Bilibili video, bangumi, cheese, and short-share URLs.

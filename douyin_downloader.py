@@ -9,6 +9,7 @@ Supports:
 import asyncio
 import logging
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -24,6 +25,10 @@ from f2.exceptions import (
 )
 
 logger = logging.getLogger("DouyinDownloader")
+
+DOUYIN_SHORT_HTTPS_RE = re.compile(r"^https://v\.douyin\.com/([A-Za-z0-9_-]+)/?$")
+DOUYIN_SHORT_RE = re.compile(r"^https?://v\.douyin\.com/([A-Za-z0-9_-]+)/?$")
+DOUYIN_AWEME_ID_RE = re.compile(r"/(?:share/)?(?:video|note)/(\d+)")
 
 
 class DouyinDownloader:
@@ -67,6 +72,7 @@ class DouyinDownloader:
             cookie_len, has_auth,
         )
 
+        url = _normalize_share_url(url)
         download_dir = Path(self.config.download_path)
         download_dir.mkdir(parents=True, exist_ok=True)
 
@@ -107,7 +113,7 @@ class DouyinDownloader:
                                           "music": False, "cover": False, "desc": False})
 
         # Step 1: Resolve short link → aweme_id
-        aweme_id = await AwemeIdFetcher.get_aweme_id(kwargs["url"])
+        aweme_id = await _resolve_aweme_id(kwargs["url"])
         logger.debug("Resolved aweme_id: %s", aweme_id)
 
         # Step 2: Fetch video metadata (works with document.cookie)
@@ -164,14 +170,7 @@ class DouyinDownloader:
         title = data.get("desc") or data.get("nickname") or "Douyin Video"
         safe_title = _sanitize_filename(title)[:80]
 
-        create_time = data.get("create_time", "")
-        if create_time:
-            try:
-                date_str = datetime.strptime(str(create_time)[:10], "%Y-%m-%d").strftime("%Y%m%d")
-            except ValueError:
-                date_str = "unknown"
-        else:
-            date_str = "unknown"
+        download_time = _download_timestamp()
 
         if self.config.folderize and data.get("nickname"):
             author_dir = _sanitize_filename(data["nickname"])[:50]
@@ -181,7 +180,7 @@ class DouyinDownloader:
 
         save_dir.mkdir(parents=True, exist_ok=True)
 
-        filename = f"{date_str}_{aweme_id}.mp4"
+        filename = f"{download_time}_{aweme_id}.mp4"
         filepath = save_dir / filename
 
         # Step 5: Download
@@ -217,16 +216,8 @@ class DouyinDownloader:
         title = data.get("desc") or data.get("nickname") or "Douyin Slideshow"
 
         # Build save paths
-        create_time = data.get("create_time", "")
-        if create_time:
-            try:
-                date_str = datetime.strptime(str(create_time)[:10], "%Y-%m-%d").strftime("%Y%m%d")
-            except ValueError:
-                date_str = "unknown"
-        else:
-            date_str = "unknown"
-
-        prefix = f"{date_str}_{aweme_id}"
+        download_time = _download_timestamp()
+        prefix = f"{download_time}_{aweme_id}"
 
         # Static images → slides/
         slides_dir = download_dir / "slides"
@@ -337,7 +328,8 @@ class DouyinDownloader:
         for attempt in range(1, max_retries + 1):
             try:
                 async with httpx.AsyncClient(
-                    timeout=timeout, follow_redirects=True, headers=headers
+                    timeout=timeout, follow_redirects=True, headers=headers,
+                    trust_env=False,
                 ) as client:
                     response = await client.get(url)
                     response.raise_for_status()
@@ -354,6 +346,48 @@ class DouyinDownloader:
     @staticmethod
     def _error(msg: str) -> dict:
         return {"success": False, "filepath": None, "title": None, "error": msg}
+
+
+def _normalize_share_url(url: str) -> str:
+    """Avoid HTTPS TLS stalls on Douyin short-link redirects."""
+    match = DOUYIN_SHORT_HTTPS_RE.fullmatch(url.strip())
+    if not match:
+        return url
+    normalized = f"http://v.douyin.com/{match.group(1)}/"
+    logger.debug("Using HTTP resolver for Douyin short link: %s", normalized)
+    return normalized
+
+
+def _download_timestamp() -> str:
+    """Return a stable timestamp prefix for newly downloaded files."""
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+async def _resolve_aweme_id(url: str) -> str:
+    """Resolve Douyin URLs without following short links onto flaky HTTPS hosts."""
+    direct_match = DOUYIN_AWEME_ID_RE.search(url)
+    if direct_match:
+        return direct_match.group(1)
+
+    short_match = DOUYIN_SHORT_RE.fullmatch(url.strip())
+    if short_match:
+        short_url = f"http://v.douyin.com/{short_match.group(1)}/"
+        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.douyin.com/"}
+        async with httpx.AsyncClient(
+            timeout=10,
+            follow_redirects=False,
+            headers=headers,
+            verify=False,
+            trust_env=False,
+        ) as client:
+            response = await client.get(short_url)
+        location = response.headers.get("location", "")
+        location_match = DOUYIN_AWEME_ID_RE.search(location)
+        if location_match:
+            logger.debug("Resolved short link from Location header: %s", location)
+            return location_match.group(1)
+
+    return await AwemeIdFetcher.get_aweme_id(url)
 
 
 async def _auto_crop_video(filepath: Path, logger) -> bool:

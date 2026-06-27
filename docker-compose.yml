@@ -16,6 +16,15 @@ services:
       - BILIBILI_YUTTO_BIN=yutto
       - COOKIE_PROFILE_DIR=/app/firefox_profile
       - TZ=Asia/Shanghai
+      # Keep Douyin traffic direct even when the Docker host has proxy vars set.
+      - HTTP_PROXY=
+      - HTTPS_PROXY=
+      - ALL_PROXY=
+      - NO_PROXY=
+      - http_proxy=
+      - https_proxy=
+      - all_proxy=
+      - no_proxy=
       # Optional: enable .env auto-reload so bot picks up cookie
       # changes without restart (requires web_login to write to .env)
       - ENV_AUTO_RELOAD=1

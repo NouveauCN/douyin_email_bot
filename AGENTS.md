@@ -96,10 +96,11 @@ Douyin downloads:
   `asyncio.run()` internally.
 - F2 resolves the share URL and fetches metadata; `httpx` performs direct media
   downloads.
-- Regular videos save as `downloads/<author>/<YYYYMMDD>_<aweme_id>.mp4` when
-  `folderize` is enabled.
+- Regular videos save as `downloads/<author>/<YYYYMMDD_HHMMSS>_<aweme_id>.mp4`
+  using download time when `folderize` is enabled.
 - Static slideshow images save under `downloads/slides/`.
-- Slideshow animated clips save in the same author-folder layout as videos.
+- Slideshow filenames use the same download-time prefix. Animated clips save in
+  the same author-folder layout as videos.
 - Downloaded MP4 files pass through `_auto_crop_video()`. Cropping must restore
   the original if ffmpeg fails.
 
@@ -232,6 +233,9 @@ sudo docker compose down
 The services share named volumes for logs and the Firefox profile. Downloads
 are mounted at `/srv/nas_data/douyin_downloads` on the documented Docker host.
 `.env` and `config.yaml` are bind-mounted from the checkout.
+The `bot` service intentionally clears proxy environment variables in Compose;
+Douyin requests should go out directly even if the Docker host has proxy
+settings configured.
 
 The documented execution host is `nouveau@192.168.0.103`, with the checkout at
 `~/douyin_email_bot/`. Treat this as the deployment default, not a portable code
