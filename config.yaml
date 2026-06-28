@@ -55,6 +55,12 @@ bot:
   cooldown_seconds: 5
   # Subject must contain this keyword to trigger download
   subject_keyword: "下载"
+  # Retry transient network/timeout download failures before final failure.
+  transient_retry_attempts: 3
+  transient_retry_delay_seconds: 120
+  # Project-relative files for queued retries and final failed links.
+  transient_pending_file: "./pending_retries.json"
+  transient_failed_file: "./failed_links.txt"
   # Special command keywords in email subject
   commands:
     # "更新cookie" — paste new DOUYIN_COOKIE in email body

@@ -30,6 +30,8 @@ desktop.ini
 downloads/
 logs/
 firefox_profile/
+pending_retries.json
+failed_links.txt
 
 # Secrets (mounted or passed via env — never in the image)
 .env

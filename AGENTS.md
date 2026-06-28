@@ -87,6 +87,9 @@ Email processing in `EmailBot`:
 - applies cooldown per sender, not per URL;
 - retries Douyin downloads once after cookie-like failures if Firefox cookie
   extraction succeeds;
+- queues transient network/timeout download failures for delayed retry before
+  sending a final failure; exhausted retry links are appended to the configured
+  failed-links file;
 - marks handled messages as seen;
 - closes IMAP sockets through `_safe_logout()` to avoid protocol logout hangs.
 
@@ -165,6 +168,8 @@ Important runtime overrides:
 | `BOT_ALLOWED_SENDERS` | `bot.allowed_senders` |
 | `BOT_COOLDOWN_SECONDS` | `bot.cooldown_seconds` |
 | `BOT_SUBJECT_KEYWORD` | `bot.subject_keyword` |
+| `BOT_TRANSIENT_RETRY_ATTEMPTS` | `bot.transient_retry_attempts` |
+| `BOT_TRANSIENT_RETRY_DELAY_SECONDS` | `bot.transient_retry_delay_seconds` |
 | `COOKIE_PROFILE_DIR` | `cookie_extractor.profile_dir` |
 | `ENV_AUTO_RELOAD` | enables `.env` cookie hot reload |
 

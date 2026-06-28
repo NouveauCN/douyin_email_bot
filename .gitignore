@@ -6,3 +6,5 @@ downloads/
 firefox_profile/
 logs/
 douyin_users.db
+pending_retries.json
+failed_links.txt

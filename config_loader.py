@@ -22,6 +22,8 @@ Docker env-var overrides:
     BOT_ALLOWED_SENDERS   — overrides bot.allowed_senders (comma-separated)
     BOT_COOLDOWN_SECONDS  — overrides bot.cooldown_seconds
     BOT_SUBJECT_KEYWORD   — overrides bot.subject_keyword
+    BOT_TRANSIENT_RETRY_ATTEMPTS — overrides bot.transient_retry_attempts
+    BOT_TRANSIENT_RETRY_DELAY_SECONDS — overrides bot.transient_retry_delay_seconds
     COOKIE_PROFILE_DIR    — overrides cookie_extractor.profile_dir
 """
 
@@ -60,6 +62,14 @@ def _parse_allowed_senders(value) -> list[str]:
     if isinstance(value, str) and value.strip():
         return [s.strip() for s in value.split(",") if s.strip()]
     return []
+
+
+def _resolve_project_path(config_path: Path, value: str) -> str:
+    """Resolve a project-relative path from config.yaml."""
+    target = Path(value)
+    if not target.is_absolute():
+        target = config_path.parent / target
+    return str(target.resolve())
 
 
 @dataclass
@@ -125,6 +135,10 @@ class BotConfig:
     allowed_senders: list[str] = field(default_factory=list)
     cooldown_seconds: int = 5
     subject_keyword: str = "下载"
+    transient_retry_attempts: int = 3
+    transient_retry_delay_seconds: int = 120
+    transient_pending_file: str = "./pending_retries.json"
+    transient_failed_file: str = "./failed_links.txt"
     commands: BotCommands = field(default_factory=BotCommands)
 
 
@@ -235,6 +249,22 @@ def load_config(path: Path) -> AppConfig:
         subject_keyword=_env_str(
             "BOT_SUBJECT_KEYWORD",
             bot_raw.get("subject_keyword", "下载"),
+        ),
+        transient_retry_attempts=_env_int(
+            "BOT_TRANSIENT_RETRY_ATTEMPTS",
+            bot_raw.get("transient_retry_attempts", 3),
+        ),
+        transient_retry_delay_seconds=_env_int(
+            "BOT_TRANSIENT_RETRY_DELAY_SECONDS",
+            bot_raw.get("transient_retry_delay_seconds", 120),
+        ),
+        transient_pending_file=_resolve_project_path(
+            path,
+            bot_raw.get("transient_pending_file", "./pending_retries.json"),
+        ),
+        transient_failed_file=_resolve_project_path(
+            path,
+            bot_raw.get("transient_failed_file", "./failed_links.txt"),
         ),
         commands=bot_commands,
     )

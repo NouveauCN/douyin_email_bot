@@ -349,18 +349,41 @@ class DouyinDownloader:
 
 
 def _normalize_share_url(url: str) -> str:
-    """Avoid HTTPS TLS stalls on Douyin short-link redirects."""
-    match = DOUYIN_SHORT_HTTPS_RE.fullmatch(url.strip())
-    if not match:
-        return url
-    normalized = f"http://v.douyin.com/{match.group(1)}/"
-    logger.debug("Using HTTP resolver for Douyin short link: %s", normalized)
-    return normalized
+    """Keep share URLs as-is — resolution now tries HTTPS first, HTTP fallback."""
+    return url.strip()
 
 
 def _download_timestamp() -> str:
     """Return a stable timestamp prefix for newly downloaded files."""
     return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+async def _resolve_short_link(path: str, headers: dict) -> str:
+    """Resolve a v.douyin.com short link, trying HTTPS first then HTTP.
+
+    Some network environments block direct HTTP (port 80) while HTTPS works,
+    and some have the opposite problem (TLS stalls).  Try both.
+    """
+    for scheme in ("https", "http"):
+        short_url = f"{scheme}://v.douyin.com/{path}/"
+        try:
+            async with httpx.AsyncClient(
+                timeout=10,
+                follow_redirects=False,
+                headers=headers,
+                verify=False,
+                trust_env=False,
+            ) as client:
+                response = await client.get(short_url)
+            location = response.headers.get("location", "")
+            if location:
+                logger.debug("Short link resolved via %s: %s", scheme.upper(), location[:120])
+                return location
+        except httpx.ReadTimeout:
+            logger.debug("Short link %s timed out, trying fallback...", scheme.upper())
+        except Exception:
+            logger.debug("Short link %s failed, trying fallback...", scheme.upper())
+    return ""
 
 
 async def _resolve_aweme_id(url: str) -> str:
@@ -371,17 +394,8 @@ async def _resolve_aweme_id(url: str) -> str:
 
     short_match = DOUYIN_SHORT_RE.fullmatch(url.strip())
     if short_match:
-        short_url = f"http://v.douyin.com/{short_match.group(1)}/"
         headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.douyin.com/"}
-        async with httpx.AsyncClient(
-            timeout=10,
-            follow_redirects=False,
-            headers=headers,
-            verify=False,
-            trust_env=False,
-        ) as client:
-            response = await client.get(short_url)
-        location = response.headers.get("location", "")
+        location = await _resolve_short_link(short_match.group(1), headers)
         location_match = DOUYIN_AWEME_ID_RE.search(location)
         if location_match:
             logger.debug("Resolved short link from Location header: %s", location)
