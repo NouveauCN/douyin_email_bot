@@ -26,7 +26,16 @@ from urllib.parse import quote
 from PIL import Image
 
 from dotenv import load_dotenv
-from flask import Flask, abort, make_response, render_template_string, request, send_from_directory
+from flask import (
+    Flask,
+    abort,
+    make_response,
+    redirect,
+    render_template_string,
+    request,
+    send_from_directory,
+    url_for,
+)
 
 # ── Bootstrap ────────────────────────────────────────────────────────
 _PROJECT_DIR = Path(__file__).parent
@@ -269,6 +278,8 @@ def _collect_videos(author: str | None = None) -> list[dict]:
 def index():
     """Top-level index: author folders + slideshow groups."""
     data = _scan_downloads()
+    data["upload_success"] = request.args.get("upload_success", "")
+    data["upload_error"] = request.args.get("upload_error", "")
     resp = make_response(render_template_string(INDEX_HTML, **data))
     resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return resp
@@ -499,15 +510,31 @@ def _convert_video(src: Path, dst: Path) -> bool:
         return False
 
 
+def _upload_response(payload: dict, status: int = 200):
+    """Return JSON to enhanced clients and redirect native form submissions."""
+    if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+        return payload, status
+
+    if payload.get("success"):
+        return redirect(
+            url_for("index", upload_success=payload.get("filename", "")),
+            code=303,
+        )
+    return redirect(
+        url_for("index", upload_error=payload.get("error", "上传失败")),
+        code=303,
+    )
+
+
 @app.route("/api/upload", methods=["POST"])
 def api_upload():
     """Upload a file; images → slides/, videos → uploads/ (convert if needed)."""
     if "file" not in request.files:
-        return {"success": False, "error": "缺少 file 参数"}, 400
+        return _upload_response({"success": False, "error": "缺少 file 参数"}, 400)
 
     file = request.files["file"]
     if not file or not file.filename:
-        return {"success": False, "error": "未选择文件"}, 400
+        return _upload_response({"success": False, "error": "未选择文件"}, 400)
 
     original_name = Path(file.filename).name
     if "." in original_name:
@@ -532,10 +559,13 @@ def api_upload():
         out_ext = ext
     else:
         all_allowed = _VIDEO_EXTS | _VIDEO_CONVERT_EXTS | _IMAGE_EXTS
-        return {
-            "success": False,
-            "error": f"不支持的文件类型 {ext}，仅支持: {', '.join(sorted(all_allowed))}",
-        }, 400
+        return _upload_response(
+            {
+                "success": False,
+                "error": f"不支持的文件类型 {ext}，仅支持: {', '.join(sorted(all_allowed))}",
+            },
+            400,
+        )
 
     safe_stem = re.sub(r"[^\w\-.\\u4e00-\\u9fff]", "_", stem).strip("_") or "upload"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -566,7 +596,10 @@ def api_upload():
                         p.unlink()
                     except OSError:
                         pass
-                return {"success": False, "error": "视频转码失败，请检查文件格式"}, 500
+                return _upload_response(
+                    {"success": False, "error": "视频转码失败，请检查文件格式"},
+                    500,
+                )
             # Remove the original after successful conversion
             try:
                 tmp_path.unlink()
@@ -621,10 +654,10 @@ def api_upload():
         }
         if dup_result:
             response["duplicate"] = dup_result
-        return response
+        return _upload_response(response)
     except OSError as e:
         log.error("Upload failed: %s", e)
-        return {"success": False, "error": str(e)}, 500
+        return _upload_response({"success": False, "error": str(e)}, 500)
 
 
 @app.route("/api/dups")
@@ -894,6 +927,18 @@ INDEX_HTML = (
     background: #e74c3c; color: #fff; font-size: 13px; transition: opacity 0.15s;
   }
   .dup-actions .del-btn2:hover { opacity: 0.85; }
+  .upload-form {
+    margin-bottom: 24px; display: flex; gap: 10px; align-items: center;
+    flex-wrap: wrap;
+  }
+  .upload-input {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap;
+    border: 0;
+  }
+  .upload-submit { background: #25a55a; }
+  .upload-submit:disabled { cursor: wait; opacity: 0.55; }
+  .upload-status { font-size: 12px; color: #999; word-break: break-all; }
 </style>
 </head>
 <body>
@@ -901,16 +946,21 @@ INDEX_HTML = (
   <h1>📦 下载浏览</h1>
   <p class="subtitle">Douyin Email Bot — LAN File Browser</p>
 
-  <div style="margin-bottom:24px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-    <input type="file" id="uploadInput" style="display:none" accept="video/*,image/*" onchange="handleUpload(event)">
-    <button class="btn" onclick="document.getElementById('uploadInput').click()" style="background:#25a55a">
-      📤 上传文件
-    </button>
+  <form id="uploadForm" class="upload-form" action="{{ url_for('api_upload') }}"
+        method="post" enctype="multipart/form-data">
+    <input class="upload-input" type="file" id="uploadInput" name="file"
+           accept="video/*,image/*" required>
+    <label class="btn" for="uploadInput">📁 选择文件</label>
+    <button class="btn upload-submit" id="uploadSubmit" type="submit">📤 开始上传</button>
     {% if videos %}
     <a class="btn" href="{{ url_for('playlist') }}">▶ 全部播放（随机）</a>
     {% endif %}
-    <span id="uploadStatus" style="font-size:12px;color:#999"></span>
-  </div>
+    <span id="uploadStatus" class="upload-status">
+      {% if upload_success %}✅ {{ upload_success }} 上传成功
+      {% elif upload_error %}❌ 上传失败：{{ upload_error }}
+      {% else %}就绪{% endif %}
+    </span>
+  </form>
 
   <!-- Pending duplicates section (populated by JS) -->
   <div id="dupSection"></div>
@@ -987,46 +1037,70 @@ function confirmDelete(event, path, label) {
     else alert('删除失败: ' + (data.error || '未知错误'));
   }).catch(function(e) { alert('请求失败: ' + e.message); });
 }
-function handleUpload(e) {
-  var file = e.target.files[0];
-  if (!file) return;
+function setUploadStatus(message, background, color) {
   var status = document.getElementById('uploadStatus');
   status.style.display = 'inline-block';
   status.style.padding = '6px 14px';
   status.style.borderRadius = '6px';
   status.style.fontWeight = '600';
-  status.textContent = '⏳ 上传中...';
-  status.style.background = '#fff3cd';
-  status.style.color = '#856404';
-  var form = new FormData();
-  form.append('file', file);
-  fetch('/api/upload', {method:'POST', body:form})
-    .then(function(r) { return r.json(); })
-    .then(function(data) {
-      if (data.success) {
+  status.textContent = message;
+  status.style.background = background;
+  status.style.color = color;
+}
+var uploadForm = document.getElementById('uploadForm');
+var uploadInput = document.getElementById('uploadInput');
+var uploadSubmit = document.getElementById('uploadSubmit');
+uploadInput.addEventListener('change', function() {
+  if (uploadInput.files.length) {
+    setUploadStatus('已选择：' + uploadInput.files[0].name, '#e8f4fd', '#236a96');
+  }
+});
+uploadForm.addEventListener('submit', function(event) {
+  if (!uploadInput.files.length) return;
+  event.preventDefault();
+  uploadSubmit.disabled = true;
+  setUploadStatus('⏳ 上传中...', '#fff3cd', '#856404');
+  fetch(uploadForm.action, {
+    method: 'POST',
+    body: new FormData(uploadForm),
+    headers: {'X-Requested-With': 'XMLHttpRequest'}
+  })
+    .then(function(response) {
+      return response.json().then(function(data) {
+        return {ok: response.ok, data: data};
+      });
+    })
+    .then(function(result) {
+      var data = result.data;
+      if (result.ok && data.success) {
         var label = data.type === 'video' ? '视频' : '图片';
         if (data.duplicate) {
-          status.style.background = '#fff3cd';
-          status.style.color = '#856404';
-          status.textContent = '⚠️ 重复候选！相似度 ' + data.duplicate.similarity_pct + '%，刷新中...';
+          setUploadStatus(
+            '⚠️ 重复候选！相似度 ' + data.duplicate.similarity_pct + '%，刷新中...',
+            '#fff3cd', '#856404'
+          );
         } else {
-          status.style.background = '#d4edda';
-          status.style.color = '#155724';
-          status.textContent = '✅ ' + label + ' ' + data.filename + ' 上传成功！刷新中...';
+          setUploadStatus(
+            '✅ ' + label + ' ' + data.filename + ' 上传成功！刷新中...',
+            '#d4edda', '#155724'
+          );
         }
         setTimeout(function() { location.reload(); }, 1500);
       } else {
-        status.style.background = '#f8d7da';
-        status.style.color = '#721c24';
-        status.textContent = '❌ 上传失败: ' + (data.error || '未知错误');
+        uploadSubmit.disabled = false;
+        uploadInput.value = '';
+        setUploadStatus(
+          '❌ 上传失败: ' + (data.error || '未知错误'),
+          '#f8d7da', '#721c24'
+        );
       }
     })
     .catch(function(err) {
-      status.style.background = '#f8d7da';
-      status.style.color = '#721c24';
-      status.textContent = '❌ 请求失败: ' + err.message;
+      uploadSubmit.disabled = false;
+      uploadInput.value = '';
+      setUploadStatus('❌ 请求失败: ' + err.message, '#f8d7da', '#721c24');
     });
-}
+});
 // ── Pending duplicates ──
 function loadDups() {
   fetch('/api/dups')
@@ -1137,7 +1211,6 @@ function resolveDup(path, action, label) {
   }).catch(function(e) { alert('请求失败: ' + e.message); });
 }
 loadDups();
-document.getElementById('uploadStatus').textContent = '就绪';
 </script>
 </body>
 </html>"""  # noqa: E501
