@@ -12,6 +12,7 @@ import argparse
 import logging
 import os
 import sys
+import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -41,6 +42,7 @@ from cookie_extractor import (  # noqa: E402
 
 app = Flask(__name__)
 log = logging.getLogger("web_login")
+_browser_lock = threading.Lock()
 
 
 def _get_profile_dir() -> Path:
@@ -62,7 +64,8 @@ def index():
 def api_qr():
     """Generate a fresh QR code screenshot."""
     profile_dir = _get_profile_dir()
-    b64, msg = screenshot_qr_code(profile_dir)
+    with _browser_lock:
+        b64, msg = screenshot_qr_code(profile_dir)
     if b64:
         log.info("QR screenshot: %d chars", len(b64))
         return jsonify({"success": True, "qr_image": b64, "message": msg})
@@ -74,7 +77,8 @@ def api_qr():
 def api_status():
     """Check whether the user has scanned the QR and logged in."""
     profile_dir = _get_profile_dir()
-    result = check_auth_cookies(profile_dir)
+    with _browser_lock:
+        result = check_auth_cookies(profile_dir)
 
     if result["status"] == "logged_in" and result["cookie_str"]:
         # Validate cookie quality before saving
@@ -137,17 +141,18 @@ LOGIN_HTML = r"""<!DOCTYPE html>
   }
   .card {
     background: #1a1a1a; border-radius: 16px; padding: 40px 32px;
-    max-width: 400px; width: 90%; text-align: center;
+    max-width: 1100px; width: 95%; text-align: center;
     box-shadow: 0 8px 32px rgba(0,0,0,0.4);
   }
   h1 { font-size: 22px; font-weight: 600; margin-bottom: 8px; color: #fff; }
   .subtitle { font-size: 13px; color: #888; margin-bottom: 28px; }
   #qr-box {
-    width: 240px; height: 240px; margin: 0 auto 20px;
+    width: min(960px, 90vw); aspect-ratio: 16 / 9; margin: 0 auto 20px;
     border-radius: 12px; overflow: hidden; position: relative;
     background: #2a2a2a; display: flex; align-items: center; justify-content: center;
   }
-  #qr-box img { width: 100%; height: 100%; object-fit: contain; }
+  #qr-box a { width: 100%; height: 100%; display: block; }
+  #qr-box img { width: 100%; height: 100%; object-fit: contain; cursor: zoom-in; }
   #qr-placeholder { color: #666; font-size: 14px; }
   .status { font-size: 14px; margin: 12px 0; min-height: 20px; }
   .status.ok { color: #4caf50; }
@@ -175,7 +180,9 @@ LOGIN_HTML = r"""<!DOCTYPE html>
   <p class="subtitle">Douyin Email Bot — Cookie 获取</p>
 
   <div id="qr-box">
-    <img id="qr-img" src="" alt="QR Code" style="display:none">
+    <a id="qr-link" href="#" target="_blank" title="点击打开原尺寸截图">
+      <img id="qr-img" src="" alt="抖音完整登录页面" style="display:none">
+    </a>
     <div id="qr-placeholder">⏳ 加载中...</div>
   </div>
 
@@ -194,9 +201,11 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 
 <script>
 let _pollTimer = null;
+let _pollInFlight = false;
 
 async function loadQR() {
   const img = document.getElementById('qr-img');
+  const link = document.getElementById('qr-link');
   const placeholder = document.getElementById('qr-placeholder');
   const status = document.getElementById('status');
   const refreshBtn = document.getElementById('refresh-btn');
@@ -214,9 +223,10 @@ async function loadQR() {
     const data = await resp.json();
     if (data.success) {
       img.src = data.qr_image;
+      link.href = data.qr_image;
       img.style.display = 'block';
       placeholder.style.display = 'none';
-      status.textContent = '请使用抖音 App 扫描二维码';
+      status.textContent = '完整登录页面（点击图片可打开原尺寸）';
       status.className = 'status wait';
       refreshBtn.style.display = 'inline-block';
       startPolling();
@@ -236,7 +246,7 @@ async function loadQR() {
 
 function startPolling() {
   stopPolling();
-  _pollTimer = setInterval(pollStatus, 2500);
+  _pollTimer = setInterval(pollStatus, 10000);
 }
 
 function stopPolling() {
@@ -244,6 +254,8 @@ function stopPolling() {
 }
 
 async function pollStatus() {
+  if (_pollInFlight) return;
+  _pollInFlight = true;
   try {
     const resp = await fetch('/api/status');
     const data = await resp.json();
@@ -275,6 +287,8 @@ async function pollStatus() {
     }
   } catch (e) {
     // network error during poll, ignore and keep trying
+  } finally {
+    _pollInFlight = false;
   }
 }
 
@@ -312,7 +326,7 @@ def main():
     log.info("Open http://<host>:%d in a browser to scan the QR code", args.port)
 
     try:
-        app.run(host=args.host, port=args.port, debug=args.debug)
+        app.run(host=args.host, port=args.port, debug=args.debug, threaded=False)
     except KeyboardInterrupt:
         log.info("Shutting down")
 

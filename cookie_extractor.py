@@ -25,8 +25,7 @@ DOUYIN_HOMEPAGE = "https://www.douyin.com/"
 
 # Auth-indicating cookie names — if present, the session is logged in.
 _AUTH_COOKIE_NAMES = frozenset({
-    "sessionid", "sessionid_ss", "sid_guard", "uid", "passport_csrf_token",
-    "passport_csrf_token_default", "odin_tt", "LOGIN_STATUS",
+    "sessionid", "sessionid_ss", "sid_guard", "uid", "LOGIN_STATUS",
 })
 
 
@@ -309,39 +308,41 @@ def screenshot_qr_code(
 
             page.wait_for_timeout(3000)  # let JS render the login modal
 
-            # Try common QR element selectors (Douyin login modal)
-            qr_element = None
-            selectors = [
-                ".qrcode-img",
-                ".qrcode-image",
-                "img[class*='qrcode']",
-                "canvas[class*='qrcode']",
-                ".login-modal img",
-                "#qrcode img",
-                "img[src*='qrcode']",
-                "img[src*='qr_code']",
+            # The homepage does not open the login dialog automatically.  The
+            # old implementation searched the feed immediately and therefore
+            # fell back to returning a screenshot of the first video grid.
+            login_opened = False
+            login_selectors = [
+                "button:has-text('登录')",
+                "[role='button']:has-text('登录')",
             ]
-            for sel in selectors:
+            for sel in login_selectors:
                 try:
-                    el = page.locator(sel).first
-                    if el.is_visible(timeout=1000):
-                        qr_element = el
+                    login_button = page.locator(sel).first
+                    if login_button.is_visible(timeout=2000):
+                        login_button.click(force=True)
+                        login_opened = True
+                        logger.debug("Opened Douyin login dialog via selector: %s", sel)
                         break
                 except Exception:
                     continue
 
-            if qr_element:
-                screenshot_bytes = qr_element.screenshot(type="png")
-                logger.debug("QR element found via selector: %s", sel)
-            else:
-                # Fallback: screenshot the visible viewport
-                screenshot_bytes = page.screenshot(type="png", full_page=False)
-                logger.debug("QR element not found, using full viewport screenshot")
+            if not login_opened:
+                browser.close()
+                return None, "未找到抖音网页的登录按钮，请刷新后重试"
+
+            page.wait_for_timeout(4000)  # let the login QR render
+
+            # Return the complete viewport.  Douyin frequently changes the
+            # login modal's obfuscated classes, making element guessing prone
+            # to selecting square promotional cards instead of the QR code.
+            screenshot_bytes = page.screenshot(type="png", full_page=False)
+            logger.debug("Captured complete Douyin login viewport")
 
             browser.close()
 
         b64 = base64.b64encode(screenshot_bytes).decode("ascii")
-        return f"data:image/png;base64,{b64}", "QR code captured"
+        return f"data:image/png;base64,{b64}", "完整登录页面已截取"
 
     except Exception as exc:
         logger.error("QR screenshot failed: %s", exc)

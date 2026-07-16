@@ -32,6 +32,7 @@ logs/
 firefox_profile/
 pending_retries.json
 failed_links.txt
+short_link_cache.json
 
 # Secrets (mounted or passed via env — never in the image)
 .env
