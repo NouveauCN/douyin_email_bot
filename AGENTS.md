@@ -38,7 +38,7 @@ config_loader.py        YAML/env configuration dataclasses
 cookie_extractor.py     Persistent Playwright Firefox cookie handling
 get_cookie.py           Interactive/headless cookie CLI
 web_login.py            Flask QR login service
-file_browser.py         Flask download browser and playlist UI
+file_browser.py         Flask browser, playlist, upload, dedup, and delete UI
 play.py                 Local shuffled playback of downloaded MP4 files
 migrate_downloads.py    One-shot slideshow layout migration
 test_download.py        Live Douyin integration smoke script
@@ -51,7 +51,8 @@ docker-compose.yml      bot, web_login, and file_browser services
 ## Non-Negotiable Safety Rules
 
 - Never commit credentials, cookies, browser profiles, downloaded media, or
-  logs. Secrets belong in `.env`, which is gitignored.
+  logs. Secrets such as `BILIBILI_AUTH` belong in `.env`, which is gitignored;
+  yutto auth files must also stay outside Git.
 - Preserve unrelated user changes in a dirty worktree.
 - Do not run `test_download.py` casually; it uses a hardcoded live Douyin URL,
   requires a valid cookie and network access, and may download media.
@@ -67,6 +68,9 @@ it writes F2 config and monkey-patches F2 0.0.1.7 behavior:
 
 - Douyin `ClientConfManager.brm_os`, `brm_version`, `brm_browser`, and
   `brm_engine` receive dictionary fallbacks.
+- The browser and engine fingerprint is forced to Firefox/Gecko on the host
+  platform so it matches cookies acquired through the persistent Firefox
+  profile; F2's bundled Edge/Win32 defaults can produce HTTP 200 empty data.
 - `TokenManager.gen_real_msToken` falls back to `gen_false_msToken`.
 - Bark `ClientConfManager.merge` returns `{}` when both configs are empty.
 
@@ -90,7 +94,11 @@ Email processing in `EmailBot`:
 - queues transient network/timeout download failures for delayed retry before
   sending a final failure; exhausted retry links are appended to the configured
   failed-links file;
-- marks handled messages as seen;
+- caches successful `v.douyin.com` short-link resolutions to aweme IDs so
+  repeated links and manual retries can bypass flaky short-link redirects;
+- marks completed and rejected messages as seen; allowlist, keyword, and
+  cooldown skips return unseen on their first poll, then the in-process dedup
+  path normally marks them seen on the next poll;
 - closes IMAP sockets through `_safe_logout()` to avoid protocol logout hangs.
 
 Douyin downloads:
@@ -111,9 +119,11 @@ Bilibili downloads:
 
 - `BilibiliDownloader.download()` shells out to the yutto CLI. Keep yutto as a
   CLI integration unless there is an explicit reason to depend on internals.
-- Bilibili output defaults to `downloads/bilibili/`, mp4 format, highest
+- Bilibili's dataclass default is `downloads/bilibili/` (the checked-in YAML
+  and Docker overrides currently point at the NAS), mp4 format, highest
   configured video quality, codec preference `hevc,avc,av1`, no danmaku,
-  subtitles, standalone audio sidecars, progress, or color.
+  subtitles, progress, or color. yutto's current default does not retain a
+  standalone audio sidecar.
 - yutto may still download audio needed to mux the final video with sound.
 - Cover sidecars are allowed, but are moved to `downloads/slides/` with a
   `bilibili_` prefix and must not count as video download results.
@@ -130,14 +140,18 @@ Cookie handling:
 - Cookie extraction is Firefox-only and uses a persistent Playwright profile.
 - First login can be interactive through `get_cookie.py`; later headless
   extraction reuses the profile.
+- The web QR login service opens the Douyin login dialog before capturing the
+  complete viewport and serializes Firefox access between QR/status requests.
 - Cookie auth indicators in `cookie_extractor.py` and `douyin_downloader.py`
   should stay logically consistent.
-- `.env` update logic exists in multiple modules. Keep formatting and atomicity
-  behavior consistent if changing it.
+- `.env` update logic exists in multiple modules. The implementations currently
+  preserve similar formatting but write in place rather than atomically; keep
+  them consistent and prefer a shared atomic implementation when changing them.
 
 ## Configuration
 
-Configuration priority is:
+For fields that have an environment-variable override, configuration priority
+is:
 
 ```text
 environment variables > config.yaml > dataclass defaults
@@ -148,6 +162,10 @@ Secret values belong in `.env`:
 - `EMAIL_ADDRESS`
 - `EMAIL_PASSWORD`
 - `DOUYIN_COOKIE`
+- `BILIBILI_AUTH`
+
+`BILIBILI_AUTH_FILE` may point to a yutto authentication file containing
+sensitive login state; do not commit that file.
 
 Important runtime overrides:
 
@@ -157,6 +175,7 @@ Important runtime overrides:
 | `DOUYIN_TIMEOUT` | `douyin.timeout` |
 | `DOUYIN_MAX_RETRIES` | `douyin.max_retries` |
 | `DOUYIN_MAX_TASKS` | `douyin.max_tasks` |
+| `DOUYIN_SHORT_LINK_CACHE` | short-link cache file path |
 | `BILIBILI_DOWNLOAD_PATH` | `bilibili.download_path` |
 | `BILIBILI_AUTH` | `bilibili.auth` |
 | `BILIBILI_AUTH_FILE` | `bilibili.auth_file` |
@@ -184,13 +203,18 @@ Install dependencies:
 uv sync
 ```
 
+`file_browser.py` imports Pillow. Docker installs it from `requirements.txt`,
+but it is not currently declared in `pyproject.toml`/`uv.lock`; a local
+`uv sync` environment needs Pillow installed separately before running the file
+browser.
+
 Run locally:
 
 ```bash
 uv run python main.py
 uv run python web_login.py
 uv run python file_browser.py
-uv run python play.py --dry-run
+uv run python play.py --dry-run --download-dir /srv/nas_data/douyin_downloads
 ```
 
 Cookie utilities:
@@ -235,16 +259,31 @@ sudo docker compose --profile login up web_login
 sudo docker compose down
 ```
 
-The services share named volumes for logs and the Firefox profile. Downloads
-are mounted at `/srv/nas_data/douyin_downloads` on the documented Docker host.
-`.env` and `config.yaml` are bind-mounted from the checkout.
+The bot owns the named logs volume, while the bot and `web_login` share the
+Firefox profile volume. Downloads are bind-mounted into the bot and
+`file_browser` from `/srv/nas_data/douyin_downloads` on the documented Docker
+host (→ `/app/downloads` inside containers). All services bind-mount
+`config.yaml`; only the bot and `web_login` bind-mount `.env`.
 The `bot` service intentionally clears proxy environment variables in Compose;
 Douyin requests should go out directly even if the Docker host has proxy
 settings configured.
 
-The documented execution host is `nouveau@192.168.0.103`, with the checkout at
-`~/douyin_email_bot/`. Treat this as the deployment default, not a portable code
-assumption.
+**Important:** The checked-in `config.yaml` currently points Douyin and
+Bilibili downloads directly at `/srv/nas_data/douyin_downloads`, so
+`test_download.py` and `migrate_downloads.py` operate on the NAS path when run
+on the deployment host. `play.py` is the exception: it defaults to the
+checkout's `./downloads/` and needs `--download-dir
+/srv/nas_data/douyin_downloads` to play deployed media. The NAS root is
+currently owned by `197609:1000` with mode `755`, so use `sudo` when creating
+author directories or otherwise writing outside the Docker services:
+
+```bash
+sudo mkdir -p /srv/nas_data/douyin_downloads/新作者名
+```
+
+The documented execution host is `nouveau@nouveauserver` (currently
+`192.168.1.94`), with the checkout at `~/douyin_email_bot/`. Treat this as the
+deployment default, not a portable code assumption.
 
 Codex usually works directly in the remote Linux checkout, so it may edit and
 verify in `~/douyin_email_bot/` and restart services there. Claude Code on a
@@ -254,7 +293,7 @@ after making changes:
 1. Push all code changes to GitHub.
 2. SSH to the server:
    ```bash
-   ssh nouveau@192.168.0.103
+   ssh nouveau@nouveauserver
    ```
 3. Sync and restart from the server checkout:
    ```bash
@@ -274,19 +313,29 @@ work directly in the server checkout and restart services after verification.
 
 ## Known Pitfalls
 
-- `README.md` contains some legacy cookie instructions. Prefer the current
-  implementation and this file when they conflict, and update user-facing docs
-  when behavior changes.
+- `README.md` and `.env.example` contain legacy cookie instructions and stale
+  default download paths. Prefer the current implementation and this file when
+  they conflict, and update user-facing docs when behavior changes.
 - Slideshow extension detection is heuristic and defaults to `.webp`.
 - `douyin.max_tasks` exists in config, but the single-download handler currently
   forces `max_tasks=1`.
-- If an unallowed or cooldown-limited message is left unseen, it may be found
-  again on later polls. Understand existing flag handling before changing it.
+- Allowlist-, keyword-, and cooldown-skipped messages are left unseen on the
+  first poll, but their IMAP IDs have already entered `_seen_ids`; the next poll
+  normally marks them seen. A process restart before that next poll can cause
+  them to be evaluated again.
 - `_safe_logout()` and the 30-second IMAP socket timeout prevent hangs after
   stale or severed connections.
-- `/api/delete` in `file_browser.py` is destructive and unauthenticated. Treat
-  it as a trusted-LAN service unless an explicit security change is requested.
+- `file_browser.py` is an unauthenticated writable service: upload, delete, and
+  duplicate-resolution endpoints can modify the download tree. Treat the whole
+  service as trusted-LAN-only unless an explicit security change is requested.
 - The thumbnail cache is fixed at `/app/.thumb_cache`.
+- `cookie_extractor.headless` and `cookie_extractor.validate` are loaded from
+  YAML, but email-triggered extraction currently hardcodes both to `True`.
+- `play.py` does not load `config.yaml`; its default directory remains the
+  checkout-local `./downloads/`.
+- Pillow is present in `requirements.txt` for Docker but absent from
+  `pyproject.toml`/`uv.lock`, so `uv sync` alone does not prepare the local file
+  browser environment.
 - Flask templates, CSS, and JavaScript are inline in Python modules; avoid broad
   rewrites unless the task requires them.
 

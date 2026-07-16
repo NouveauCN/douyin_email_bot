@@ -7,9 +7,11 @@ Supports:
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -26,9 +28,23 @@ from f2.exceptions import (
 
 logger = logging.getLogger("DouyinDownloader")
 
+_FIREFOX_UA_PLATFORM = (
+    "X11; Linux x86_64" if sys.platform.startswith("linux") else
+    "Macintosh; Intel Mac OS X 10.15" if sys.platform == "darwin" else
+    "Windows NT 10.0; Win64; x64"
+)
+_FIREFOX_USER_AGENT = (
+    f"Mozilla/5.0 ({_FIREFOX_UA_PLATFORM}; rv:130.0) "
+    "Gecko/20100101 Firefox/130.0"
+)
+
 DOUYIN_SHORT_HTTPS_RE = re.compile(r"^https://v\.douyin\.com/([A-Za-z0-9_-]+)/?$")
 DOUYIN_SHORT_RE = re.compile(r"^https?://v\.douyin\.com/([A-Za-z0-9_-]+)/?$")
 DOUYIN_AWEME_ID_RE = re.compile(r"/(?:share/)?(?:video|note)/(\d+)")
+SHORT_LINK_CACHE_PATH = Path(
+    os.getenv("DOUYIN_SHORT_LINK_CACHE")
+    or Path(__file__).parent / "logs" / "short_link_cache.json"
+)
 
 
 class DouyinDownloader:
@@ -59,7 +75,7 @@ class DouyinDownloader:
 
         # ── Quick cookie quality pre-check ──────────────────────────
         cookie_len = len(self.config.cookie)
-        auth_indicators = ["sessionid", "passport_csrf_token", "odin_tt", "uid"]
+        auth_indicators = ["sessionid", "sessionid_ss", "sid_guard", "uid", "LOGIN_STATUS"]
         has_auth = any(k in self.config.cookie for k in auth_indicators)
         if cookie_len < 500 and not has_auth:
             logger.warning(
@@ -82,7 +98,7 @@ class DouyinDownloader:
             "timeout": self.config.timeout,
             "max_retries": self.config.max_retries,
             "proxies": {},
-            "headers": {},
+            "headers": {"User-Agent": _FIREFOX_USER_AGENT},
         }
 
         try:
@@ -364,25 +380,40 @@ async def _resolve_short_link(path: str, headers: dict) -> str:
     Some network environments block direct HTTP (port 80) while HTTPS works,
     and some have the opposite problem (TLS stalls).  Try both.
     """
-    for scheme in ("https", "http"):
-        short_url = f"{scheme}://v.douyin.com/{path}/"
-        try:
-            async with httpx.AsyncClient(
-                timeout=10,
-                follow_redirects=False,
-                headers=headers,
-                verify=False,
-                trust_env=False,
-            ) as client:
-                response = await client.get(short_url)
-            location = response.headers.get("location", "")
-            if location:
-                logger.debug("Short link resolved via %s: %s", scheme.upper(), location[:120])
-                return location
-        except httpx.ReadTimeout:
-            logger.debug("Short link %s timed out, trying fallback...", scheme.upper())
-        except Exception:
-            logger.debug("Short link %s failed, trying fallback...", scheme.upper())
+    for attempt in range(1, 4):
+        for scheme in ("https", "http"):
+            short_url = f"{scheme}://v.douyin.com/{path}/"
+            try:
+                async with httpx.AsyncClient(
+                    timeout=10,
+                    follow_redirects=False,
+                    headers=headers,
+                    verify=False,
+                    trust_env=False,
+                ) as client:
+                    response = await client.get(short_url)
+                location = response.headers.get("location", "")
+                if location:
+                    logger.debug(
+                        "Short link resolved via %s on attempt %d: %s",
+                        scheme.upper(),
+                        attempt,
+                        location[:120],
+                    )
+                    return location
+            except httpx.TimeoutException:
+                logger.debug(
+                    "Short link %s timed out on attempt %d, trying fallback...",
+                    scheme.upper(),
+                    attempt,
+                )
+            except Exception:
+                logger.debug(
+                    "Short link %s failed on attempt %d, trying fallback...",
+                    scheme.upper(),
+                    attempt,
+                )
+        await asyncio.sleep(1)
     return ""
 
 
@@ -394,14 +425,68 @@ async def _resolve_aweme_id(url: str) -> str:
 
     short_match = DOUYIN_SHORT_RE.fullmatch(url.strip())
     if short_match:
+        cache_key = _short_link_cache_key(short_match.group(1))
+        cached_aweme_id = _read_cached_aweme_id(cache_key)
+        if cached_aweme_id:
+            logger.debug("Resolved short link from cache: %s -> %s", cache_key, cached_aweme_id)
+            return cached_aweme_id
+
         headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.douyin.com/"}
         location = await _resolve_short_link(short_match.group(1), headers)
         location_match = DOUYIN_AWEME_ID_RE.search(location)
         if location_match:
+            aweme_id = location_match.group(1)
             logger.debug("Resolved short link from Location header: %s", location)
-            return location_match.group(1)
+            _write_cached_aweme_id(cache_key, aweme_id)
+            return aweme_id
+        raise APITimeoutError("Douyin short-link redirect timed out")
 
     return await AwemeIdFetcher.get_aweme_id(url)
+
+
+def _short_link_cache_key(path: str) -> str:
+    return f"https://v.douyin.com/{path.strip('/')}/"
+
+
+def _load_short_link_cache() -> dict:
+    try:
+        if not SHORT_LINK_CACHE_PATH.exists():
+            return {}
+        raw = SHORT_LINK_CACHE_PATH.read_text(encoding="utf-8").strip()
+        if not raw:
+            return {}
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        logger.warning("Failed to read short-link cache %s: %s", SHORT_LINK_CACHE_PATH, exc)
+        return {}
+
+
+def _read_cached_aweme_id(cache_key: str) -> str:
+    item = _load_short_link_cache().get(cache_key, {})
+    if not isinstance(item, dict):
+        return ""
+    aweme_id = item.get("aweme_id", "")
+    return aweme_id if isinstance(aweme_id, str) and aweme_id.isdigit() else ""
+
+
+def _write_cached_aweme_id(cache_key: str, aweme_id: str) -> None:
+    try:
+        cache = _load_short_link_cache()
+        cache[cache_key] = {
+            "aweme_id": aweme_id,
+            "cached_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        SHORT_LINK_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = SHORT_LINK_CACHE_PATH.with_suffix(SHORT_LINK_CACHE_PATH.suffix + ".tmp")
+        tmp_path.write_text(
+            json.dumps(cache, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        tmp_path.replace(SHORT_LINK_CACHE_PATH)
+        logger.debug("Cached short link: %s -> %s", cache_key, aweme_id)
+    except OSError as exc:
+        logger.warning("Failed to write short-link cache %s: %s", SHORT_LINK_CACHE_PATH, exc)
 
 
 async def _auto_crop_video(filepath: Path, logger) -> bool:

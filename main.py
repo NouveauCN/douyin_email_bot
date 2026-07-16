@@ -40,13 +40,13 @@ _orig_brm_version = _DOUYIN_CCM.brm_version.__func__
 _orig_brm_browser = _DOUYIN_CCM.brm_browser.__func__
 _orig_brm_engine = _DOUYIN_CCM.brm_engine.__func__
 
-# Platform-aware fallback values for F2's browser fingerprint
-# Douyin API checks these headers; using host-appropriate defaults reduces
-# the chance of being flagged as a bot.
+# Platform-aware values matching the Firefox profile used for cookie login.
+# F2's bundled config defaults to Edge/Win32 even in Linux containers.  A
+# Firefox cookie paired with that mismatched fingerprint gets HTTP 200 empty
+# responses from Douyin, so do not preserve the bundled browser defaults.
 _PLATFORM = "Linux" if sys.platform.startswith("linux") else (
     "Darwin" if sys.platform == "darwin" else "Windows"
 )
-_BROWSER_NAME = "Firefox" if _PLATFORM == "Linux" else "Edge"
 _BROWSER_PLATFORM = "Linux x86_64" if _PLATFORM == "Linux" else (
     "MacIntel" if _PLATFORM == "Darwin" else "Win32"
 )
@@ -63,16 +63,14 @@ def _safe_brm_version(cls):
 
 @classmethod
 def _safe_brm_browser(cls):
-    v = _orig_brm_browser(cls)
-    return v if isinstance(v, dict) else {
-        "name": _BROWSER_NAME, "version": "130.0.0.0",
+    return {
+        "name": "Firefox", "version": "130.0.0.0",
         "language": "zh-CN", "platform": _BROWSER_PLATFORM,
     }
 
 @classmethod
 def _safe_brm_engine(cls):
-    v = _orig_brm_engine(cls)
-    return v if isinstance(v, dict) else {"name": "Blink", "version": "130.0.0.0"}
+    return {"name": "Gecko", "version": "130.0.0.0"}
 
 _DOUYIN_CCM.brm_os = _safe_brm_os
 _DOUYIN_CCM.brm_version = _safe_brm_version

@@ -15,8 +15,8 @@ email:
 
 # Douyin download settings
 douyin:
-  # Download save path (relative to project root)
-  download_path: "./downloads"
+  # Download save path (NAS path for Docker container visibility; absolute path)
+  download_path: "/srv/nas_data/douyin_downloads"
   # Video filename template
   naming: "{create}_{aweme_id}"
   # Save videos to individual user folders
@@ -33,8 +33,8 @@ douyin:
 
 # Bilibili download settings (via yutto)
 bilibili:
-  # Download save path (relative to project root)
-  download_path: "./downloads/bilibili"
+  # Download save path (NAS path for Docker container visibility; absolute path)
+  download_path: "/srv/nas_data/douyin_downloads/bilibili"
   # Max wall-clock time for one yutto process (seconds)
   timeout: 3600
   # Default video quality. 127 requests the highest available stream (8K tier,
