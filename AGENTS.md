@@ -176,6 +176,23 @@ affected-module compilation and focused tests when practical. Mock IMAP, SMTP,
 browser, network, and filesystem side effects; do not use live downloads as a
 routine test.
 
+## Change Delivery
+
+- Every completed modification round must be committed with a clear,
+  descriptive message that summarizes the full change; avoid vague messages
+  such as `update` or `fix`.
+- Do not leave completed work only in the local checkout. After verification,
+  push a branch, open a PR, and merge it into GitHub `main`.
+- Use local `git` for status, staging, commits, and pushes. Use the authenticated
+  GitHub CLI (`gh`) by default for PR creation, inspection, readiness, and merge
+  operations.
+- After merging a functional code, dependency, configuration, or runtime change,
+  sync local `main` and rebuild/restart the affected Docker services without
+  waiting for a separate request. Verify container status afterward.
+- Documentation-only changes do not require a container rebuild. Keep
+  profile-only services such as `web_login` stopped unless they are needed; if
+  they changed, rebuild the profile image without leaving it running.
+
 ## Docker Deployment
 
 ```bash
