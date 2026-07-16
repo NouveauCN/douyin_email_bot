@@ -515,9 +515,21 @@ def _upload_response(payload: dict, status: int = 200):
     if request.headers.get("X-Requested-With") == "XMLHttpRequest":
         return payload, status
 
+    if payload.get("success_count", 0) > 0:
+        return redirect(
+            url_for(
+                "index",
+                upload_success=payload.get("message", ""),
+                upload_error=payload.get("error", ""),
+            ),
+            code=303,
+        )
     if payload.get("success"):
         return redirect(
-            url_for("index", upload_success=payload.get("filename", "")),
+            url_for(
+                "index",
+                upload_success=f"{payload.get('filename', '')} 上传成功",
+            ),
             code=303,
         )
     return redirect(
@@ -526,16 +538,8 @@ def _upload_response(payload: dict, status: int = 200):
     )
 
 
-@app.route("/api/upload", methods=["POST"])
-def api_upload():
-    """Upload a file; images → slides/, videos → uploads/ (convert if needed)."""
-    if "file" not in request.files:
-        return _upload_response({"success": False, "error": "缺少 file 参数"}, 400)
-
-    file = request.files["file"]
-    if not file or not file.filename:
-        return _upload_response({"success": False, "error": "未选择文件"}, 400)
-
+def _process_uploaded_file(file) -> tuple[dict, int]:
+    """Validate and save one uploaded file, returning its payload and status."""
     original_name = Path(file.filename).name
     if "." in original_name:
         stem, ext = original_name.rsplit(".", 1)
@@ -559,9 +563,10 @@ def api_upload():
         out_ext = ext
     else:
         all_allowed = _VIDEO_EXTS | _VIDEO_CONVERT_EXTS | _IMAGE_EXTS
-        return _upload_response(
+        return (
             {
                 "success": False,
+                "original_filename": original_name,
                 "error": f"不支持的文件类型 {ext}，仅支持: {', '.join(sorted(all_allowed))}",
             },
             400,
@@ -596,8 +601,12 @@ def api_upload():
                         p.unlink()
                     except OSError:
                         pass
-                return _upload_response(
-                    {"success": False, "error": "视频转码失败，请检查文件格式"},
+                return (
+                    {
+                        "success": False,
+                        "original_filename": original_name,
+                        "error": "视频转码失败，请检查文件格式",
+                    },
                     500,
                 )
             # Remove the original after successful conversion
@@ -645,6 +654,7 @@ def api_upload():
 
         response = {
             "success": True,
+            "original_filename": original_name,
             "filename": new_name,
             "relpath": relpath,
             "size": dest.stat().st_size,
@@ -654,10 +664,56 @@ def api_upload():
         }
         if dup_result:
             response["duplicate"] = dup_result
-        return _upload_response(response)
+        return response, 200
     except OSError as e:
         log.error("Upload failed: %s", e)
-        return _upload_response({"success": False, "error": str(e)}, 500)
+        return {
+            "success": False,
+            "original_filename": original_name,
+            "error": str(e),
+        }, 500
+
+
+@app.route("/api/upload", methods=["POST"])
+def api_upload():
+    """Upload one or more files; images → slides/, videos → uploads/."""
+    if "file" not in request.files:
+        return _upload_response({"success": False, "error": "缺少 file 参数"}, 400)
+
+    files = [file for file in request.files.getlist("file") if file and file.filename]
+    if not files:
+        return _upload_response({"success": False, "error": "未选择文件"}, 400)
+
+    processed = [_process_uploaded_file(file) for file in files]
+    if len(processed) == 1:
+        payload, status = processed[0]
+        return _upload_response(payload, status)
+
+    results = [payload for payload, _status in processed]
+    success_count = sum(1 for result in results if result.get("success"))
+    failed = [result for result in results if not result.get("success")]
+    failed_count = len(failed)
+    payload = {
+        "success": failed_count == 0,
+        "files": results,
+        "file_count": len(results),
+        "success_count": success_count,
+        "failed_count": failed_count,
+        "message": f"成功上传 {success_count}/{len(results)} 个文件",
+    }
+    if failed:
+        payload["error"] = "；".join(
+            f"{result.get('original_filename', '未知文件')}: {result.get('error', '上传失败')}"
+            for result in failed
+        )
+
+    if not failed:
+        status = 200
+    elif success_count:
+        status = 207
+    else:
+        status = max(status for _payload, status in processed)
+    return _upload_response(payload, status)
 
 
 @app.route("/api/dups")
@@ -949,16 +1005,18 @@ INDEX_HTML = (
   <form id="uploadForm" class="upload-form" action="{{ url_for('api_upload') }}"
         method="post" enctype="multipart/form-data">
     <input class="upload-input" type="file" id="uploadInput" name="file"
-           accept="video/*,image/*" required>
+           accept="video/*,image/*" multiple required>
     <label class="btn" for="uploadInput">📁 选择文件</label>
     <button class="btn upload-submit" id="uploadSubmit" type="submit">📤 开始上传</button>
     {% if videos %}
     <a class="btn" href="{{ url_for('playlist') }}">▶ 全部播放（随机）</a>
     {% endif %}
     <span id="uploadStatus" class="upload-status">
-      {% if upload_success %}✅ {{ upload_success }} 上传成功
-      {% elif upload_error %}❌ 上传失败：{{ upload_error }}
-      {% else %}就绪{% endif %}
+      {% if upload_success %}✅ {{ upload_success }}
+      {% endif %}
+      {% if upload_error %}❌ {{ upload_error }}
+      {% endif %}
+      {% if not upload_success and not upload_error %}就绪{% endif %}
     </span>
   </form>
 
@@ -1052,7 +1110,10 @@ var uploadInput = document.getElementById('uploadInput');
 var uploadSubmit = document.getElementById('uploadSubmit');
 uploadInput.addEventListener('change', function() {
   if (uploadInput.files.length) {
-    setUploadStatus('已选择：' + uploadInput.files[0].name, '#e8f4fd', '#236a96');
+    var selection = uploadInput.files.length === 1
+      ? uploadInput.files[0].name
+      : uploadInput.files.length + ' 个文件';
+    setUploadStatus('已选择：' + selection, '#e8f4fd', '#236a96');
   }
 });
 uploadForm.addEventListener('submit', function(event) {
@@ -1072,6 +1133,23 @@ uploadForm.addEventListener('submit', function(event) {
     })
     .then(function(result) {
       var data = result.data;
+      if (data.file_count) {
+        if (data.success_count) {
+          var batchMessage = '✅ ' + data.message;
+          if (data.failed_count) batchMessage += '；失败：' + data.error;
+          setUploadStatus(
+            batchMessage,
+            data.failed_count ? '#fff3cd' : '#d4edda',
+            data.failed_count ? '#856404' : '#155724'
+          );
+          setTimeout(function() { location.reload(); }, 1800);
+        } else {
+          uploadSubmit.disabled = false;
+          uploadInput.value = '';
+          setUploadStatus('❌ 上传失败: ' + data.error, '#f8d7da', '#721c24');
+        }
+        return;
+      }
       if (result.ok && data.success) {
         var label = data.type === 'video' ? '视频' : '图片';
         if (data.duplicate) {
