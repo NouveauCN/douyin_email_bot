@@ -13,6 +13,8 @@ main.py                 Bot entry point and order-sensitive F2 bootstrap
 email_bot.py            IMAP loop, routing, retries, SMTP, cookie refresh
 douyin_downloader.py    F2 metadata and direct httpx media downloads
 bilibili_downloader.py  Isolated yutto CLI wrapper
+media_processor.py      Conservative shared image/video edge-border removal
+process_media.py        Dry-run/apply CLI for existing downloaded media
 url_extractor.py        Supported URL extraction
 config_loader.py        YAML/env configuration dataclasses
 cookie_extractor.py     Persistent Playwright Firefox cookie handling
@@ -91,8 +93,9 @@ patches and must stay synchronized until they move into a shared module.
   `<root>/<author>/<YYYYMMDD_HHMMSS>_<aweme_id>.mp4` when folderized.
 - Static slideshow images go to `<root>/slides/`; animated MP4 clips follow the
   author-folder layout. Extension detection is heuristic and defaults to WebP.
-- Downloaded MP4 files pass through `_auto_crop_video()`. Restore the original
-  whenever FFmpeg cropping fails.
+- Downloaded images, regular videos, and animated clips pass through the shared
+  `media_processor.py` edge-crop pipeline. Post-processing failures must not
+  turn successful downloads into failures.
 - `douyin.max_tasks` is configured but single downloads currently force one
   task.
 
@@ -104,8 +107,24 @@ patches and must stay synchronized until they move into a shared module.
   current no-danmaku/no-subtitle/no-progress/no-color behavior.
 - Move cover sidecars to the sibling `slides/` directory with a `bilibili_`
   prefix; covers must not count as video results.
+- Run newly downloaded Bilibili videos and moved covers through the shared
+  media processor without changing `files`, `covers`, or count metadata.
 - One URL may return multiple files. Preserve `files` and `file_count` metadata
   and useful single- and multi-file email replies.
+
+### Media post-processing
+
+- Remove only consecutive near-uniform rows or columns connected to an outside
+  edge. Never remove internal lines, and never use darkness alone as a border
+  signal.
+- Keep the strict pixel coverage, per-side crop cap, retained-area floor, and
+  90% whole-duration video-frame consensus unless tests justify a safer change.
+- Successful crops keep the source as `<stem>_original.bak`. Image writes are
+  temporary and atomically replace the destination; all failures restore the
+  source.
+- H.264 crop dimensions must remain even. Preserve audio by stream copy.
+- `process_media.py` is dry-run by default; existing downloads change only with
+  explicit `--apply`.
 
 ### Cookies
 
@@ -157,11 +176,8 @@ uv run python play.py --dry-run --download-dir /srv/nas_data/douyin_downloads
 uv run python get_cookie.py
 uv run python get_cookie.py --headless
 uv run python migrate_downloads.py --dry-run
+uv run python process_media.py /srv/nas_data/douyin_downloads
 ```
-
-`file_browser.py` imports Pillow. Docker gets it from `requirements.txt`, but it
-is currently absent from `pyproject.toml`/`uv.lock`; install it separately in a
-local `uv sync` environment before running the file browser.
 
 Verification baseline:
 
@@ -218,8 +234,8 @@ sudo docker compose down
   stale default paths.
 - The thumbnail cache is fixed at `/app/.thumb_cache`.
 - Flask HTML, CSS, and JavaScript remain inline in Python modules.
-- The local Pillow dependency and the unused cookie-extractor configuration
-  fields should eventually be corrected rather than documented indefinitely.
+- The unused cookie-extractor configuration fields should eventually be
+  corrected rather than documented indefinitely.
 
 Any substantial change to architecture, media layout, configuration,
 dependencies, or startup/deployment behavior must update this file.
