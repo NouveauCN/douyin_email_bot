@@ -124,6 +124,9 @@ patches and must stay synchronized until they move into a shared module.
 - Successful crops keep the source as `<stem>_original.bak`. Image writes are
   temporary and atomically replace the destination; all failures restore the
   source.
+- The bot checks media backups at startup and every seven days. It deletes only
+  `*_original.bak` files that have been retained for at least 28 days; retention
+  and check intervals are configurable under `media_cleanup`.
 - H.264 crop dimensions must remain even. Preserve audio by stream copy and
   prefer the reported source video bitrate so re-encoding does not imply or
   waste space on nonexistent quality improvements.

@@ -301,6 +301,10 @@ def process_image(
                 )
             check.verify()
         temporary.replace(path)
+        try:
+            backup.touch()
+        except OSError as exc:
+            logger.warning("Could not timestamp media backup %s: %s", backup, exc)
     except Exception:
         temporary.unlink(missing_ok=True)
         path.unlink(missing_ok=True)
@@ -598,6 +602,10 @@ def process_video(
         if not output_probe or output_probe[:2] != output_size:
             raise OSError("cropped video failed dimension validation")
         temporary.replace(path)
+        try:
+            backup.touch()
+        except OSError as exc:
+            logger.warning("Could not timestamp media backup %s: %s", backup, exc)
     except Exception:
         temporary.unlink(missing_ok=True)
         path.unlink(missing_ok=True)

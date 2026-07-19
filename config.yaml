@@ -68,6 +68,13 @@ bot:
     # "自动获取cookie" — auto-extract from browser on this machine
     cookie_auto: "自动获取cookie"
 
+# Original media retained after automatic/manual edge cropping
+media_cleanup:
+  # Delete originals that have remained unused for four weeks.
+  backup_retention_days: 28
+  # Scan for expired backups once per week (and once when the bot starts).
+  check_interval_days: 7
+
 # Headless Firefox cookie extraction (optional)
 cookie_extractor:
   # Firefox profile directory for persistent cookies
