@@ -51,7 +51,7 @@ services:
     container_name: douyin_file_browser
     restart: unless-stopped
     ports:
-      - "8081:8081"
+      - "192.168.1.94:8081:8081"
     volumes:
       - /srv/nas_data/douyin_downloads:/app/downloads
       - ./config.yaml:/app/config.yaml:ro
