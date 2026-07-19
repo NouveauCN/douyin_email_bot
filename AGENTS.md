@@ -117,14 +117,21 @@ patches and must stay synchronized until they move into a shared module.
 - Remove only consecutive near-uniform rows or columns connected to an outside
   edge. Never remove internal lines, and never use darkness alone as a border
   signal.
-- Keep the strict pixel coverage, per-side crop cap, retained-area floor, and
-  90% whole-duration video-frame consensus unless tests justify a safer change.
+- Keep the strict pixel coverage and 90% whole-duration video-frame consensus.
+  Standard crops retain the conservative per-side and area limits. Extended
+  crops may auto-apply only when every sampled frame supports stable, paired
+  opposite edges; otherwise they must return `requires_review`.
 - Successful crops keep the source as `<stem>_original.bak`. Image writes are
   temporary and atomically replace the destination; all failures restore the
   source.
-- H.264 crop dimensions must remain even. Preserve audio by stream copy.
+- H.264 crop dimensions must remain even. Preserve audio by stream copy and
+  prefer the reported source video bitrate so re-encoding does not imply or
+  waste space on nonexistent quality improvements.
 - `process_media.py` is dry-run by default; existing downloads change only with
-  explicit `--apply`.
+  explicit `--apply`. Review candidates additionally require `--force-review`.
+- The trusted-LAN file browser video page exposes preview/apply endpoints for
+  manual review. Every media path accepted by these routes must pass through
+  `_safe_subpath()`.
 
 ### Cookies
 

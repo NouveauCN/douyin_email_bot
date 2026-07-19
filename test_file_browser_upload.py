@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import file_browser
+from media_processor import EdgeCrop, ProcessResult
 
 
 _TEST_PNG = base64.b64decode(
@@ -131,6 +132,78 @@ class UploadFormTests(unittest.TestCase):
         followup = self.client.get(response.headers["Location"])
         page = followup.get_data(as_text=True)
         self.assertIn("成功上传 2/2 个文件", page)
+
+    def test_video_page_exposes_crop_review_action(self):
+        video_dir = self.download_dir / "author"
+        video_dir.mkdir()
+        (video_dir / "sample.mp4").write_bytes(b"video")
+
+        response = self.client.get("/video/author/sample.mp4")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('id="cropBtn"', response.get_data(as_text=True))
+        self.assertIn("/api/crop/preview", response.get_data(as_text=True))
+
+    def test_crop_preview_returns_manual_review_candidate(self):
+        video_dir = self.download_dir / "author"
+        video_dir.mkdir()
+        path = video_dir / "sample.mp4"
+        path.write_bytes(b"video")
+        result = ProcessResult(
+            path,
+            False,
+            EdgeCrop(top=300, bottom=300),
+            (1080, 2000),
+            (1080, 1400),
+            "large video crop requires review",
+            requires_review=True,
+            confidence="review",
+        )
+
+        with patch.object(
+            file_browser, "process_media", return_value=result
+        ) as process:
+            response = self.client.post(
+                "/api/crop/preview", json={"path": "author/sample.mp4"}
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["candidate"])
+        self.assertTrue(response.get_json()["requires_review"])
+        process.assert_called_once_with(path, dry_run=True)
+
+    def test_crop_apply_passes_explicit_manual_confirmation(self):
+        video_dir = self.download_dir / "author"
+        video_dir.mkdir()
+        path = video_dir / "sample.mp4"
+        path.write_bytes(b"video")
+        result = ProcessResult(
+            path,
+            True,
+            EdgeCrop(top=300, bottom=300),
+            (1080, 2000),
+            (1080, 1400),
+            "cropped",
+            confidence="manual",
+        )
+
+        with patch.object(
+            file_browser, "process_media", return_value=result
+        ) as process:
+            response = self.client.post(
+                "/api/crop/apply",
+                json={"path": "author/sample.mp4", "force_review": True},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["changed"])
+        process.assert_called_once_with(path, force_review=True)
+
+    def test_crop_api_rejects_path_traversal(self):
+        response = self.client.post(
+            "/api/crop/preview", json={"path": "../../outside.mp4"}
+        )
+        self.assertEqual(response.status_code, 403)
 
 
 if __name__ == "__main__":

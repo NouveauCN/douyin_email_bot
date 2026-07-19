@@ -102,6 +102,8 @@ BILIBILI_AUTH="SESSDATA=xxxxx; bili_jct=yyyyy"
 
 新下载的抖音/B站视频、图集图片和封面都会经过保守的自动裁边。处理器只检查从画布外缘连续延伸的近似同色行列，不会因为画面整体较暗就把黑底照片当成黑边；视频还要求分布在整个时长内的至少 90% 抽样帧达成一致。
 
+对于占画面比例很大的边框，处理器会做第二级确认：如果所有抽样帧都存在稳定、成对的上下边框或左右边框，则自动裁剪；证据不足时保留文件，并要求人工确认。打开视频详情页，点击“检测并裁边”，页面会显示原尺寸、预计尺寸和四侧裁剪量，再决定是否继续。
+
 裁剪成功时，原文件会保留为同目录下的 `*_original.bak`。检测、写入或 FFmpeg 处理失败时会恢复原件，且不会把已经完成的下载标记为失败。
 
 对已有媒体可先预览，不会修改文件：
@@ -115,6 +117,14 @@ uv run python process_media.py /srv/nas_data/douyin_downloads
 ```bash
 uv run python process_media.py /srv/nas_data/douyin_downloads --apply
 ```
+
+命令行中需要人工确认的候选不会被 `--apply` 修改。确认后可针对单个文件执行：
+
+```bash
+uv run python process_media.py "/path/to/video.mp4" --apply --force-review
+```
+
+裁剪必须重新编码画面，但重新编码不会提升原始画质。视频优先沿用源视频码率，让裁剪后的文件大小接近原件；无法读取源码率时才使用保守的质量参数。
 
 ## Cookie 管理
 
@@ -182,6 +192,7 @@ uv run python process_media.py /srv/nas_data/douyin_downloads --apply
 - 处理器宁可少裁也不碰主体；边缘色差过大、裁剪区域过大或视频抽样帧意见不一致时会跳过
 - 本机处理视频需要同时安装 `ffmpeg` 和 `ffprobe`
 - 已存在对应的 `*_original.bak` 时不会重复处理
+- 可在视频详情页点击“检测并裁边”查看候选范围并人工确认
 
 ### 邮件发不出去
 - QQ 邮箱 SMTP 有频率限制，建议 `poll_interval` 不小于 30 秒

@@ -124,6 +124,19 @@ class ImageProcessingTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), original)
             self.assertFalse((path.parent / "bordered_original.bak").exists())
 
+    def test_large_image_crop_requires_explicit_review(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "large-border.png"
+            _bordered_image(top=40).save(path)
+
+            preview = process_image(path, dry_run=True)
+            self.assertTrue(preview.requires_review)
+            self.assertFalse(preview.changed)
+
+            applied = process_image(path, force_review=True)
+            self.assertTrue(applied.changed)
+            self.assertEqual(applied.output_size, (160, 80))
+
 
 class VideoConsensusTests(unittest.TestCase):
     def _write_frames(self, directory: Path, count: int, bordered: int) -> list[Path]:
@@ -141,15 +154,47 @@ class VideoConsensusTests(unittest.TestCase):
     def test_ninety_percent_consensus_allows_video_crop(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             frames = self._write_frames(Path(temp_dir), 16, 15)
-            crop = _video_crop_from_frames(frames, 160, 120)
-        self.assertEqual(crop.top, 12)
-        self.assertEqual(crop.bottom, 8)
+            decision = _video_crop_from_frames(frames, 160, 120)
+        self.assertEqual(decision.crop.top, 12)
+        self.assertEqual(decision.crop.bottom, 8)
 
     def test_low_consensus_rejects_video_crop(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             frames = self._write_frames(Path(temp_dir), 16, 14)
-            crop = _video_crop_from_frames(frames, 160, 120)
-        self.assertEqual(crop, EdgeCrop())
+            decision = _video_crop_from_frames(frames, 160, 120)
+        self.assertEqual(decision.crop, EdgeCrop())
+
+    def test_large_stable_paired_borders_are_automatically_confirmed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = []
+            for index in range(16):
+                path = Path(temp_dir) / f"frame-{index:03d}.png"
+                _bordered_image(top=40, bottom=40).save(path)
+                paths.append(path)
+            decision = _video_crop_from_frames(paths, 160, 120)
+
+        self.assertEqual(decision.crop.top, 40)
+        self.assertEqual(decision.crop.bottom, 40)
+        self.assertFalse(decision.requires_review)
+        self.assertEqual(decision.confidence, "high-confidence-large-border")
+
+    def test_large_border_without_full_frame_support_requires_review(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = []
+            for index in range(16):
+                path = Path(temp_dir) / f"frame-{index:03d}.png"
+                image = (
+                    _bordered_image(top=40, bottom=40)
+                    if index < 15
+                    else _bordered_image()
+                )
+                image.save(path)
+                paths.append(path)
+            decision = _video_crop_from_frames(paths, 160, 120)
+
+        self.assertTrue(decision.crop.changed)
+        self.assertTrue(decision.requires_review)
+        self.assertEqual(decision.confidence, "review")
 
 
 @unittest.skipUnless(
