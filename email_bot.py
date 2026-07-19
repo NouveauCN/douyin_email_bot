@@ -18,6 +18,7 @@ from email.header import decode_header
 from email.mime.text import MIMEText
 from pathlib import Path
 
+from backup_cleanup import BackupCleanupScheduler
 from bilibili_downloader import BilibiliDownloader
 from colorama import Fore, Style
 from douyin_downloader import DouyinDownloader
@@ -83,6 +84,11 @@ class EmailBot:
         self._pending_retries: dict[str, dict] = {}
         self._pending_retry_file = Path(config.bot.transient_pending_file)
         self._failed_links_file = Path(config.bot.transient_failed_file)
+        self._backup_cleanup = BackupCleanupScheduler(
+            Path(config.douyin.download_path),
+            retention_days=config.media_cleanup.backup_retention_days,
+            check_interval_days=config.media_cleanup.check_interval_days,
+        )
         self._load_pending_retries()
 
         # Optional .env auto-reload (for Docker: web_login writes cookie → bot picks it up)
@@ -107,6 +113,7 @@ class EmailBot:
 
         while True:
             try:
+                self._backup_cleanup.run_if_due()
                 self._poll_once(cfg, bot_cfg)
             except imaplib.IMAP4.error as e:
                 logger.error("IMAP error: %s — retrying in %ds", e, cfg.poll_interval)

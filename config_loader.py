@@ -24,6 +24,8 @@ Docker env-var overrides:
     BOT_SUBJECT_KEYWORD   — overrides bot.subject_keyword
     BOT_TRANSIENT_RETRY_ATTEMPTS — overrides bot.transient_retry_attempts
     BOT_TRANSIENT_RETRY_DELAY_SECONDS — overrides bot.transient_retry_delay_seconds
+    MEDIA_BACKUP_RETENTION_DAYS — overrides media_cleanup.backup_retention_days
+    MEDIA_BACKUP_CHECK_INTERVAL_DAYS — overrides media_cleanup.check_interval_days
     COOKIE_PROFILE_DIR    — overrides cookie_extractor.profile_dir
 """
 
@@ -152,6 +154,14 @@ class CookieExtractorConfig:
 
 
 @dataclass
+class MediaCleanupConfig:
+    """Retention policy for originals kept after media cropping."""
+
+    backup_retention_days: int = 28
+    check_interval_days: int = 7
+
+
+@dataclass
 class AppConfig:
     """Top-level application config."""
 
@@ -159,6 +169,7 @@ class AppConfig:
     douyin: DouyinConfig
     bilibili: BilibiliConfig
     bot: BotConfig
+    media_cleanup: MediaCleanupConfig
     cookie_extractor: CookieExtractorConfig
 
 
@@ -269,6 +280,25 @@ def load_config(path: Path) -> AppConfig:
         commands=bot_commands,
     )
 
+    # ── Media backup cleanup ──
+    cleanup_raw = raw.get("media_cleanup", {})
+    media_cleanup = MediaCleanupConfig(
+        backup_retention_days=max(
+            1,
+            _env_int(
+                "MEDIA_BACKUP_RETENTION_DAYS",
+                cleanup_raw.get("backup_retention_days", 28),
+            ),
+        ),
+        check_interval_days=max(
+            1,
+            _env_int(
+                "MEDIA_BACKUP_CHECK_INTERVAL_DAYS",
+                cleanup_raw.get("check_interval_days", 7),
+            ),
+        ),
+    )
+
     # ── Cookie Extractor ──
     extractor_raw = raw.get("cookie_extractor", {})
     cookie_extractor = CookieExtractorConfig(
@@ -285,5 +315,6 @@ def load_config(path: Path) -> AppConfig:
         douyin=douyin,
         bilibili=bilibili,
         bot=bot,
+        media_cleanup=media_cleanup,
         cookie_extractor=cookie_extractor,
     )
