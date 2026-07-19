@@ -12,9 +12,7 @@ Usage:
 
 import argparse
 import hashlib
-import json
 import logging
-import os
 import re
 import shutil
 import subprocess
@@ -45,6 +43,12 @@ if _env_path.exists():
     load_dotenv(_env_path)
 
 from config_loader import load_config  # noqa: E402
+from media_processor import (  # noqa: E402
+    IMAGE_EXTENSIONS as _CROP_IMAGE_EXTENSIONS,
+    VIDEO_EXTENSIONS as _CROP_VIDEO_EXTENSIONS,
+    ProcessResult,
+    process_media,
+)
 
 _config = load_config(_PROJECT_DIR / "config.yaml")
 _DOWNLOAD_DIR = Path(_config.douyin.download_path)
@@ -493,6 +497,75 @@ def api_delete():
     except OSError as e:
         log.error("Failed to delete %s: %s", target, e)
         return {"success": False, "error": str(e)}, 500
+
+
+def _crop_result_payload(result: ProcessResult) -> dict:
+    return {
+        "success": True,
+        "candidate": result.changed or result.requires_review,
+        "changed": result.changed,
+        "requires_review": result.requires_review,
+        "confidence": result.confidence,
+        "reason": result.reason,
+        "original_size": list(result.original_size) if result.original_size else None,
+        "output_size": list(result.output_size) if result.output_size else None,
+        "crop": {
+            "left": result.crop.left,
+            "top": result.crop.top,
+            "right": result.crop.right,
+            "bottom": result.crop.bottom,
+        },
+    }
+
+
+def _crop_target_from_request() -> Path:
+    data = request.get_json(silent=True) or {}
+    subpath = str(data.get("path", "")).strip()
+    if not subpath:
+        abort(400, "缺少 path 参数")
+    target = _safe_subpath(subpath)
+    supported = _CROP_IMAGE_EXTENSIONS | _CROP_VIDEO_EXTENSIONS
+    if not target.is_file():
+        abort(404, "媒体文件不存在")
+    if target.suffix.lower() not in supported:
+        abort(400, "不支持该媒体格式")
+    return target
+
+
+@app.route("/api/crop/preview", methods=["POST"])
+def api_crop_preview():
+    """Analyse one media file without changing it."""
+    target = _crop_target_from_request()
+    try:
+        result = process_media(target, dry_run=True)
+        return _crop_result_payload(result)
+    except Exception as exc:
+        log.exception("Crop preview failed for %s", target)
+        return {"success": False, "error": str(exc)}, 500
+
+
+@app.route("/api/crop/apply", methods=["POST"])
+def api_crop_apply():
+    """Apply an automatic crop or a user-confirmed review candidate."""
+    data = request.get_json(silent=True) or {}
+    target = _crop_target_from_request()
+    force_review = data.get("force_review") is True
+    try:
+        result = process_media(target, force_review=force_review)
+        payload = _crop_result_payload(result)
+        if result.requires_review:
+            payload["success"] = False
+            payload["error"] = "该裁剪范围需要在预览后人工确认"
+            return payload, 409
+        if not result.changed:
+            payload["success"] = False
+            payload["error"] = result.reason or "没有检测到可裁剪边缘"
+            return payload, 422
+        log.info("Manual crop applied: %s (%s)", target, result.confidence)
+        return payload
+    except Exception as exc:
+        log.exception("Crop apply failed for %s", target)
+        return {"success": False, "error": str(exc)}, 500
 
 
 def _convert_video(src: Path, dst: Path) -> bool:
@@ -1391,6 +1464,12 @@ VIDEO_HTML = (
   .info-item { font-size: 13px; color: #999; }
   .info-item strong { color: #333; }
   .actions { margin-top: 14px; display: flex; gap: 10px; flex-wrap: wrap; }
+  .crop-btn { background: #e67e22; }
+  .crop-btn:disabled { opacity: 0.55; cursor: wait; }
+  .crop-status {
+    width: 100%; font-size: 13px; color: #777; padding: 10px 12px;
+    background: #fff; border-radius: 8px; display: none;
+  }
 </style>
 </head>
 <body>
@@ -1415,8 +1494,81 @@ VIDEO_HTML = (
   <div class="actions">
     <a class="btn" href="{{ url_for('raw_file', filepath=relpath) }}" download>⬇ 下载视频</a>
     <a class="btn" href="{{ url_for('browse', subpath=parent_path) }}" style="background:#eee;color:#555">📂 查看更多</a>
+    <button class="btn crop-btn" id="cropBtn" type="button" onclick="checkCrop()">✂ 检测并裁边</button>
+    <div class="crop-status" id="cropStatus"></div>
   </div>
 </div>
+<script>
+const CROP_PATH = {{ relpath | tojson }};
+const cropBtn = document.getElementById('cropBtn');
+const cropStatus = document.getElementById('cropStatus');
+
+function showCropStatus(message, color) {
+  cropStatus.style.display = 'block';
+  cropStatus.style.color = color || '#555';
+  cropStatus.textContent = message;
+}
+
+function cropDetails(data) {
+  const c = data.crop;
+  return data.original_size.join('×') + ' → ' + data.output_size.join('×') +
+    '；左 ' + c.left + '、上 ' + c.top + '、右 ' + c.right + '、下 ' + c.bottom;
+}
+
+function postCrop(endpoint, payload) {
+  return fetch(endpoint, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  }).then(function(response) {
+    return response.json().then(function(data) {
+      if (!response.ok || !data.success) throw new Error(data.error || '操作失败');
+      return data;
+    });
+  });
+}
+
+function checkCrop() {
+  cropBtn.disabled = true;
+  showCropStatus('正在均匀抽取视频帧并检测边缘…', '#856404');
+  postCrop('/api/crop/preview', {path: CROP_PATH})
+    .then(function(data) {
+      if (!data.candidate) {
+        showCropStatus('没有检测到可安全裁剪的连续同色边缘。', '#777');
+        cropBtn.disabled = false;
+        return;
+      }
+      const detail = cropDetails(data);
+      let prompt;
+      if (data.requires_review) {
+        prompt = '该范围超过自动安全阈值，需要人工确认。\n' + detail +
+          '\n\n确认画面主体没有位于这些边缘中，并继续裁剪？';
+      } else if (data.confidence === 'high-confidence-large-border') {
+        prompt = '二次检测确认：所有抽样帧都有稳定、成对的大面积纯色边缘。\n' +
+          detail + '\n\n确认裁剪？';
+      } else {
+        prompt = '检测到高置信度纯色边缘。\n' + detail + '\n\n确认裁剪？';
+      }
+      if (!confirm(prompt)) {
+        showCropStatus('已取消，文件没有修改。检测结果：' + detail, '#777');
+        cropBtn.disabled = false;
+        return;
+      }
+      showCropStatus('正在裁剪并校验输出，原件会保留为备份…', '#856404');
+      return postCrop('/api/crop/apply', {
+        path: CROP_PATH,
+        force_review: data.requires_review
+      }).then(function(result) {
+        showCropStatus('裁剪完成：' + cropDetails(result) + '。正在刷新…', '#155724');
+        setTimeout(function() { location.reload(); }, 1200);
+      });
+    })
+    .catch(function(error) {
+      showCropStatus('裁边失败：' + error.message, '#721c24');
+      cropBtn.disabled = false;
+    });
+}
+</script>
 </body>
 </html>"""  # noqa: E501
 )
