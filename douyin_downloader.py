@@ -26,6 +26,8 @@ from f2.exceptions import (
     APITimeoutError,
 )
 
+from media_processor import log_process_result, process_media
+
 logger = logging.getLogger("DouyinDownloader")
 
 _FIREFOX_UA_PLATFORM = (
@@ -184,7 +186,6 @@ class DouyinDownloader:
 
         # Step 4: Build output filename
         title = data.get("desc") or data.get("nickname") or "Douyin Video"
-        safe_title = _sanitize_filename(title)[:80]
 
         download_time = _download_timestamp()
 
@@ -200,18 +201,20 @@ class DouyinDownloader:
         filepath = save_dir / filename
 
         # Step 5: Download
+        downloaded = False
         if filepath.exists():
             logger.info(f"{Fore.YELLOW}已存在: %s", filepath.name)
         else:
             await self._download_file(video_url, filepath, kwargs)
+            downloaded = True
             logger.info(
                 f"{Fore.GREEN}{Style.BRIGHT}[DONE] 下载完成: %s (%.1f MB)",
                 filepath.name,
                 filepath.stat().st_size / 1_000_000,
             )
 
-        # Auto-crop black bars (backup original as .bak)
-        await _auto_crop_video(filepath, logger)
+        if downloaded:
+            await _process_downloaded_media(filepath)
 
         return {
             "success": True,
@@ -306,9 +309,7 @@ class DouyinDownloader:
                 await self._download_file(url, filepath, kwargs)
                 done += 1
                 total_size += filepath.stat().st_size
-                # Auto-crop slideshow video clips too
-                if filepath.suffix.lower() == ".mp4":
-                    await _auto_crop_video(filepath, logger)
+                await _process_downloaded_media(filepath)
             except Exception as exc:
                 logger.warning("Failed to download %s %s: %s", label, filepath.name, exc)
 
@@ -489,158 +490,14 @@ def _write_cached_aweme_id(cache_key: str, aweme_id: str) -> None:
         logger.warning("Failed to write short-link cache %s: %s", SHORT_LINK_CACHE_PATH, exc)
 
 
-async def _auto_crop_video(filepath: Path, logger) -> bool:
-    """Detect and remove baked-in black bars from a downloaded video.
-
-    Uses ffmpeg cropdetect to analyse 100 frames and find consistent
-    letterboxing/pillarboxing.  If black bars exceed 10% of either
-    dimension, the video is re-encoded with the crop applied.
-
-    The original is backed up as ``{name}_original.bak`` so it can be
-    restored if the auto-crop gets it wrong.
-
-    Returns True if the video was cropped, False otherwise.
-    """
-    import shutil
-    import subprocess
-    import tempfile
-
-    if not shutil.which("ffmpeg"):
-        logger.debug("ffmpeg not available — skipping auto-crop")
-        return False
-
-    path_str = str(filepath)
-
-    # ── Step 1: Detect crop parameters across 100 frames ───────────
-    logger.debug("Auto-crop: analysing %s…", filepath.name)
+async def _process_downloaded_media(filepath: Path) -> None:
+    """Run CPU/subprocess media work without blocking the downloader loop."""
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg",
-            "-v", "error",
-            "-i", path_str,
-            "-vf", "cropdetect=limit=24:round=2",
-            "-vframes", "100",
-            "-f", "null", "-",
-            stderr=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.DEVNULL,
-        )
-        _stdout, stderr = await proc.communicate()
+        result = await asyncio.to_thread(process_media, filepath)
+        log_process_result(result, logger)
     except Exception as exc:
-        logger.warning("Auto-crop: ffmpeg cropdetect failed: %s", exc)
-        return False
-
-    stderr_text = stderr.decode("utf-8", errors="replace")
-
-    # Parse cropdetect lines: "w:720 h:360 x:0 y:180"
-    import re
-    crop_re = re.compile(r"crop=(\d+):(\d+):(\d+):(\d+)")
-    crops: list[tuple[int, int, int, int]] = []
-    for line in stderr_text.splitlines():
-        m = crop_re.search(line)
-        if m:
-            crops.append(tuple(map(int, m.groups())))
-
-    # Also check for the final "crop=…" line that cropdetect outputs
-    final_re = re.compile(r"crop=(\d+):(\d+):(\d+):(\d+)")
-    for line in stderr_text.splitlines():
-        m = final_re.search(line)
-        if m and "crop=" in line and "cropdetect" not in line:
-            # This is the consensus line
-            pass
-
-    if not crops:
-        logger.debug("Auto-crop: no frames analysed for %s", filepath.name)
-        return False
-
-    # ── Step 2: Find the most common (mode) crop value ─────────────
-    from collections import Counter
-    crop_counts = Counter(crops)
-    (w, h, x, y), count = crop_counts.most_common(1)[0]
-
-    # Get original dimensions
-    try:
-        probe = await asyncio.create_subprocess_exec(
-            "ffprobe",
-            "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=width,height",
-            "-of", "csv=p=0",
-            path_str,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        probe_out, _ = await probe.communicate()
-        orig_w, orig_h = map(int, probe_out.decode().strip().split(","))
-    except Exception:
-        logger.warning("Auto-crop: ffprobe failed — skipping")
-        return False
-
-    # ── Step 3: Decide if cropping is worth it ─────────────────────
-    w_reduction = 1.0 - (w / orig_w)
-    h_reduction = 1.0 - (h / orig_h)
-
-    if w_reduction < 0.10 and h_reduction < 0.10:
-        logger.debug(
-            "Auto-crop: black bars too small (%d%% width, %d%% height) — skipping %s",
-            int(w_reduction * 100), int(h_reduction * 100), filepath.name,
-        )
-        return False
-
-    # Must be a reasonable fraction of frames agreeing
-    agreement = count / len(crops) if crops else 0
-    if agreement < 0.5:
-        logger.debug(
-            "Auto-crop: crop consensus too low (%.0f%%) — skipping %s",
-            agreement * 100, filepath.name,
-        )
-        return False
-
-    logger.info(
-        "Auto-crop: detected black bars — %dx%d -> %dx%d (%.0f%% agreement) for %s",
-        orig_w, orig_h, w, h, agreement * 100, filepath.name,
-    )
-
-    # ── Step 4: Backup original + crop ─────────────────────────────
-    backup_path = filepath.parent / (filepath.stem + "_original.bak")
-    filepath.rename(backup_path)
-    logger.debug("Auto-crop: backed up original -> %s", backup_path.name)
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg",
-            "-v", "error",
-            "-i", str(backup_path),
-            "-vf", f"crop={w}:{h}:{x}:{y}",
-            "-c:a", "copy",   # copy audio stream unchanged
-            "-c:v", "libx264",
-            "-preset", "fast",
-            "-crf", "23",
-            "-movflags", "+faststart",
-            str(filepath),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, crop_stderr = await proc.communicate()
-        if proc.returncode != 0:
-            # Restore original on failure
-            err = crop_stderr.decode("utf-8", errors="replace")[-200:]
-            logger.warning("Auto-crop: ffmpeg crop failed: %s", err)
-            backup_path.rename(filepath)
-            return False
-
-        orig_size = backup_path.stat().st_size / 1_000_000
-        new_size = filepath.stat().st_size / 1_000_000
-        logger.info(
-            "Auto-crop: cropped %dx%d -> %dx%d (%.1f MB -> %.1f MB) for %s",
-            orig_w, orig_h, w, h, orig_size, new_size, filepath.name,
-        )
-        return True
-    except Exception as exc:
-        logger.warning("Auto-crop: crop failed, restoring original: %s", exc)
-        if filepath.exists():
-            filepath.unlink()
-        backup_path.rename(filepath)
-        return False
+        # Post-processing must never turn a completed download into a failure.
+        logger.warning("Auto-crop failed for %s: %s", filepath.name, exc)
 
 
 def _sanitize_filename(name: str) -> str:

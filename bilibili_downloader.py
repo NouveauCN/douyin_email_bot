@@ -9,6 +9,8 @@ from pathlib import Path
 
 from colorama import Fore, Style
 
+from media_processor import log_process_result, process_media
+
 logger = logging.getLogger("BilibiliDownloader")
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -69,6 +71,7 @@ class BilibiliDownloader:
 
         covers = _move_cover_files(download_dir, started_at)
         files = _collect_downloaded_files(download_dir, started_at)
+        _process_downloaded_media([*files, *covers])
         filepath = _format_file_result(files, download_dir)
         title = _extract_title(output) or "Bilibili Video"
 
@@ -235,3 +238,13 @@ def _format_file_result(files: list[Path], download_dir: Path) -> str | None:
     if len(parents) == 1:
         return str(next(iter(parents)))
     return f"{download_dir} ({len(files)} 个文件)"
+
+
+def _process_downloaded_media(paths: list[Path]) -> None:
+    """Best-effort post-processing that cannot invalidate a yutto download."""
+    for path in paths:
+        try:
+            result = process_media(path)
+            log_process_result(result, logger)
+        except Exception as exc:
+            logger.warning("Auto-crop failed for %s: %s", path.name, exc)
