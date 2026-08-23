@@ -24,6 +24,14 @@ Docker env-var overrides:
     BOT_SUBJECT_KEYWORD   — overrides bot.subject_keyword
     BOT_TRANSIENT_RETRY_ATTEMPTS — overrides bot.transient_retry_attempts
     BOT_TRANSIENT_RETRY_DELAY_SECONDS — overrides bot.transient_retry_delay_seconds
+    CODEX_FAILURE_HANDLER_ENABLED — overrides codex.enabled
+    CODEX_BIN — overrides codex.executable
+    CODEX_SANDBOX — overrides codex.sandbox
+    CODEX_TIMEOUT_SECONDS — overrides codex.timeout_seconds
+    CODEX_WORKING_DIRECTORY — overrides codex.working_directory
+    CODEX_MODEL — overrides codex.model
+    CODEX_MAX_OUTPUT_CHARS — overrides codex.max_output_chars
+    CODEX_NOTIFY_EMAIL — overrides codex.notify_email
     MEDIA_BACKUP_RETENTION_DAYS — overrides media_cleanup.backup_retention_days
     MEDIA_BACKUP_CHECK_INTERVAL_DAYS — overrides media_cleanup.check_interval_days
     COOKIE_PROFILE_DIR    — overrides cookie_extractor.profile_dir
@@ -151,6 +159,20 @@ class BotConfig:
 
 
 @dataclass
+class CodexConfig:
+    """Failure-diagnosis settings for the optional local Codex CLI."""
+
+    enabled: bool = True
+    executable: str = "codex"
+    sandbox: str = "read-only"
+    timeout_seconds: int = 900
+    working_directory: str = ""
+    model: str = ""
+    max_output_chars: int = 12000
+    notify_email: str = ""
+
+
+@dataclass
 class CookieExtractorConfig:
     """Headless Firefox cookie extraction settings."""
 
@@ -175,6 +197,7 @@ class AppConfig:
     douyin: DouyinConfig
     bilibili: BilibiliConfig
     bot: BotConfig
+    codex: CodexConfig
     media_cleanup: MediaCleanupConfig
     cookie_extractor: CookieExtractorConfig
 
@@ -289,6 +312,31 @@ def load_config(path: Path) -> AppConfig:
         commands=bot_commands,
     )
 
+    # ── Codex failure diagnosis ──
+    codex_raw = raw.get("codex", {})
+    codex = CodexConfig(
+        enabled=_env_bool(
+            "CODEX_FAILURE_HANDLER_ENABLED",
+            codex_raw.get("enabled", True),
+        ),
+        executable=_env_str("CODEX_BIN", codex_raw.get("executable", "codex")),
+        sandbox=_env_str("CODEX_SANDBOX", codex_raw.get("sandbox", "read-only")),
+        timeout_seconds=max(
+            30,
+            _env_int("CODEX_TIMEOUT_SECONDS", codex_raw.get("timeout_seconds", 900)),
+        ),
+        working_directory=_resolve_project_path(
+            path,
+            _env_str("CODEX_WORKING_DIRECTORY", codex_raw.get("working_directory", "")),
+        ),
+        model=_env_str("CODEX_MODEL", codex_raw.get("model", "")),
+        max_output_chars=max(
+            1000,
+            _env_int("CODEX_MAX_OUTPUT_CHARS", codex_raw.get("max_output_chars", 12000)),
+        ),
+        notify_email=_env_str("CODEX_NOTIFY_EMAIL", codex_raw.get("notify_email", "")),
+    )
+
     # ── Media backup cleanup ──
     cleanup_raw = raw.get("media_cleanup", {})
     media_cleanup = MediaCleanupConfig(
@@ -324,6 +372,7 @@ def load_config(path: Path) -> AppConfig:
         douyin=douyin,
         bilibili=bilibili,
         bot=bot,
+        codex=codex,
         media_cleanup=media_cleanup,
         cookie_extractor=cookie_extractor,
     )
