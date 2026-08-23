@@ -17,10 +17,11 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from PIL import Image
 
@@ -60,6 +61,102 @@ _THUMB_CACHE = Path("/app/.thumb_cache")
 
 app = Flask(__name__)
 log = logging.getLogger("file_browser")
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+_MAX_UPLOAD_BYTES = _positive_int_env("FILE_BROWSER_MAX_UPLOAD_BYTES", 2 * 1024**3)
+_MAX_UPLOAD_FILES = _positive_int_env("FILE_BROWSER_MAX_UPLOAD_FILES", 10)
+_MEDIA_MAX_CONCURRENCY = _positive_int_env(
+    "FILE_BROWSER_MEDIA_MAX_CONCURRENCY", 2
+)
+app.config["MAX_CONTENT_LENGTH"] = _MAX_UPLOAD_BYTES
+app.config["FILE_BROWSER_MAX_UPLOAD_BYTES"] = _MAX_UPLOAD_BYTES
+app.config["FILE_BROWSER_MAX_UPLOAD_FILES"] = _MAX_UPLOAD_FILES
+
+
+def _configured_origins() -> tuple[str, ...]:
+    configured = os.environ.get("FILE_BROWSER_ALLOWED_ORIGINS", "")
+    return tuple(
+        origin
+        for value in configured.split(",")
+        if (origin := _normalize_origin(value.strip())) is not None
+    )
+
+
+def _normalize_origin(value: str) -> str | None:
+    """Return an origin, rejecting paths and other non-origin components."""
+    try:
+        parsed = urlsplit(value)
+        parsed.port  # Validate a possible explicit port.
+    except ValueError:
+        return None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+
+
+_ALLOWED_ORIGINS = _configured_origins()
+_USE_DEFAULT_ORIGIN = not os.environ.get("FILE_BROWSER_ALLOWED_ORIGINS", "").strip()
+_MEDIA_SEMAPHORE = threading.BoundedSemaphore(_MEDIA_MAX_CONCURRENCY)
+_DEDUP_LOCK = threading.RLock()
+
+
+def _request_origin() -> str | None:
+    return _normalize_origin(f"{request.scheme}://{request.host}")
+
+
+def _source_origin() -> str | None:
+    origin = request.headers.get("Origin")
+    if origin is not None:
+        return _normalize_origin(origin)
+    referer = request.headers.get("Referer")
+    if not referer:
+        return None
+    try:
+        parsed = urlsplit(referer)
+    except ValueError:
+        return None
+    return _normalize_origin(f"{parsed.scheme}://{parsed.netloc}")
+
+
+@app.before_request
+def _validate_mutating_request_source():
+    """Require a same-origin source for every state-changing request."""
+    if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return None
+
+    source = _source_origin()
+    allowed = (
+        ((_request_origin(),) if _request_origin() else ())
+        if _USE_DEFAULT_ORIGIN
+        else _ALLOWED_ORIGINS
+    )
+    if source is None or source not in allowed:
+        abort(403, "Origin or Referer validation failed")
+    return None
+
+
+def _media_busy_response():
+    return {"success": False, "error": "媒体处理繁忙，请稍后重试"}, 429
+
+
+def _try_acquire_media_slot() -> bool:
+    return _MEDIA_SEMAPHORE.acquire(blocking=False)
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -596,6 +693,8 @@ def api_delete():
         return {"success": False, "error": "不允许删除下载根目录"}, 403
     if not target.exists():
         return {"success": False, "error": "文件或目录不存在"}, 404
+    if not _try_acquire_media_slot():
+        return _media_busy_response()
 
     try:
         # Save this before deletion: ``Path.is_dir()`` is false after rmtree,
@@ -615,19 +714,20 @@ def api_delete():
         # Clean up dedup state
         deleted_rel = str(target.relative_to(_DOWNLOAD_DIR)).replace("\\", "/")
         global _DEDUP_INDEX, _PENDING_DUPS
-        if target_was_dir:
-            prefix = deleted_rel + "/"
-            _DEDUP_INDEX = {k: v for k, v in _DEDUP_INDEX.items()
-                            if not k.startswith(prefix) and k != deleted_rel}
-            _PENDING_DUPS = [d for d in _PENDING_DUPS
-                             if d["new_file"] != deleted_rel
-                             and not d["new_file"].startswith(prefix)
-                             and not d["match_file"].startswith(prefix)]
-        else:
-            _DEDUP_INDEX.pop(deleted_rel, None)
-            _PENDING_DUPS = [d for d in _PENDING_DUPS
-                             if d["new_file"] != deleted_rel
-                             and d["match_file"] != deleted_rel]
+        with _DEDUP_LOCK:
+            if target_was_dir:
+                prefix = deleted_rel + "/"
+                _DEDUP_INDEX = {k: v for k, v in _DEDUP_INDEX.items()
+                                if not k.startswith(prefix) and k != deleted_rel}
+                _PENDING_DUPS = [d for d in _PENDING_DUPS
+                                 if d["new_file"] != deleted_rel
+                                 and not d["new_file"].startswith(prefix)
+                                 and not d["match_file"].startswith(prefix)]
+            else:
+                _DEDUP_INDEX.pop(deleted_rel, None)
+                _PENDING_DUPS = [d for d in _PENDING_DUPS
+                                 if d["new_file"] != deleted_rel
+                                 and d["match_file"] != deleted_rel]
 
         return {
             "success": True,
@@ -639,6 +739,8 @@ def api_delete():
     except OSError as e:
         log.error("Failed to delete %s: %s", target, e)
         return {"success": False, "error": str(e)}, 500
+    finally:
+        _MEDIA_SEMAPHORE.release()
 
 
 def _crop_result_payload(result: ProcessResult) -> dict:
@@ -678,12 +780,16 @@ def _crop_target_from_request() -> Path:
 def api_crop_preview():
     """Analyse one media file without changing it."""
     target = _crop_target_from_request()
+    if not _try_acquire_media_slot():
+        return _media_busy_response()
     try:
         result = process_media(target, dry_run=True)
         return _crop_result_payload(result)
     except Exception as exc:
         log.exception("Crop preview failed for %s", target)
         return {"success": False, "error": str(exc)}, 500
+    finally:
+        _MEDIA_SEMAPHORE.release()
 
 
 @app.route("/api/crop/apply", methods=["POST"])
@@ -692,6 +798,8 @@ def api_crop_apply():
     data = request.get_json(silent=True) or {}
     target = _crop_target_from_request()
     force_review = data.get("force_review") is True
+    if not _try_acquire_media_slot():
+        return _media_busy_response()
     try:
         result = process_media(target, force_review=force_review)
         payload = _crop_result_payload(result)
@@ -708,6 +816,8 @@ def api_crop_apply():
     except Exception as exc:
         log.exception("Crop apply failed for %s", target)
         return {"success": False, "error": str(exc)}, 500
+    finally:
+        _MEDIA_SEMAPHORE.release()
 
 
 def _convert_video(src: Path, dst: Path) -> bool:
@@ -727,7 +837,9 @@ def _convert_video(src: Path, dst: Path) -> bool:
 
 def _upload_response(payload: dict, status: int = 200):
     """Return JSON to enhanced clients and redirect native form submissions."""
-    if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+    if request.headers.get("X-Requested-With") == "XMLHttpRequest" or status in {
+        413, 429, 503
+    }:
         return payload, status
 
     if payload.get("success_count", 0) > 0:
@@ -840,30 +952,31 @@ def _process_uploaded_file(file) -> tuple[dict, int]:
             img = _media_to_image(dest)
             new_dhash = _compute_dhash(img)
             new_thumb = _compute_thumbnail(img)
-            for existing_rel, (existing_dhash, existing_thumb) in _DEDUP_INDEX.items():
-                if _hamming(new_dhash, existing_dhash) > _DHASH_THRESHOLD:
-                    continue
-                mse_val = _mse(new_thumb, existing_thumb)
-                if mse_val < _MSE_THRESHOLD:
-                    similarity = max(0, 100 - int(mse_val / _MSE_THRESHOLD * 100))
-                    dup_result = {
-                        "duplicate_of": existing_rel,
-                        "dhash_dist": _hamming(new_dhash, existing_dhash),
-                        "mse": round(mse_val, 1),
-                        "similarity_pct": similarity,
-                    }
-                    _PENDING_DUPS.append({
-                        "new_file": relpath,
-                        "match_file": existing_rel,
-                        "dhash_dist": dup_result["dhash_dist"],
-                        "mse": dup_result["mse"],
-                        "similarity_pct": similarity,
-                    })
-                    log.info("Duplicate candidate: %s ≈ %s (dist=%d, mse=%.1f)",
-                             relpath, existing_rel, dup_result["dhash_dist"], dup_result["mse"])
-                    break
-            if not dup_result:
-                _DEDUP_INDEX[relpath] = (new_dhash, new_thumb)
+            with _DEDUP_LOCK:
+                for existing_rel, (existing_dhash, existing_thumb) in _DEDUP_INDEX.items():
+                    if _hamming(new_dhash, existing_dhash) > _DHASH_THRESHOLD:
+                        continue
+                    mse_val = _mse(new_thumb, existing_thumb)
+                    if mse_val < _MSE_THRESHOLD:
+                        similarity = max(0, 100 - int(mse_val / _MSE_THRESHOLD * 100))
+                        dup_result = {
+                            "duplicate_of": existing_rel,
+                            "dhash_dist": _hamming(new_dhash, existing_dhash),
+                            "mse": round(mse_val, 1),
+                            "similarity_pct": similarity,
+                        }
+                        _PENDING_DUPS.append({
+                            "new_file": relpath,
+                            "match_file": existing_rel,
+                            "dhash_dist": dup_result["dhash_dist"],
+                            "mse": dup_result["mse"],
+                            "similarity_pct": similarity,
+                        })
+                        log.info("Duplicate candidate: %s ≈ %s (dist=%d, mse=%.1f)",
+                                 relpath, existing_rel, dup_result["dhash_dist"], dup_result["mse"])
+                        break
+                if not dup_result:
+                    _DEDUP_INDEX[relpath] = (new_dhash, new_thumb)
         except Exception as e:
             log.warning("Dedup check skipped for %s: %s", relpath, e)
 
@@ -895,11 +1008,28 @@ def api_upload():
     if "file" not in request.files:
         return _upload_response({"success": False, "error": "缺少 file 参数"}, 400)
 
-    files = [file for file in request.files.getlist("file") if file and file.filename]
+    uploaded_files = request.files.getlist("file")
+    if len(uploaded_files) > _MAX_UPLOAD_FILES:
+        return _upload_response(
+            {
+                "success": False,
+                "error": f"单次最多上传 {_MAX_UPLOAD_FILES} 个文件",
+            },
+            413,
+        )
+
+    files = [file for file in uploaded_files if file and file.filename]
     if not files:
         return _upload_response({"success": False, "error": "未选择文件"}, 400)
 
-    processed = [_process_uploaded_file(file) for file in files]
+    if not _try_acquire_media_slot():
+        return _upload_response(
+            {"success": False, "error": "媒体处理繁忙，请稍后重试"}, 429
+        )
+    try:
+        processed = [_process_uploaded_file(file) for file in files]
+    finally:
+        _MEDIA_SEMAPHORE.release()
     if len(processed) == 1:
         payload, status = processed[0]
         return _upload_response(payload, status)
@@ -935,7 +1065,9 @@ def api_upload():
 def api_list_dups():
     """List pending duplicate confirmations with file metadata."""
     result = []
-    for d in _PENDING_DUPS:
+    with _DEDUP_LOCK:
+        pending_dups = list(_PENDING_DUPS)
+    for d in pending_dups:
         new_info = _file_info(d["new_file"])
         match_info = _file_info(d["match_file"])
         if new_info and match_info:
@@ -971,6 +1103,8 @@ def api_dup_delete():
     target = _safe_subpath(path)
     if not target.exists():
         return {"success": False, "error": "文件不存在"}, 404
+    if not _try_acquire_media_slot():
+        return _media_busy_response()
 
     try:
         target.unlink()
@@ -981,22 +1115,26 @@ def api_dup_delete():
             new_target = _safe_subpath(entry["new_file"])
             if new_target.exists():
                 img = _media_to_image(new_target)
-                _DEDUP_INDEX[entry["new_file"]] = (
-                    _compute_dhash(img),
-                    _compute_thumbnail(img),
-                )
+                with _DEDUP_LOCK:
+                    _DEDUP_INDEX[entry["new_file"]] = (
+                        _compute_dhash(img),
+                        _compute_thumbnail(img),
+                    )
                 log.info("Dup resolved: deleted match %s, indexed new %s",
                          path, entry["new_file"])
         else:
             log.info("Dup resolved: deleted new %s, kept match %s",
                      path, entry["match_file"])
 
-        _PENDING_DUPS = [d for d in _PENDING_DUPS if d != entry]
-        _DEDUP_INDEX.pop(path, None)
+        with _DEDUP_LOCK:
+            _PENDING_DUPS = [d for d in _PENDING_DUPS if d != entry]
+            _DEDUP_INDEX.pop(path, None)
         return {"success": True}
     except OSError as e:
         log.error("Dup delete failed: %s", e)
         return {"success": False, "error": str(e)}, 500
+    finally:
+        _MEDIA_SEMAPHORE.release()
 
 
 @app.route("/api/dup/keep", methods=["POST"])
@@ -1010,19 +1148,24 @@ def api_dup_keep():
     target = _safe_subpath(path)
     if not target.exists():
         return {"success": False, "error": "文件不存在"}, 404
+    if not _try_acquire_media_slot():
+        return _media_busy_response()
 
     try:
         # Add to dedup index
         img = _media_to_image(target)
-        _DEDUP_INDEX[path] = (_compute_dhash(img), _compute_thumbnail(img))
-        # Remove from pending
-        global _PENDING_DUPS
-        _PENDING_DUPS = [d for d in _PENDING_DUPS if d["new_file"] != path]
+        with _DEDUP_LOCK:
+            _DEDUP_INDEX[path] = (_compute_dhash(img), _compute_thumbnail(img))
+            # Remove from pending
+            global _PENDING_DUPS
+            _PENDING_DUPS = [d for d in _PENDING_DUPS if d["new_file"] != path]
         log.info("Dup-kept: %s → added to index", path)
         return {"success": True}
     except Exception as e:
         log.error("Dup keep failed: %s", e)
         return {"success": False, "error": str(e)}, 500
+    finally:
+        _MEDIA_SEMAPHORE.release()
 
 
 def _file_info(relpath: str) -> dict | None:
@@ -1082,6 +1225,21 @@ def _server_error(e):
         suggestion=suggestion,
         detail=str(e),
     ), 500
+
+
+@app.errorhandler(413)
+def _request_too_large(e):
+    payload = {"success": False, "error": "请求内容超过允许的大小或文件数量限制"}
+    if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+        return payload, 413
+    return render_template_string(
+        ERROR_HTML,
+        code=413,
+        title="请求过大",
+        explanation="上传内容超过服务器允许的大小或文件数量限制。",
+        suggestion="请减少文件数量或选择较小的文件后重试。",
+        detail=str(e),
+    ), 413
 
 
 # ── Templates ─────────────────────────────────────────────────────────
