@@ -43,7 +43,8 @@ _FIREFOX_USER_AGENT = (
     "Gecko/20100101 Firefox/130.0"
 )
 
-DOUYIN_SHORT_RE = re.compile(r"^https?://v\.douyin\.com/([A-Za-z0-9_-]+)/?$")
+DOUYIN_SHORT_RE = re.compile(r"^https://v\.douyin\.com/([A-Za-z0-9_-]+)/?$")
+DOUYIN_SHORT_PATH_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 DOUYIN_AWEME_ID_RE = re.compile(r"/(?:share/)?(?:video|note)/(\d+)")
 DOUYIN_AWEME_PATH_RE = re.compile(r"^/(?:share/)?(?:video|note)/(\d+)/?$")
 _DOUYIN_REDIRECT_HOSTS = frozenset({
@@ -55,6 +56,7 @@ SHORT_LINK_CACHE_PATH = Path(
     os.getenv("DOUYIN_SHORT_LINK_CACHE")
     or Path(__file__).parent / "logs" / "short_link_cache.json"
 )
+SHORT_LINK_CACHE_SCHEMA = "https-validated-v1"
 
 
 def _short_link_verify() -> str | bool:
@@ -481,6 +483,9 @@ async def _resolve_short_link(path: str, headers: dict) -> str:
     Douyin host and the exact video/note path shape are accepted and cached.
     A private CA may be supplied explicitly with ``DOUYIN_SHORT_LINK_CA_BUNDLE``.
     """
+    if not DOUYIN_SHORT_PATH_RE.fullmatch(path):
+        return ""
+
     short_url = f"https://v.douyin.com/{path}/"
     for attempt in range(1, 4):
         try:
@@ -494,7 +499,7 @@ async def _resolve_short_link(path: str, headers: dict) -> str:
                 response = await client.get(short_url)
             if response.is_redirect:
                 location = response.headers.get("location", "")
-                if location:
+                if _validated_aweme_id(location):
                     logger.debug(
                         "Short link resolved via HTTPS on attempt %d: %s",
                         attempt,
@@ -520,21 +525,40 @@ def _validated_aweme_id(location: str) -> str:
     """Return an aweme ID only for a verified HTTPS Douyin redirect target."""
     try:
         parsed = urlparse(location)
+        port = parsed.port
     except ValueError:
         return ""
-    if parsed.scheme != "https" or parsed.hostname not in _DOUYIN_REDIRECT_HOSTS:
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname not in _DOUYIN_REDIRECT_HOSTS
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or parsed.netloc.endswith(":")
+        or parsed.fragment
+    ):
         return ""
     match = DOUYIN_AWEME_PATH_RE.fullmatch(parsed.path)
     return match.group(1) if match else ""
 
 
+def _is_douyin_short_host_url(url: str) -> bool:
+    """Identify v.douyin.com URLs so HTTP or malformed short links never fall back."""
+    try:
+        parsed = urlparse(url)
+        return parsed.scheme in {"http", "https"} and parsed.hostname == "v.douyin.com"
+    except ValueError:
+        return False
+
+
 async def _resolve_aweme_id(url: str) -> str:
     """Resolve Douyin URLs without following short links onto flaky HTTPS hosts."""
-    direct_match = DOUYIN_AWEME_ID_RE.search(url)
+    candidate = url.strip()
+    direct_match = DOUYIN_AWEME_ID_RE.search(candidate)
     if direct_match:
         return direct_match.group(1)
 
-    short_match = DOUYIN_SHORT_RE.fullmatch(url.strip())
+    short_match = DOUYIN_SHORT_RE.fullmatch(candidate)
     if short_match:
         cache_key = _short_link_cache_key(short_match.group(1))
         cached_aweme_id = _read_cached_aweme_id(cache_key)
@@ -551,7 +575,10 @@ async def _resolve_aweme_id(url: str) -> str:
             return aweme_id
         raise APITimeoutError("Douyin short-link redirect timed out")
 
-    return await AwemeIdFetcher.get_aweme_id(url)
+    if _is_douyin_short_host_url(candidate):
+        raise APITimeoutError("Douyin short links require HTTPS and a valid short path")
+
+    return await AwemeIdFetcher.get_aweme_id(candidate)
 
 
 def _short_link_cache_key(path: str) -> str:
@@ -576,6 +603,8 @@ def _read_cached_aweme_id(cache_key: str) -> str:
     item = _load_short_link_cache().get(cache_key, {})
     if not isinstance(item, dict):
         return ""
+    if item.get("schema") != SHORT_LINK_CACHE_SCHEMA:
+        return ""
     aweme_id = item.get("aweme_id", "")
     return aweme_id if isinstance(aweme_id, str) and aweme_id.isdigit() else ""
 
@@ -584,6 +613,7 @@ def _write_cached_aweme_id(cache_key: str, aweme_id: str) -> None:
     try:
         cache = _load_short_link_cache()
         cache[cache_key] = {
+            "schema": SHORT_LINK_CACHE_SCHEMA,
             "aweme_id": aweme_id,
             "cached_at": datetime.now().isoformat(timespec="seconds"),
         }
