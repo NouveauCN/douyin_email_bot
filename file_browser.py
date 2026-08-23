@@ -92,14 +92,18 @@ def _configured_origins() -> tuple[str, ...]:
 
 def _normalize_origin(value: str) -> str | None:
     """Return an origin, rejecting paths and other non-origin components."""
+    if not value or any(char.isspace() for char in value):
+        return None
     try:
         parsed = urlsplit(value)
-        parsed.port  # Validate a possible explicit port.
+        hostname = parsed.hostname
+        port = parsed.port  # Validate a possible explicit port.
     except ValueError:
         return None
     if (
         parsed.scheme not in {"http", "https"}
         or not parsed.netloc
+        or not hostname
         or parsed.path not in {"", "/"}
         or parsed.query
         or parsed.fragment
@@ -107,7 +111,13 @@ def _normalize_origin(value: str) -> str | None:
         or parsed.password is not None
     ):
         return None
-    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+    scheme = parsed.scheme.lower()
+    hostname = hostname.lower()
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    default_port = 80 if scheme == "http" else 443
+    port_suffix = f":{port}" if port is not None and port != default_port else ""
+    return f"{scheme}://{hostname}{port_suffix}"
 
 
 _ALLOWED_ORIGINS = _configured_origins()

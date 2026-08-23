@@ -85,6 +85,26 @@ uv run python main.py
 
 机器人收到后会下载视频并回复邮件。
 
+## 局域网 + Tailscale Web 访问
+
+`file_browser` 和 `web_login` 不显示应用登录页，访问边界由 Docker
+主机端口和 Tailscale 控制：Compose 只把 8081/8080 发布到
+`127.0.0.1`，不会直接暴露在物理 LAN 上。请在主机上用 Tailscale
+Serve（不要用 Funnel）把需要的本地端口提供给 tailnet，并用 ACL/Grants
+只允许自己的设备或用户访问。
+
+服务仍会拒绝缺少或不匹配 Origin/Referer 的写请求，并限制上传大小、文件
+数量、媒体并发、二维码生成和状态轮询；这些保护不需要额外登录操作。
+如 Tailscale Serve 使用的地址与请求 Host 不同，可在 `.env` 中配置精确的
+允许来源：
+
+```env
+FILE_BROWSER_ALLOWED_ORIGINS=https://your-machine.your-tailnet.ts.net
+WEB_LOGIN_ALLOWED_ORIGINS=https://your-machine.your-tailnet.ts.net
+```
+
+不要把这两个服务重新绑定到 `0.0.0.0`、物理 LAN 地址或公网 Funnel。
+
 ## B站下载
 
 B站链接由 [yutto](https://github.com/yutto-dev/yutto) CLI 下载，支持 BV/av 投稿视频、番剧 ep/ss 以及 b23.tv 短链接。默认保存到 `downloads/bilibili/`。
@@ -174,6 +194,9 @@ uv run python process_media.py "/path/to/video.mp4" --apply --force-review
 | `bot.cooldown_seconds` | int | `5` | 同一发件人冷却时间 |
 | `bot.commands.cookie_update` | str | `"更新cookie"` | 手动更新 cookie 的邮件主题关键词 |
 | `bot.commands.cookie_auto` | str | `"自动获取cookie"` | 浏览器自动提取 cookie 的邮件主题关键词 |
+| `FILE_BROWSER_ALLOWED_ORIGINS` | str | 当前请求 origin | 文件浏览器精确允许来源（逗号分隔） |
+| `WEB_LOGIN_ALLOWED_ORIGINS` | str | 当前请求 origin | QR 服务精确允许来源（逗号分隔） |
+| `DOUYIN_SHORT_LINK_CA_BUNDLE` | str | 系统 CA | 私有 CA bundle 路径；不配置时使用正常证书校验 |
 
 ## 常见问题
 

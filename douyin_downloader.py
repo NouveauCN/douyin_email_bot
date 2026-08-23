@@ -16,6 +16,7 @@ import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 from colorama import Fore, Style
@@ -42,13 +43,23 @@ _FIREFOX_USER_AGENT = (
     "Gecko/20100101 Firefox/130.0"
 )
 
-DOUYIN_SHORT_HTTPS_RE = re.compile(r"^https://v\.douyin\.com/([A-Za-z0-9_-]+)/?$")
 DOUYIN_SHORT_RE = re.compile(r"^https?://v\.douyin\.com/([A-Za-z0-9_-]+)/?$")
 DOUYIN_AWEME_ID_RE = re.compile(r"/(?:share/)?(?:video|note)/(\d+)")
+DOUYIN_AWEME_PATH_RE = re.compile(r"^/(?:share/)?(?:video|note)/(\d+)/?$")
+_DOUYIN_REDIRECT_HOSTS = frozenset({
+    "douyin.com",
+    "www.douyin.com",
+    "m.douyin.com",
+})
 SHORT_LINK_CACHE_PATH = Path(
     os.getenv("DOUYIN_SHORT_LINK_CACHE")
     or Path(__file__).parent / "logs" / "short_link_cache.json"
 )
+
+
+def _short_link_verify() -> str | bool:
+    """Return strict system verification or an explicitly configured CA path."""
+    return os.getenv("DOUYIN_SHORT_LINK_CA_BUNDLE") or True
 
 
 class DouyinDownloader:
@@ -433,7 +444,7 @@ class DouyinDownloader:
 
 
 def _normalize_share_url(url: str) -> str:
-    """Keep share URLs as-is — resolution now tries HTTPS first, HTTP fallback."""
+    """Keep share URLs as-is; short-link resolution enforces HTTPS."""
     return url.strip()
 
 
@@ -464,46 +475,57 @@ def _find_existing_slideshow_file(directory: Path, suffix: str) -> Path | None:
 
 
 async def _resolve_short_link(path: str, headers: dict) -> str:
-    """Resolve a v.douyin.com short link, trying HTTPS first then HTTP.
+    """Resolve a Douyin short link over verified HTTPS only.
 
-    Some network environments block direct HTTP (port 80) while HTTPS works,
-    and some have the opposite problem (TLS stalls).  Try both.
+    The redirect is deliberately not followed automatically: only a known
+    Douyin host and the exact video/note path shape are accepted and cached.
+    A private CA may be supplied explicitly with ``DOUYIN_SHORT_LINK_CA_BUNDLE``.
     """
+    short_url = f"https://v.douyin.com/{path}/"
     for attempt in range(1, 4):
-        for scheme in ("https", "http"):
-            short_url = f"{scheme}://v.douyin.com/{path}/"
-            try:
-                async with httpx.AsyncClient(
-                    timeout=10,
-                    follow_redirects=False,
-                    headers=headers,
-                    verify=False,
-                    trust_env=False,
-                ) as client:
-                    response = await client.get(short_url)
+        try:
+            async with httpx.AsyncClient(
+                timeout=10,
+                follow_redirects=False,
+                headers=headers,
+                verify=_short_link_verify(),
+                trust_env=False,
+            ) as client:
+                response = await client.get(short_url)
+            if response.is_redirect:
                 location = response.headers.get("location", "")
                 if location:
                     logger.debug(
-                        "Short link resolved via %s on attempt %d: %s",
-                        scheme.upper(),
+                        "Short link resolved via HTTPS on attempt %d: %s",
                         attempt,
                         location[:120],
                     )
                     return location
-            except httpx.TimeoutException:
-                logger.debug(
-                    "Short link %s timed out on attempt %d, trying fallback...",
-                    scheme.upper(),
-                    attempt,
-                )
-            except Exception:
-                logger.debug(
-                    "Short link %s failed on attempt %d, trying fallback...",
-                    scheme.upper(),
-                    attempt,
-                )
+            logger.debug(
+                "Short link returned no acceptable redirect on attempt %d: HTTP %s",
+                attempt,
+                response.status_code,
+            )
+        except httpx.TimeoutException:
+            logger.debug("Short link HTTPS timed out on attempt %d", attempt)
+        except httpx.HTTPError as exc:
+            logger.debug("Short link HTTPS failed on attempt %d: %s", attempt, exc)
+        except Exception:
+            logger.debug("Short link HTTPS failed on attempt %d", attempt, exc_info=True)
         await asyncio.sleep(1)
     return ""
+
+
+def _validated_aweme_id(location: str) -> str:
+    """Return an aweme ID only for a verified HTTPS Douyin redirect target."""
+    try:
+        parsed = urlparse(location)
+    except ValueError:
+        return ""
+    if parsed.scheme != "https" or parsed.hostname not in _DOUYIN_REDIRECT_HOSTS:
+        return ""
+    match = DOUYIN_AWEME_PATH_RE.fullmatch(parsed.path)
+    return match.group(1) if match else ""
 
 
 async def _resolve_aweme_id(url: str) -> str:
@@ -522,9 +544,8 @@ async def _resolve_aweme_id(url: str) -> str:
 
         headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.douyin.com/"}
         location = await _resolve_short_link(short_match.group(1), headers)
-        location_match = DOUYIN_AWEME_ID_RE.search(location)
-        if location_match:
-            aweme_id = location_match.group(1)
+        aweme_id = _validated_aweme_id(location)
+        if aweme_id:
             logger.debug("Resolved short link from Location header: %s", location)
             _write_cached_aweme_id(cache_key, aweme_id)
             return aweme_id

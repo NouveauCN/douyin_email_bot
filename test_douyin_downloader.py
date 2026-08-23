@@ -49,6 +49,59 @@ class DouyinDownloadTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(target.stat().st_mode & 0o777, 0o640)
             self.assertEqual(list(Path(temp_dir).glob(".video.mp4.*.tmp")), [])
 
+
+    async def test_valid_https_redirect_is_cached(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache = Path(temp_dir) / "short-links.json"
+            location = "https://www.douyin.com/video/1234567890/?region=cn"
+            with patch.object(douyin_downloader, "SHORT_LINK_CACHE_PATH", cache), patch(
+                "douyin_downloader._resolve_short_link",
+                new=AsyncMock(return_value=location),
+            ):
+                result = await douyin_downloader._resolve_aweme_id(
+                    "https://v.douyin.com/AbC123/"
+                )
+
+            self.assertEqual(result, "1234567890")
+            self.assertIn('"aweme_id": "1234567890"', cache.read_text())
+
+    async def test_untrusted_redirect_is_rejected_without_cache_write(self):
+        locations = (
+            "http://www.douyin.com/video/1234567890",
+            "https://evil.example/video/1234567890",
+            "https://www.douyin.com/video/not-a-number",
+        )
+        for location in locations:
+            with self.subTest(location=location), tempfile.TemporaryDirectory() as temp_dir:
+                cache = Path(temp_dir) / "short-links.json"
+                with patch.object(douyin_downloader, "SHORT_LINK_CACHE_PATH", cache), patch(
+                    "douyin_downloader._resolve_short_link",
+                    new=AsyncMock(return_value=location),
+                ):
+                    with self.assertRaises(douyin_downloader.APITimeoutError):
+                        await douyin_downloader._resolve_aweme_id(
+                            "https://v.douyin.com/AbC123/"
+                        )
+
+                self.assertFalse(cache.exists())
+
+    async def test_short_link_transport_uses_https_only(self):
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            return httpx.Response(
+                302,
+                headers={"Location": "https://www.douyin.com/video/1234567890"},
+                request=request,
+            )
+
+        with self._mock_client(handler):
+            location = await douyin_downloader._resolve_short_link("AbC123", {})
+
+        self.assertEqual(location, "https://www.douyin.com/video/1234567890")
+        self.assertEqual([request.url.scheme for request in requests], ["https"])
+
     async def test_new_target_uses_readable_media_permissions(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             target = Path(temp_dir) / "video.mp4"

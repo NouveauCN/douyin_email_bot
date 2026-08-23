@@ -34,7 +34,9 @@ services:
     container_name: douyin_web_login
     restart: "no"
     ports:
-      - "8080:8080"
+      # Keep the host entry point local; expose it to the tailnet with
+      # `tailscale serve`, not on the physical LAN interface.
+      - "127.0.0.1:8080:8080"
     volumes:
       - firefox_profile:/app/firefox_profile
       - ./.env:/app/.env
@@ -42,7 +44,10 @@ services:
     environment:
       - COOKIE_PROFILE_DIR=/app/firefox_profile
       - TZ=Asia/Shanghai
-    command: ["python3", "web_login.py"]
+      - WEB_LOGIN_ALLOWED_ORIGINS=${WEB_LOGIN_ALLOWED_ORIGINS:-}
+    # The container needs an all-interface bind; the host port above remains
+    # loopback-only and is the boundary enforced by Tailscale Serve/ACLs.
+    command: ["python3", "web_login.py", "--host", "0.0.0.0"]
     profiles:
       - login
 
@@ -51,7 +56,8 @@ services:
     container_name: douyin_file_browser
     restart: unless-stopped
     ports:
-      - "192.168.1.94:8081:8081"
+      # Do not let a LAN address bypass the Tailscale access boundary.
+      - "127.0.0.1:8081:8081"
     volumes:
       - /srv/nas_data/douyin_downloads:/app/downloads
       - /srv/nas_data/comics:/app/comics:ro
@@ -60,6 +66,10 @@ services:
       - DOUYIN_DOWNLOAD_PATH=/app/downloads
       - COMICS_PICS_PATH=/app/comics/pics
       - TZ=Asia/Shanghai
+      - FILE_BROWSER_ALLOWED_ORIGINS=${FILE_BROWSER_ALLOWED_ORIGINS:-}
+      - FILE_BROWSER_MAX_UPLOAD_BYTES=${FILE_BROWSER_MAX_UPLOAD_BYTES:-2147483648}
+      - FILE_BROWSER_MAX_UPLOAD_FILES=${FILE_BROWSER_MAX_UPLOAD_FILES:-10}
+      - FILE_BROWSER_MEDIA_MAX_CONCURRENCY=${FILE_BROWSER_MEDIA_MAX_CONCURRENCY:-2}
     command: ["python3", "file_browser.py"]
 
 volumes:
