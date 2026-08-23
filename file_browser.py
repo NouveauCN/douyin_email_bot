@@ -59,16 +59,15 @@ _THUMB_CACHE = Path("/app/.thumb_cache")
 app = Flask(__name__)
 log = logging.getLogger("file_browser")
 
-# Regex: {YYYYMMDD}_{aweme_id}_{NN}.{ext} → capture prefix
-_SLIDE_RE = re.compile(r"^(\d{8}_\d+)_\d+\.\w+$")
-
-
 # ── Helpers ───────────────────────────────────────────────────────────
 
 def _safe_subpath(subpath: str) -> Path:
     """Resolve subpath relative to download dir; reject traversal attempts."""
+    root = _DOWNLOAD_DIR.resolve()
     p = (_DOWNLOAD_DIR / subpath).resolve()
-    if _DOWNLOAD_DIR not in p.parents and p != _DOWNLOAD_DIR.resolve():
+    try:
+        p.relative_to(root)
+    except ValueError:
         abort(403, "Path traversal denied")
     return p
 
@@ -123,7 +122,7 @@ def _scan_downloads() -> dict:
             continue
         if entry.name == "slides":
             for img in sorted(entry.iterdir(), reverse=True):
-                if img.is_file():
+                if img.is_file() and img.suffix.lower() in _IMAGE_EXTS:
                     relpath = str(img.relative_to(_DOWNLOAD_DIR)).replace("\\", "/")
                     date_str = _format_date(img.name[:8]) if len(img.name) >= 8 else ""
                     slides.append({
@@ -171,6 +170,37 @@ _DEDUP_INDEX: dict[str, tuple[int, bytes]] = {}  # relpath → (dhash, 32×32 th
 _PENDING_DUPS: list[dict] = []  # pending duplicate confirmations
 _DHASH_THRESHOLD = 5
 _MSE_THRESHOLD = 50.0
+
+
+def _collect_images(directory: Path) -> list[dict]:
+    """Collect supported images in one directory, excluding unsafe symlinks."""
+    root = _DOWNLOAD_DIR.resolve()
+    try:
+        directory = directory.resolve()
+        directory.relative_to(root)
+    except (OSError, ValueError):
+        return []
+
+    if not directory.is_dir():
+        return []
+
+    images = []
+    for image in sorted(directory.iterdir(), key=lambda item: item.name):
+        if image.suffix.lower() not in _IMAGE_EXTS or not image.is_file():
+            continue
+        try:
+            resolved = image.resolve()
+            resolved.relative_to(root)
+            size = resolved.stat().st_size
+            relpath = resolved.relative_to(root).as_posix()
+        except (OSError, ValueError):
+            continue
+        images.append({
+            "name": image.name,
+            "relpath": relpath,
+            "size_fmt": _format_size(size),
+        })
+    return images
 
 
 def _media_to_image(filepath: Path) -> Image.Image:
@@ -306,7 +336,7 @@ def browse(subpath):
                 "size_fmt": _format_size(f.stat().st_size),
                 "relpath": str(f.relative_to(_DOWNLOAD_DIR)).replace("\\", "/"),
                 "is_video": f.suffix.lower() in _VIDEO_EXTS,
-                "is_image": f.suffix.lower() in (".webp", ".jpg", ".jpeg", ".png", ".gif"),
+                "is_image": f.suffix.lower() in _IMAGE_EXTS,
                 "date": _format_date(f.name[:8]) if len(f.name) >= 8 else "",
             })
 
@@ -349,34 +379,53 @@ def view_video(filepath):
     )
 
 
+@app.route("/image/<path:filepath>")
+def view_image(filepath):
+    """Render an embedded image viewer for the containing directory."""
+    safe = _safe_subpath(filepath)
+    if not safe.is_file() or safe.suffix.lower() not in _IMAGE_EXTS:
+        abort(404, "Image not found")
+
+    images = _collect_images(safe.parent)
+    current_relpath = safe.relative_to(_DOWNLOAD_DIR.resolve()).as_posix()
+    current_index = next(
+        (index for index, image in enumerate(images)
+         if image["relpath"] == current_relpath),
+        None,
+    )
+    if current_index is None:
+        abort(404, "Image not found")
+
+    for image in images:
+        image["raw_url"] = url_for("raw_file", filepath=image["relpath"])
+
+    parent_path = safe.parent.relative_to(_DOWNLOAD_DIR.resolve())
+    parent_relpath = "" if parent_path == Path(".") else parent_path.as_posix()
+    back_url = (
+        url_for("browse", subpath=parent_relpath)
+        if parent_relpath else url_for("index")
+    )
+    return render_template_string(
+        IMAGE_VIEWER_HTML,
+        filename=safe.name,
+        directory_name=safe.parent.name or "下载目录",
+        back_url=back_url,
+        images=images,
+        current_index=current_index,
+    )
+
+
 @app.route("/slideshow/<prefix>")
 def view_slideshow(prefix):
-    """Image gallery for a slideshow group."""
-    slides_dir = _DOWNLOAD_DIR / "slides"
-    if not slides_dir.is_dir():
-        abort(404, "Slides directory not found")
-
-    # Find all images with this prefix
-    images = []
-    for img in sorted(slides_dir.iterdir()):
-        if img.is_file() and img.name.startswith(prefix + "_"):
-            images.append({
-                "name": img.name,
-                "relpath": f"slides/{img.name}",
-                "size_fmt": _format_size(img.stat().st_size),
-                "index": len(images),
-            })
-
-    if not images:
-        abort(404, "Slideshow not found")
-
-    return render_template_string(
-        SLIDESHOW_HTML,
-        prefix=prefix,
-        date=_format_date(prefix),
-        images=images,
-        total=len(images),
+    """Compatibility entry point for old slideshow URLs."""
+    slides = _collect_images(_DOWNLOAD_DIR / "slides")
+    first = next(
+        (image for image in slides if image["name"].startswith(prefix + "_")),
+        None,
     )
+    if first is None:
+        abort(404, "Slideshow not found")
+    return redirect(url_for("view_image", filepath=first["relpath"]))
 
 
 @app.route("/playlist")
@@ -1135,7 +1184,7 @@ INDEX_HTML = (
   <div class="collapsible-body card-grid">
   {% for s in slides %}
     <div class="card">
-      <a class="card-inner" href="{{ url_for('raw_file', filepath=s.relpath) }}" target="_blank">
+      <a class="card-inner" href="{{ url_for('view_image', filepath=s.relpath) }}">
         <img class="card-thumb" src="{{ url_for('raw_file', filepath=s.relpath) }}" loading="lazy" alt="" width="180" height="320">
         <div class="vname">{{ s.name }}</div>
         <div class="meta" style="margin-top:4px">
@@ -1430,6 +1479,9 @@ BROWSE_HTML = (
       {% if f.is_video %}
       <a class="play-btn" href="{{ url_for('view_video', filepath=f.relpath) }}">▶ 播放</a>
       {% endif %}
+      {% if f.is_image %}
+      <a class="play-btn" href="{{ url_for('view_image', filepath=f.relpath) }}">🖼 查看</a>
+      {% endif %}
       <a class="dl-btn" href="{{ url_for('raw_file', filepath=f.relpath) }}" download>⬇ 下载</a>
     </div>
   </div>
@@ -1573,12 +1625,12 @@ function checkCrop() {
 </html>"""  # noqa: E501
 )
 
-SLIDESHOW_HTML = (
+IMAGE_VIEWER_HTML = (
     "<!DOCTYPE html>\n"
     '<html lang="zh-CN">\n<head>\n'
     '<meta charset="UTF-8">\n'
     '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
-    "<title>{{ prefix }} — 图集浏览</title>\n"
+    "<title>{{ filename }} — 图片浏览</title>\n"
     "<style>" + _COMMON_CSS + """
   .gallery-wrapper {
     background: #000; border-radius: 12px; overflow: hidden;
@@ -1587,7 +1639,7 @@ SLIDESHOW_HTML = (
     min-height: 300px; display: flex; align-items: center; justify-content: center;
   }
   .gallery-wrapper img {
-    max-width: 100%; max-height: 70vh; object-fit: contain;
+    max-width: 100%; max-height: 70vh; object-fit: contain; display: block;
     transition: opacity 0.2s;
   }
   .nav-btn {
@@ -1608,6 +1660,7 @@ SLIDESHOW_HTML = (
   }
   .gallery-info .counter { font-size: 18px; font-weight: 600; color: #fe2c55; }
   .gallery-info .meta { font-size: 13px; color: #999; }
+  .viewer-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; width: 100%; }
   .thumb-strip {
     display: flex; gap: 6px; overflow-x: auto; padding: 8px 0;
     scroll-behavior: smooth;
@@ -1624,62 +1677,73 @@ SLIDESHOW_HTML = (
 </head>
 <body>
 <div class="container">
-  <a class="back-link" href="{{ url_for('index') }}">← 返回首页</a>
-  <h1>🖼️ 图集</h1>
-  <p class="subtitle">{{ date }} · {{ total }} 张图片</p>
+  <a class="back-link" href="{{ back_url }}">← 返回 {{ directory_name }}</a>
+  <h1>🖼️ 图片浏览</h1>
+  <p class="subtitle">{{ directory_name }} · {{ images | length }} 张图片</p>
 
   <div class="gallery-wrapper">
-    <button class="nav-btn nav-prev" id="prevBtn" onclick="navigate(-1)">‹</button>
-    <img id="mainImg" src="{{ url_for('raw_file', filepath=images[0].relpath) }}" alt="">
-    <button class="nav-btn nav-next" id="nextBtn" onclick="navigate(1)">›</button>
+    <button class="nav-btn nav-prev" id="prevBtn" type="button" onclick="navigate(-1)" aria-label="上一张">‹</button>
+    <img id="mainImg" src="{{ images[current_index].raw_url }}" alt="{{ images[current_index].name }}">
+    <button class="nav-btn nav-next" id="nextBtn" type="button" onclick="navigate(1)" aria-label="下一张">›</button>
   </div>
 
   <div class="gallery-info">
-    <span class="counter" id="counter">1 / {{ total }}</span>
-    <span class="meta" id="imgName">{{ images[0].name }}</span>
-    <span class="meta" id="imgSize">{{ images[0].size_fmt }}</span>
+    <span class="counter" id="counter">{{ current_index + 1 }} / {{ images | length }}</span>
+    <span class="meta" id="imgName">{{ images[current_index].name }}</span>
+    <span class="meta" id="imgSize">{{ images[current_index].size_fmt }}</span>
+    <div class="viewer-actions">
+      <a class="btn" id="downloadBtn" href="{{ images[current_index].raw_url }}" download>⬇ 下载图片</a>
+    </div>
   </div>
 
   <div class="thumb-strip" id="thumbStrip">
     {% for img in images %}
-    <img src="{{ url_for('raw_file', filepath=img.relpath) }}"
-         class="{{ 'active' if loop.first }}"
-         data-index="{{ img.index }}"
-         onclick="jumpTo({{ img.index }})"
+    <img src="{{ img.raw_url }}"
+         class="{{ 'active' if loop.index0 == current_index }}"
+         data-index="{{ loop.index0 }}"
+         onclick="jumpTo({{ loop.index0 }})"
+         loading="lazy"
+         alt=""
          title="{{ img.name }}">
     {% endfor %}
   </div>
-  <p class="key-hint">💡 使用 ← → 方向键或点击缩略图切换图片</p>
+  <p class="key-hint">💡 使用 ← → 方向键、左右滑动或点击缩略图切换图片</p>
 </div>
 
 <script>
-const IMAGES = [
-{% for img in images %}
-  {name: "{{ img.name }}", relpath: "{{ img.relpath }}", sizeFmt: "{{ img.size_fmt }}"}{{ "," if not loop.last else "" }}
-{% endfor %}
-];
-let _idx = 0;
+const IMAGES = {{ images | tojson }};
+let _idx = {{ current_index }};
 const mainImg = document.getElementById('mainImg');
 const counter = document.getElementById('counter');
 const imgName = document.getElementById('imgName');
 const imgSize = document.getElementById('imgSize');
+const downloadBtn = document.getElementById('downloadBtn');
 const prevBtn = document.getElementById('prevBtn');
 const nextBtn = document.getElementById('nextBtn');
 const thumbs = document.querySelectorAll('#thumbStrip img');
+const gallery = document.querySelector('.gallery-wrapper');
 
 function show(i) {
   _idx = Math.max(0, Math.min(i, IMAGES.length - 1));
   const img = IMAGES[_idx];
-  mainImg.src = "{{ url_for('raw_file', filepath='') }}" + img.relpath;
+  mainImg.src = img.raw_url;
+  mainImg.alt = img.name;
   counter.textContent = (_idx + 1) + " / " + IMAGES.length;
   imgName.textContent = img.name;
-  imgSize.textContent = img.sizeFmt;
+  imgSize.textContent = img.size_fmt;
+  downloadBtn.href = img.raw_url;
   prevBtn.disabled = (_idx === 0);
   nextBtn.disabled = (_idx === IMAGES.length - 1);
   thumbs.forEach(t => t.classList.toggle('active', parseInt(t.dataset.index) === _idx));
   // Scroll thumbnail into view
   const activeThumb = document.querySelector('#thumbStrip img.active');
   if (activeThumb) activeThumb.scrollIntoView({behavior: 'smooth', block: 'nearest', inline: 'center'});
+  [_idx - 1, _idx + 1].forEach(function(adjacent) {
+    if (IMAGES[adjacent]) {
+      const preload = new Image();
+      preload.src = IMAGES[adjacent].raw_url;
+    }
+  });
 }
 
 function navigate(delta) { show(_idx + delta); }
@@ -1689,6 +1753,19 @@ document.addEventListener('keydown', function(e) {
   if (e.key === 'ArrowLeft') { e.preventDefault(); navigate(-1); }
   if (e.key === 'ArrowRight') { e.preventDefault(); navigate(1); }
 });
+
+let touchStartX = null;
+gallery.addEventListener('touchstart', function(e) {
+  touchStartX = e.changedTouches[0].clientX;
+}, {passive: true});
+gallery.addEventListener('touchend', function(e) {
+  if (touchStartX === null) return;
+  const distance = e.changedTouches[0].clientX - touchStartX;
+  if (Math.abs(distance) >= 50) navigate(distance > 0 ? -1 : 1);
+  touchStartX = null;
+}, {passive: true});
+
+show(_idx);
 </script>
 </body>
 </html>"""  # noqa: E501
