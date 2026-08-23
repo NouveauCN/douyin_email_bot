@@ -49,6 +49,10 @@ IMAP -> EmailBot -> UrlExtractor -> platform downloader -> SMTP reply
 - `file_browser.py` is unauthenticated and writable: upload, delete, and
   duplicate-resolution endpoints modify the download tree. Keep it trusted-LAN
   only unless an explicit security change is requested.
+- The file browser reads `/app/comics/pics` as a separate read-only comics
+  gallery source. Its `/comics/raw/...` and `/comics/image/...` routes must
+  validate resolved paths within that source and must never pass comics paths
+  to download upload, delete, crop, or dedup operations.
 
 ## F2 Bootstrap Invariant
 
@@ -230,6 +234,8 @@ sudo docker compose down
 - The bot owns the logs volume; bot and `web_login` share the Firefox-profile
   volume.
 - Bot and `file_browser` bind the host NAS root to `/app/downloads`.
+- `file_browser` also mounts `/srv/nas_data/comics` read-only at `/app/comics`
+  and uses `COMICS_PICS_PATH=/app/comics/pics` for the in-site comics gallery.
 - All services bind `config.yaml`; only bot and `web_login` bind `.env`.
 - The bot intentionally clears proxy variables so Douyin traffic goes direct.
 - The deployment checkout is `~/douyin_email_bot` on `nouveau@nouveauserver`.

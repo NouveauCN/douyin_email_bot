@@ -47,17 +47,15 @@ class UploadFormTests(unittest.TestCase):
         self.assertIn("multiple", page)
         self.assertNotIn("uploadInput').click()", page)
 
-    def test_empty_home_exposes_comics_nas_entry(self):
+    def test_empty_home_exposes_comics_gallery(self):
         response = self.client.get("/")
         page = response.get_data(as_text=True)
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn(
-            'href="http://192.168.1.94:8082/files/comics/pics/"', page
-        )
         self.assertIn("二次元图片", page)
-        self.assertIn('target="_blank"', page)
-        self.assertIn('rel="noopener noreferrer"', page)
+        self.assertIn("暂无二次元图片", page)
+        self.assertIn('class="section-header collapsed"', page)
+        self.assertNotIn("external-section-link", page)
 
     def test_home_local_sections_start_collapsed(self):
         (self.download_dir / "author").mkdir()
@@ -82,10 +80,6 @@ class UploadFormTests(unittest.TestCase):
         self.assertIn("header.className = 'section-header collapsed';", page)
         self.assertIn(
             "body.className = 'collapsible-body dup-section collapsed';", page
-        )
-        self.assertIn(
-            '<a class="section-header external-section-link" href="http://192.168.1.94:8082/files/comics/pics/"',
-            page,
         )
 
     def test_enhanced_mobile_upload_returns_json(self):
