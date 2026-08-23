@@ -9,10 +9,14 @@ bootstrap_f2()
 from email_bot import (  # noqa: E402
     EmailBot,
     _format_success_reply,
+    _format_codex_result,
+    _format_failure_alert,
     _partial_failure_error,
+    _redact_sensitive_text,
     _success_subject_status,
     _try_extract_cookie,
 )
+from codex_failure_handler import CodexRunResult
 
 
 def test_optional_paths_resolve_from_config_directory_and_keep_empty(tmp_path, monkeypatch):
@@ -38,6 +42,38 @@ cookie_extractor:
     config = load_config(config_path)
     assert config.bilibili.auth_file == ""
     assert config.cookie_extractor.profile_dir == ""
+
+
+def test_codex_settings_support_yaml_and_environment_overrides(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+codex:
+  enabled: false
+  executable: yaml-codex
+  sandbox: read-only
+  timeout_seconds: 45
+  working_directory: codex-work
+  model: yaml-model
+  max_output_chars: 2000
+  notify_email: yaml@example.com
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_FAILURE_HANDLER_ENABLED", "true")
+    monkeypatch.setenv("CODEX_BIN", "env-codex")
+    monkeypatch.setenv("CODEX_TIMEOUT_SECONDS", "60")
+    monkeypatch.setenv("CODEX_NOTIFY_EMAIL", "env@example.com")
+
+    config = load_config(config_path)
+
+    assert config.codex.enabled is True
+    assert config.codex.executable == "env-codex"
+    assert config.codex.timeout_seconds == 60
+    assert config.codex.working_directory == str((tmp_path / "codex-work").resolve())
+    assert config.codex.model == "yaml-model"
+    assert config.codex.max_output_chars == 2000
+    assert config.codex.notify_email == "env@example.com"
 
 
 def test_transient_retry_paths_honor_env_and_resolve_relative_to_config(tmp_path, monkeypatch):
@@ -188,3 +224,148 @@ def test_partial_transient_retry_remains_persisted(monkeypatch):
     assert queued["attempts"] == 2
     assert queued["next_attempt_at"] == 160.0
     assert "network timeout" in queued["last_error"]
+
+
+def test_failure_alert_contains_actionable_context(tmp_path):
+    body = _format_failure_alert(
+        url="https://v.douyin.com/example",
+        platform="douyin",
+        subject="下载：示例",
+        error_msg="network timeout",
+        attempts=2,
+        retry_status="已加入自动重试队列",
+        codex_status="已唤起，后台诊断中",
+        pending_retry_file=tmp_path / "pending.json",
+        failed_links_file=tmp_path / "failed.txt",
+    )
+
+    assert "https://v.douyin.com/example" in body
+    assert "network timeout" in body
+    assert "已加入自动重试队列" in body
+    assert "Codex处理状态：已唤起" in body
+    assert str(tmp_path / "failed.txt") in body
+
+
+def test_codex_context_and_output_redact_secrets():
+    config = SimpleNamespace(
+        douyin=SimpleNamespace(cookie="cookie-secret"),
+        bilibili=SimpleNamespace(auth="auth-secret"),
+    )
+    cfg = SimpleNamespace(password="mail-secret")
+
+    assert "cookie-secret" not in _redact_sensitive_text("cookie-secret", config, cfg)
+    assert "auth-secret" not in _redact_sensitive_text("auth-secret", config, cfg)
+    assert "mail-secret" not in _redact_sensitive_text("mail-secret", config, cfg)
+    assert "DOUYIN_COOKIE=hidden" not in _redact_sensitive_text(
+        "DOUYIN_COOKIE=hidden", config, cfg
+    )
+
+    result = _format_codex_result(
+        {"url": "https://example.invalid", "platform": "douyin", "error": "failed"},
+        CodexRunResult(True, True, 0, "cookie-secret\n诊断完成", "", 0.2),
+        config,
+        cfg,
+    )
+    assert "cookie-secret" not in result
+    assert "诊断完成" in result
+
+
+def test_codex_failure_is_started_once_per_link(monkeypatch, tmp_path):
+    bot = object.__new__(EmailBot)
+    bot.config = SimpleNamespace(
+        codex=SimpleNamespace(
+            enabled=True,
+            notify_email="owner@example.com",
+            working_directory="",
+        ),
+        douyin=SimpleNamespace(cookie=""),
+        bilibili=SimpleNamespace(auth=""),
+    )
+    bot._project_dir = tmp_path
+    bot._pending_retry_file = tmp_path / "pending.json"
+    bot._failed_links_file = tmp_path / "failed.txt"
+    bot._codex_inflight = set()
+    import threading
+
+    bot._codex_lock = threading.Lock()
+    starts = []
+
+    class FakeThread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            starts.append(self.kwargs)
+
+    monkeypatch.setattr("email_bot.threading.Thread", FakeThread)
+    cfg = SimpleNamespace(email="bot@example.com", password="secret")
+
+    first = bot._trigger_codex_failure(
+        cfg=cfg,
+        sender="owner@example.com",
+        subject="下载",
+        url="https://example.invalid/video",
+        platform="douyin",
+        error_msg="timeout",
+        attempts=1,
+        retry_status="queued",
+    )
+    second = bot._trigger_codex_failure(
+        cfg=cfg,
+        sender="owner@example.com",
+        subject="下载",
+        url="https://example.invalid/video",
+        platform="douyin",
+        error_msg="timeout again",
+        attempts=2,
+        retry_status="queued",
+    )
+
+    assert first == "已唤起，后台诊断中"
+    assert "已有 Codex" in second
+    assert len(starts) == 1
+
+
+def test_failure_notifications_include_owner_without_duplicate(monkeypatch):
+    bot = object.__new__(EmailBot)
+    bot.config = SimpleNamespace(codex=SimpleNamespace(notify_email="owner@example.com"))
+    sent = []
+    bot._send_reply = lambda cfg, recipient, body, subject_status: sent.append(recipient)
+    cfg = SimpleNamespace(email="bot@example.com")
+
+    bot._send_failure_notifications(
+        cfg,
+        "requester@example.com",
+        "failure details",
+        "下载失败",
+    )
+    assert sent == ["requester@example.com", "owner@example.com"]
+
+    sent.clear()
+    bot._send_failure_notifications(cfg, "owner@example.com", "failure details", "下载失败")
+    assert sent == ["owner@example.com"]
+
+
+def test_partial_failure_notification_is_sent_to_requester_and_owner(tmp_path):
+    bot = object.__new__(EmailBot)
+    bot.config = SimpleNamespace(codex=SimpleNamespace(notify_email="owner@example.com"))
+    bot._pending_retry_file = tmp_path / "pending.json"
+    bot._failed_links_file = tmp_path / "failed.txt"
+    sent = []
+    bot._send_reply = lambda cfg, recipient, body, subject_status: sent.append(
+        (recipient, body, subject_status)
+    )
+    cfg = SimpleNamespace(email="bot@example.com", password="")
+
+    bot._send_failure_notifications(
+        cfg,
+        "requester@example.com",
+        "部分成功\n\n视频下载失败详细通知\n链接：https://example.invalid",
+        "部分资源失败",
+    )
+
+    assert [recipient for recipient, _, _ in sent] == [
+        "requester@example.com",
+        "owner@example.com",
+    ]
+    assert all("视频下载失败详细通知" in body for _, body, _ in sent)

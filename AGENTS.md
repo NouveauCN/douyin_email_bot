@@ -104,6 +104,13 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
 - Allowlist-, keyword-, and cooldown-skipped mail is initially left unseen but
   already present in `_seen_ids`; the next poll normally marks it seen. A restart
   before then can evaluate it again.
+- Failed or partial downloads trigger at most one background Codex diagnosis per
+  sender/link at a time. Codex uses `codex exec` with the configured sandbox and
+  must not block polling, alter download outcomes, or receive cookies, auth
+  files, passwords, private browser profiles, or downloaded media. The default
+  `read-only` sandbox is intentional; enabling write access requires an explicit
+  configuration decision and review. Detailed failure mail goes to the requester
+  and the configured owner mailbox, followed by a separate Codex result mail.
 
 ### Douyin downloads
 
@@ -174,6 +181,10 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   their formatting consistent and prefer a shared atomic implementation when
   changing them.
 - Email-triggered extraction honors `cookie_extractor.headless` and `.validate`.
+- Codex failure diagnosis requires a trusted, authenticated `codex` executable in
+  the runtime environment; it is not installed by the Docker image. If it is
+  unavailable, the bot must continue normally and report that limitation by
+  email/log rather than treating the download as a new failure.
 
 ## Configuration And Paths
 

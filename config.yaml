@@ -68,6 +68,22 @@ bot:
     # "自动获取cookie" — auto-extract from browser on this machine
     cookie_auto: "自动获取cookie"
 
+# Invoke the local Codex CLI in the background when a download fails.
+# Install and authenticate Codex in the runtime environment before enabling it.
+# The default read-only sandbox lets Codex diagnose failures without changing
+# production files. Use workspace-write only as an explicit, reviewed choice.
+codex:
+  enabled: true
+  executable: "codex"
+  sandbox: "read-only"
+  timeout_seconds: 900
+  # Empty means the project directory containing this config file.
+  working_directory: ""
+  model: ""
+  max_output_chars: 12000
+  # Empty means the configured bot mailbox (EMAIL_ADDRESS).
+  notify_email: ""
+
 # Original media retained after automatic/manual edge cropping
 media_cleanup:
   # Delete originals that have remained unused for four weeks.
