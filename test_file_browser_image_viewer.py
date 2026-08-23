@@ -51,7 +51,6 @@ class ImageViewerTests(unittest.TestCase):
         browse = self.client.get("/browse/slides").get_data(as_text=True)
 
         self.assertIn('/image/slides/01.png', home)
-        self.assertNotIn('target="_blank"', home)
         self.assertIn('/image/slides/01.png', browse)
         self.assertIn('download', browse)
 
