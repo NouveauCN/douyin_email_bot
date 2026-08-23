@@ -26,16 +26,17 @@ Protect both Flask applications before expanding their network exposure.
 - Keep QR and status responses non-cacheable and never return cookie contents.
 
 Preferred access boundary: use Tailscale ACLs/Grants and Tailscale Serve (or an
-equivalent authenticated reverse proxy), keep the Docker host ports loopback
-only, and do not expose them through the physical LAN or Funnel. If a future
+equivalent authenticated reverse proxy), plus an explicitly configured trusted
+home-LAN address when local devices need direct access. Do not bind all
+interfaces or expose them through guest/IoT networks or Funnel. If a future
 deployment cannot enforce that boundary, use a session-based login backed by a
 separately managed secret; do not transmit a reusable Basic or bearer
 credential over plain HTTP.
 
 Acceptance criteria:
 
-- Requests outside the Tailscale boundary cannot connect; cross-origin and
-  missing-source mutating requests return `403`.
+- Requests outside the Tailscale or explicitly trusted home-LAN boundary cannot
+  connect; cross-origin and missing-source mutating requests return `403`.
 - Valid same-origin browser flows can still upload, delete, crop, and resolve
   duplicates without an application login prompt.
 - QR and status endpoints cannot be reached outside the boundary, reject
@@ -147,8 +148,9 @@ Acceptance criteria:
 ## Decisions Required Before Implementation
 
 1. Authentication boundary: for the current personal deployment, use
-   Tailscale ACLs/Grants plus loopback-only Docker ports and Tailscale Serve;
-   application-managed sessions are required if that boundary is weakened.
+   Tailscale ACLs/Grants plus Tailscale Serve and the explicitly configured
+   trusted home-LAN address; application-managed sessions are required if that
+   boundary is widened.
 2. Secret lifecycle: keep cookie hot-reload, or require a bot restart after
    updating the dedicated secrets directory.
 3. Short-link compatibility: reject broken TLS outright, or support an

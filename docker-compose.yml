@@ -35,8 +35,10 @@ services:
     restart: "no"
     ports:
       # Keep the host entry point local; expose it to the tailnet with
-      # `tailscale serve`, not on the physical LAN interface.
+      # `tailscale serve`. The explicit LAN binding below is for the trusted
+      # home network only; set LAN_BIND_ADDRESS to the server's LAN IP.
       - "127.0.0.1:8080:8080"
+      - "${LAN_BIND_ADDRESS:-192.168.1.94}:8080:8080"
     volumes:
       - firefox_profile:/app/firefox_profile
       - ./.env:/app/.env
@@ -45,8 +47,8 @@ services:
       - COOKIE_PROFILE_DIR=/app/firefox_profile
       - TZ=Asia/Shanghai
       - WEB_LOGIN_ALLOWED_ORIGINS=${WEB_LOGIN_ALLOWED_ORIGINS:-}
-    # The container needs an all-interface bind; the host port above remains
-    # loopback-only and is the boundary enforced by Tailscale Serve/ACLs.
+    # The container needs an all-interface bind; host port publication remains
+    # limited to loopback plus the explicit trusted LAN address above.
     command: ["python3", "web_login.py", "--host", "0.0.0.0"]
     profiles:
       - login
@@ -56,8 +58,10 @@ services:
     container_name: douyin_file_browser
     restart: unless-stopped
     ports:
-      # Do not let a LAN address bypass the Tailscale access boundary.
+      # Keep both the trusted home-LAN and Tailscale paths explicit; never use
+      # 0.0.0.0 or a guest/IoT network address here.
       - "127.0.0.1:8081:8081"
+      - "${LAN_BIND_ADDRESS:-192.168.1.94}:8081:8081"
     volumes:
       - /srv/nas_data/douyin_downloads:/app/downloads
       - /srv/nas_data/comics:/app/comics:ro

@@ -88,10 +88,11 @@ uv run python main.py
 ## 局域网 + Tailscale Web 访问
 
 `file_browser` 和 `web_login` 不显示应用登录页，访问边界由 Docker
-主机端口和 Tailscale 控制：Compose 只把 8081/8080 发布到
-`127.0.0.1`，不会直接暴露在物理 LAN 上。请在主机上用 Tailscale
-Serve（不要用 Funnel）把需要的本地端口提供给 tailnet，并用 ACL/Grants
-只允许自己的设备或用户访问。
+主机端口和 Tailscale 控制：Compose 同时提供本机回环、明确的可信家庭
+LAN 地址和 Tailscale Serve 路径。`LAN_BIND_ADDRESS` 默认是
+`192.168.1.94`，请按实际服务器地址修改，不要改成 `0.0.0.0`。
+Tailscale 侧请用 Serve（不要用 Funnel）并用 ACL/Grants 只允许自己的设备
+或用户访问。
 
 服务仍会拒绝缺少或不匹配 Origin/Referer 的写请求，并限制上传大小、文件
 数量、媒体并发、二维码生成和状态轮询；这些保护不需要额外登录操作。
@@ -103,7 +104,8 @@ FILE_BROWSER_ALLOWED_ORIGINS=https://your-machine.your-tailnet.ts.net
 WEB_LOGIN_ALLOWED_ORIGINS=https://your-machine.your-tailnet.ts.net
 ```
 
-不要把这两个服务重新绑定到 `0.0.0.0`、物理 LAN 地址或公网 Funnel。
+不要把这两个服务绑定到 `0.0.0.0`、访客/IoT 网段或公网 Funnel；可信家庭
+LAN 地址由 `LAN_BIND_ADDRESS` 显式指定。
 
 ## B站下载
 

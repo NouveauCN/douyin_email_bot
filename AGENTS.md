@@ -50,14 +50,15 @@ IMAP -> EmailBot -> UrlExtractor -> platform downloader -> SMTP reply
   download root itself.
 - `file_browser.py` intentionally has no application login for the personal
   deployment, but it is writable: upload, delete, crop, and duplicate-
-  resolution endpoints modify the download tree. Keep its Docker host port
-  loopback-only and expose it through a restricted Tailscale ACL/Serve path;
-  do not treat the physical LAN, guest Wi-Fi, IoT network, or Funnel as an
-  equivalent identity boundary.
+  resolution endpoints modify the download tree. Keep its Docker host ports
+  limited to loopback plus the explicitly configured trusted home-LAN address
+  and restricted Tailscale ACL/Serve path; do not bind all interfaces or treat
+  guest Wi-Fi, IoT networks, or Funnel as trusted.
 - `web_login.py` also has no application login by design. Its Docker host port
-  must remain loopback-only, its API must enforce same-origin/allowed-origin
-  checks and QR/status rate limits, and Tailscale policy must restrict access
-  to the intended user or devices.
+  must remain limited to loopback plus the explicitly configured trusted
+  home-LAN address, its API must enforce same-origin/allowed-origin checks and
+  QR/status rate limits, and Tailscale policy must restrict access to the
+  intended user or devices.
 - The file browser reads `/app/comics/pics` as a separate read-only comics
   gallery source. Its `/comics/raw/...` and `/comics/image/...` routes must
   validate resolved paths within that source and must never pass comics paths
