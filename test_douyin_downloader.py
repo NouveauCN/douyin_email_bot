@@ -64,6 +64,161 @@ class DouyinDownloadTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(result, "1234567890")
             self.assertIn('"aweme_id": "1234567890"', cache.read_text())
+            self.assertIn(
+                f'"schema": "{douyin_downloader.SHORT_LINK_CACHE_SCHEMA}"',
+                cache.read_text(),
+            )
+
+    async def test_legacy_cache_entry_is_ignored_and_re_resolved(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache = Path(temp_dir) / "short-links.json"
+            cache.write_text(
+                '{"https://v.douyin.com/AbC123/": '
+                '{"aweme_id": "9999999999"}}\n',
+                encoding="utf-8",
+            )
+            location = "https://www.douyin.com/video/1234567890"
+            with patch.object(douyin_downloader, "SHORT_LINK_CACHE_PATH", cache), patch(
+                "douyin_downloader._resolve_short_link",
+                new=AsyncMock(return_value=location),
+            ) as resolver:
+                result = await douyin_downloader._resolve_aweme_id(
+                    "https://v.douyin.com/AbC123/"
+                )
+
+            self.assertEqual(result, "1234567890")
+            resolver.assert_awaited_once()
+            rewritten = cache.read_text(encoding="utf-8")
+            self.assertIn(
+                f'"schema": "{douyin_downloader.SHORT_LINK_CACHE_SCHEMA}"',
+                rewritten,
+            )
+            self.assertIn('"aweme_id": "1234567890"', rewritten)
+            self.assertNotIn('"aweme_id": "9999999999"', rewritten)
+
+    async def test_http_short_link_input_is_rejected_without_fallback(self):
+        with patch.object(
+            douyin_downloader.AwemeIdFetcher,
+            "get_aweme_id",
+            new=AsyncMock(),
+        ) as fallback:
+            with self.assertRaises(douyin_downloader.APITimeoutError):
+                await douyin_downloader._resolve_aweme_id(
+                    "http://v.douyin.com/AbC123/"
+                )
+
+        fallback.assert_not_awaited()
+
+    async def test_redirect_accepts_only_approved_hosts_and_paths(self):
+        locations = (
+            "https://douyin.com/video/1234567890",
+            "https://www.douyin.com/note/1234567891/?region=cn",
+            "https://m.douyin.com/share/video/1234567892",
+            "https://www.douyin.com/share/note/1234567893/",
+        )
+        for location in locations:
+            with self.subTest(location=location):
+                def handler(request, location=location):
+                    return httpx.Response(
+                        302, headers={"Location": location}, request=request
+                    )
+
+                with self._mock_client(handler):
+                    result = await douyin_downloader._resolve_short_link(
+                        "AbC123", {}
+                    )
+
+                self.assertEqual(result, location)
+
+    async def test_invalid_redirect_is_not_returned_or_cached(self):
+        locations = (
+            "http://www.douyin.com/video/1234567890",
+            "https://evil.example/video/1234567890",
+            "https://user:pass@www.douyin.com/video/1234567890",
+            "https://www.douyin.com:8443/video/1234567890",
+            "https://www.douyin.com/video/not-a-number",
+            "https://www.douyin.com/video/1234567890#fragment",
+            "https://[malformed/video/1234567890",
+        )
+        for location in locations:
+            with self.subTest(location=location), tempfile.TemporaryDirectory() as temp_dir:
+                cache = Path(temp_dir) / "short-links.json"
+
+                def handler(request, location=location):
+                    return httpx.Response(
+                        302, headers={"Location": location}, request=request
+                    )
+
+                with patch.object(
+                    douyin_downloader, "SHORT_LINK_CACHE_PATH", cache
+                ), self._mock_client(handler), patch(
+                    "douyin_downloader.asyncio.sleep", new=AsyncMock()
+                ):
+                    with self.assertRaises(douyin_downloader.APITimeoutError):
+                        await douyin_downloader._resolve_aweme_id(
+                            "https://v.douyin.com/AbC123/"
+                        )
+
+                self.assertFalse(cache.exists())
+
+    async def test_short_link_tls_options_use_system_ca_or_explicit_bundle(self):
+        captured = []
+        real_client = httpx.AsyncClient
+
+        def handler(request):
+            return httpx.Response(
+                302,
+                headers={"Location": "https://www.douyin.com/video/1234567890"},
+                request=request,
+            )
+
+        transport = httpx.MockTransport(handler)
+
+        def factory(*args, **kwargs):
+            captured.append(kwargs.copy())
+            return real_client(*args, transport=transport, **kwargs)
+
+        with patch.object(
+            douyin_downloader.httpx, "AsyncClient", side_effect=factory
+        ), patch.dict(
+            douyin_downloader.os.environ, {"DOUYIN_SHORT_LINK_CA_BUNDLE": ""}
+        ):
+            await douyin_downloader._resolve_short_link("AbC123", {})
+
+        with patch.object(
+            douyin_downloader.httpx, "AsyncClient", side_effect=factory
+        ), patch.dict(
+            douyin_downloader.os.environ,
+            {"DOUYIN_SHORT_LINK_CA_BUNDLE": "/tmp/douyin-ca.pem"},
+        ):
+            await douyin_downloader._resolve_short_link("AbC123", {})
+
+        self.assertIs(captured[0]["verify"], True)
+        self.assertEqual(captured[1]["verify"], "/tmp/douyin-ca.pem")
+        for kwargs in captured:
+            self.assertFalse(kwargs["trust_env"])
+            self.assertFalse(kwargs["follow_redirects"])
+
+    async def test_certificate_failure_retries_without_cache_write(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache = Path(temp_dir) / "short-links.json"
+
+            def handler(request):
+                raise httpx.ConnectError(
+                    "certificate verify failed", request=request
+                )
+
+            with patch.object(
+                douyin_downloader, "SHORT_LINK_CACHE_PATH", cache
+            ), self._mock_client(handler), patch(
+                "douyin_downloader.asyncio.sleep", new=AsyncMock()
+            ):
+                with self.assertRaises(douyin_downloader.APITimeoutError):
+                    await douyin_downloader._resolve_aweme_id(
+                        "https://v.douyin.com/AbC123/"
+                    )
+
+            self.assertFalse(cache.exists())
 
     async def test_untrusted_redirect_is_rejected_without_cache_write(self):
         locations = (
