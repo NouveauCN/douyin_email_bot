@@ -47,7 +47,7 @@ app = Flask(__name__)
 log = logging.getLogger("web_login")
 _browser_lock = threading.Lock()
 _STATUS_RESPONSE_FIELDS = ("status", "auth_count", "message")
-_RATE_LIMIT_DEFAULTS = {"/api/qr": 5, "/api/status": 12}
+_RATE_LIMIT_DEFAULTS = {"/api/qr": 5, "/api/status": 120}
 _RATE_LIMIT_ENV_VARS = {
     "/api/qr": "WEB_LOGIN_QR_RATE_LIMIT",
     "/api/status": "WEB_LOGIN_STATUS_RATE_LIMIT",

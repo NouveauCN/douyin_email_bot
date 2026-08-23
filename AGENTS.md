@@ -48,9 +48,16 @@ IMAP -> EmailBot -> UrlExtractor -> platform downloader -> SMTP reply
   accepts a user path.
 - Destructive file-browser routes must reject any path that resolves to the
   download root itself.
-- `file_browser.py` is unauthenticated and writable: upload, delete, and
-  duplicate-resolution endpoints modify the download tree. Keep it trusted-LAN
-  only unless an explicit security change is requested.
+- `file_browser.py` intentionally has no application login for the personal
+  deployment, but it is writable: upload, delete, crop, and duplicate-
+  resolution endpoints modify the download tree. Keep its Docker host port
+  loopback-only and expose it through a restricted Tailscale ACL/Serve path;
+  do not treat the physical LAN, guest Wi-Fi, IoT network, or Funnel as an
+  equivalent identity boundary.
+- `web_login.py` also has no application login by design. Its Docker host port
+  must remain loopback-only, its API must enforce same-origin/allowed-origin
+  checks and QR/status rate limits, and Tailscale policy must restrict access
+  to the intended user or devices.
 - The file browser reads `/app/comics/pics` as a separate read-only comics
   gallery source. Its `/comics/raw/...` and `/comics/image/...` routes must
   validate resolved paths within that source and must never pass comics paths
@@ -85,6 +92,10 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   exhausted links go to the configured failure file.
 - Cache successful `v.douyin.com` resolutions so later attempts can use the
   aweme ID without repeating flaky redirects.
+- Resolve `v.douyin.com` short links over verified HTTPS only. Accept redirects
+  only from the approved Douyin hosts and exact video/note ID paths; never
+  cache HTTP, foreign-host, malformed, or certificate-invalid targets. A
+  private CA is allowed only through an explicit CA-bundle setting.
 - `_safe_logout()` closes the socket directly; do not restore blocking IMAP
   protocol logout after a broken connection.
 - Allowlist-, keyword-, and cooldown-skipped mail is initially left unseen but

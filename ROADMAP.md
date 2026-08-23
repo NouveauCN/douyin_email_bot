@@ -13,7 +13,10 @@ validated and rolled back independently.
 
 Protect both Flask applications before expanding their network exposure.
 
-- Require authentication for `file_browser` and `web_login`.
+- Require network-layer authentication for `file_browser` and `web_login`.
+  Application login is intentionally omitted for the personal LAN + Tailscale
+  deployment, but only when the services are reachable through the controlled
+  Tailscale boundary.
 - Require CSRF protection and validate `Origin`/`Referer` on every mutating
   file-browser request, including upload, delete, crop, and duplicate actions.
 - Keep read-only comics paths outside every mutating download operation.
@@ -22,17 +25,21 @@ Protect both Flask applications before expanding their network exposure.
 - Add rate limits to QR generation and login-status polling.
 - Keep QR and status responses non-cacheable and never return cookie contents.
 
-Preferred access boundary: use an authenticated reverse proxy or Tailscale
-identity when available. If the application must authenticate directly, use a
-session-based login backed by a separately managed secret; do not transmit a
-reusable Basic or bearer credential over plain HTTP.
+Preferred access boundary: use Tailscale ACLs/Grants and Tailscale Serve (or an
+equivalent authenticated reverse proxy), keep the Docker host ports loopback
+only, and do not expose them through the physical LAN or Funnel. If a future
+deployment cannot enforce that boundary, use a session-based login backed by a
+separately managed secret; do not transmit a reusable Basic or bearer
+credential over plain HTTP.
 
 Acceptance criteria:
 
-- Anonymous and cross-origin mutating requests return `401`/`403`.
-- Valid authenticated browser flows can still upload, delete, crop, and resolve
-  duplicates.
-- QR and status endpoints cannot be used anonymously and remain non-cacheable.
+- Requests outside the Tailscale boundary cannot connect; cross-origin and
+  missing-source mutating requests return `403`.
+- Valid same-origin browser flows can still upload, delete, crop, and resolve
+  duplicates without an application login prompt.
+- QR and status endpoints cannot be reached outside the boundary, reject
+  missing/untrusted sources, and remain non-cacheable.
 - Oversized uploads and excess concurrent processing fail predictably without
   exhausting memory, disk, or Flask workers.
 
@@ -139,8 +146,9 @@ Acceptance criteria:
 
 ## Decisions Required Before Implementation
 
-1. Authentication boundary: authenticated reverse proxy/Tailscale identity, or
-   application-managed sessions.
+1. Authentication boundary: for the current personal deployment, use
+   Tailscale ACLs/Grants plus loopback-only Docker ports and Tailscale Serve;
+   application-managed sessions are required if that boundary is weakened.
 2. Secret lifecycle: keep cookie hot-reload, or require a bot restart after
    updating the dedicated secrets directory.
 3. Short-link compatibility: reject broken TLS outright, or support an
