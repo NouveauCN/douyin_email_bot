@@ -1163,11 +1163,11 @@ INDEX_HTML = (
   {% endif %}
 
   {% if videos %}
-  <div class="section-header" onclick="toggleSection(this)" title="点击折叠/展开">
+  <div class="section-header collapsed" onclick="toggleSection(this)" title="点击折叠/展开">
     <span class="arrow">▼</span> 📹 视频
     <span class="section-count">{{ videos | length }} 个</span>
   </div>
-  <div class="collapsible-body card-grid">
+  <div class="collapsible-body card-grid collapsed">
   {% for v in videos %}
     <div class="card">
       <a class="card-inner" href="{{ url_for('view_video', filepath=v.relpath) }}">
@@ -1185,12 +1185,12 @@ INDEX_HTML = (
   {% endif %}
 
   {% if slides %}
-  <div class="section-header" onclick="toggleSection(this)" title="点击折叠/展开"
+  <div class="section-header collapsed" onclick="toggleSection(this)" title="点击折叠/展开"
        style="margin-top:{% if videos %}10{% else %}0{% endif %}px">
     <span class="arrow">▼</span> 🖼️ 图片
     <span class="section-count">{{ slides | length }} 张</span>
   </div>
-  <div class="collapsible-body card-grid">
+  <div class="collapsible-body card-grid collapsed">
   {% for s in slides %}
     <div class="card">
       <a class="card-inner" href="{{ url_for('view_image', filepath=s.relpath) }}">
@@ -1320,7 +1320,7 @@ function loadDups() {
       if (!dups.length) return;
 
       var header = document.createElement('div');
-      header.className = 'section-header';
+      header.className = 'section-header collapsed';
       header.title = '点击折叠/展开';
       header.onclick = function() { toggleSection(header); };
       header.innerHTML = '<span class="arrow">▼</span> ⚠️ 待确认重复' +
@@ -1328,7 +1328,7 @@ function loadDups() {
       container.appendChild(header);
 
       var body = document.createElement('div');
-      body.className = 'collapsible-body dup-section';
+      body.className = 'collapsible-body dup-section collapsed';
 
       dups.forEach(function(d) {
         var card = document.createElement('div');
