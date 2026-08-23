@@ -46,6 +46,24 @@ Acceptance criteria:
 
 ### Phase 2: Short-Link Transport Security (P0/P1)
 
+Status: **Completed** in PR #20 (`b426f7f`).
+
+Implementation delivered:
+
+- Short-link input and transport are HTTPS-only; the old HTTP fallback and
+  `verify=False` behavior were removed.
+- Redirects are accepted only for approved Douyin hosts with exact
+  `/video/<id>`, `/note/<id>`, and `/share/.../<id>` paths. Credentials,
+  fragments, malformed URLs, and non-standard ports are rejected.
+- System CA verification is used by default. A private CA is supported only
+  through the explicit `DOUYIN_SHORT_LINK_CA_BUNDLE` setting.
+- Only validated HTTPS targets are cached. Cache entries now carry the
+  `https-validated-v1` schema marker, so legacy entries are ignored and
+  re-resolved rather than trusted.
+- Added mocked coverage for valid redirects, HTTP/foreign/malformed targets,
+  TLS failures, CA configuration, cache isolation, and no-cache-on-failure
+  behavior. Network failures continue through the existing retry path.
+
 - Resolve Douyin short links over HTTPS with normal CA verification by default.
 - Remove automatic HTTP fallback and unconditional `verify=False`.
 - Validate redirect hosts and accepted aweme URL/ID shapes before caching.
