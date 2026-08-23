@@ -181,10 +181,13 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   their formatting consistent and prefer a shared atomic implementation when
   changing them.
 - Email-triggered extraction honors `cookie_extractor.headless` and `.validate`.
-- Codex failure diagnosis requires a trusted, authenticated `codex` executable in
-  the runtime environment; it is not installed by the Docker image. If it is
-  unavailable, the bot must continue normally and report that limitation by
-  email/log rather than treating the download as a new failure.
+- Codex failure diagnosis requires a trusted, authenticated `codex` executable
+  in the runtime environment. The Docker image installs the CLI and persists
+  its authentication under the compose-managed `codex_home` volume; complete
+  first-time authentication with `sudo docker compose run --rm bot codex login`
+  or provide the supported API-key environment. If it is unavailable, the bot
+  must continue normally and report that limitation by email/log rather than
+  treating the download as a new failure.
 
 ## Configuration And Paths
 
