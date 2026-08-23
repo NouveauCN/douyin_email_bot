@@ -44,6 +44,26 @@ Acceptance criteria:
 - Oversized uploads and excess concurrent processing fail predictably without
   exhausting memory, disk, or Flask workers.
 
+Implementation status (2026-08-23; PRs #16, #17, #18, and #19):
+
+- `web_login.py` now defaults to loopback, validates exact same-origin or
+  configured origins, limits QR generation to 5 requests/minute and status
+  polling to 120 requests/minute by default, and keeps `no-store` plus cookie
+  redaction.
+- `file_browser.py` now rejects missing/cross-origin mutating requests,
+  limits uploads to 2 GiB and 10 files by default, and bounds media-changing
+  work to two concurrent jobs. Existing FFmpeg and thumbnail subprocess
+  timeouts remain in force.
+- `docker-compose.yml` publishes 8080/8081 only to loopback plus the explicit
+  `LAN_BIND_ADDRESS` (default `192.168.1.94`); it never binds `0.0.0.0`.
+- The host's Tailscale Serve entries for 8080/8081 forward to the loopback
+  ports and remain tailnet-only. Tailscale ACL/Grants are managed outside this
+  repository because the local CLI cannot edit tailnet policy.
+- Application login was intentionally not added for the personal trusted-LAN
+  plus Tailscale deployment. If the LAN boundary widens beyond the trusted
+  home network, add an authenticated proxy or application session before
+  exposing these writable services.
+
 ### Phase 2: Short-Link Transport Security (P0/P1)
 
 Status: **Completed** in PR #20 (`b426f7f`).
@@ -165,14 +185,14 @@ Acceptance criteria:
 
 ## Decisions Required Before Implementation
 
-1. Authentication boundary: for the current personal deployment, use
+1. Decided for the current deployment: use
    Tailscale ACLs/Grants plus Tailscale Serve and the explicitly configured
    trusted home-LAN address; application-managed sessions are required if that
    boundary is widened.
 2. Secret lifecycle: keep cookie hot-reload, or require a bot restart after
    updating the dedicated secrets directory.
-3. Short-link compatibility: reject broken TLS outright, or support an
-   explicitly configured private CA.
+3. Decided: reject broken TLS by default; support only an explicitly configured
+   private CA through `DOUYIN_SHORT_LINK_CA_BUNDLE`.
 4. Docker dependency workflow: install with uv in the image, or commit a frozen
    `uv export` runtime requirements artifact.
 
