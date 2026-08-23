@@ -23,7 +23,7 @@ web_login.py            Flask QR login service
 file_browser.py         Flask browser, playlist, upload, dedup, and delete UI
 play.py                 Local shuffled MP4 player
 migrate_downloads.py    One-shot slideshow layout migration
-test_download.py        Live Douyin smoke download
+smoke_download.py       Live Douyin smoke download
 config.yaml             Non-secret runtime configuration
 Dockerfile              Python 3.12 image with FFmpeg, Playwright, and yutto
 docker-compose.yml      bot, web_login, and file_browser services
@@ -40,7 +40,7 @@ IMAP -> EmailBot -> UrlExtractor -> platform downloader -> SMTP reply
 - Never commit credentials, cookies, yutto auth files, Firefox profiles,
   downloaded media, or logs. Secrets belong in the gitignored `.env`.
 - Preserve unrelated user changes in a dirty worktree.
-- Do not casually run `test_download.py`: it uses a hardcoded live URL, valid
+- Do not casually run `smoke_download.py`: it uses a hardcoded live URL, valid
   credentials, network access, and the configured download destination.
 - Network, IMAP, SMTP, browser, and download failures must be logged and handled
   without terminating the long-running poll loop.
@@ -66,8 +66,8 @@ IMAP -> EmailBot -> UrlExtractor -> platform downloader -> SMTP reply
 - tolerates empty Bark configuration.
 
 Moving F2-dependent imports above this bootstrap reproduces import-time crashes
-or HTTP 200 responses with empty Douyin data. `test_download.py` duplicates the
-patches and must stay synchronized until they move into a shared module.
+or HTTP 200 responses with empty Douyin data. `f2_bootstrap.py` is the shared
+bootstrap used by both entry points; keep it before any F2-dependent imports.
 
 ## Runtime Invariants
 
@@ -170,7 +170,7 @@ Relative configured paths resolve against the directory containing
 
 The checked-in config points downloads directly at
 `/srv/nas_data/douyin_downloads`. Docker overrides that host path with
-`/app/downloads`. `test_download.py` and `migrate_downloads.py` follow the
+`/app/downloads`. `smoke_download.py` and `migrate_downloads.py` follow the
 configured path, while `play.py` ignores `config.yaml` and defaults to the
 checkout-local `./downloads/`. Pass the NAS path explicitly when using it on the
 deployment host.
