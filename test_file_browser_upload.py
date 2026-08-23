@@ -29,6 +29,7 @@ class UploadFormTests(unittest.TestCase):
         self.index_patch.start()
         self.pending_patch.start()
         self.client = file_browser.app.test_client()
+        self.client.environ_base["HTTP_ORIGIN"] = "http://localhost"
 
     def tearDown(self):
         self.pending_patch.stop()

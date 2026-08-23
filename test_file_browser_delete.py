@@ -22,6 +22,7 @@ class DeleteTests(unittest.TestCase):
         self.pending_dups = file_browser._PENDING_DUPS
         file_browser._DEDUP_INDEX = {}
         file_browser._PENDING_DUPS = []
+        self.client.environ_base["HTTP_ORIGIN"] = "http://localhost"
 
     def tearDown(self):
         file_browser._DEDUP_INDEX = self.dedup_index
