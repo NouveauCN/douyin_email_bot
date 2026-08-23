@@ -85,6 +85,10 @@ uv run python main.py
 
 机器人收到后会下载视频并回复邮件。
 
+Docker 部署时，失败清单和自动重试队列保存在 bot 的 `state` named volume
+中，不会因重建 bot 容器而丢失；对应文件位于容器内的
+`/app/state/failed_links.txt` 和 `/app/state/pending_retries.json`。
+
 ## 局域网 + Tailscale Web 访问
 
 `file_browser` 和 `web_login` 不显示应用登录页，访问边界由 Docker
@@ -194,6 +198,8 @@ uv run python process_media.py "/path/to/video.mp4" --apply --force-review
 | `bot.allowed_senders` | list | `[]` | 允许的发件人邮箱（空=允许所有人） |
 | `bot.subject_keyword` | str | `"下载"` | 触发下载的邮件主题关键词 |
 | `bot.cooldown_seconds` | int | `5` | 同一发件人冷却时间 |
+| `bot.transient_pending_file` | str | `./pending_retries.json` | 自动重试队列文件；可由 `BOT_TRANSIENT_PENDING_FILE` 覆盖 |
+| `bot.transient_failed_file` | str | `./failed_links.txt` | 重试耗尽链接的失败清单；可由 `BOT_TRANSIENT_FAILED_FILE` 覆盖 |
 | `bot.commands.cookie_update` | str | `"更新cookie"` | 手动更新 cookie 的邮件主题关键词 |
 | `bot.commands.cookie_auto` | str | `"自动获取cookie"` | 浏览器自动提取 cookie 的邮件主题关键词 |
 | `FILE_BROWSER_ALLOWED_ORIGINS` | str | 当前请求 origin | 文件浏览器精确允许来源（逗号分隔） |
