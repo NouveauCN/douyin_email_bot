@@ -5,17 +5,21 @@ a web interface: open http://<host>:8080, scan the QR code with the Douyin
 app, and cookies are automatically saved to .env.
 
 Usage:
-    python web_login.py [--port 8080] [--host 0.0.0.0]
+    python web_login.py [--port 8080] [--host 127.0.0.1]
 """
 
 import argparse
+from collections import deque
 import logging
+import math
 import os
 import threading
+import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 
 # ── Bootstrap: same as main.py (needed before any F2 imports) ─────
 _PROJECT_DIR = Path(__file__).parent
@@ -43,6 +47,14 @@ app = Flask(__name__)
 log = logging.getLogger("web_login")
 _browser_lock = threading.Lock()
 _STATUS_RESPONSE_FIELDS = ("status", "auth_count", "message")
+_RATE_LIMIT_DEFAULTS = {"/api/qr": 5, "/api/status": 12}
+_RATE_LIMIT_ENV_VARS = {
+    "/api/qr": "WEB_LOGIN_QR_RATE_LIMIT",
+    "/api/status": "WEB_LOGIN_STATUS_RATE_LIMIT",
+}
+_DEFAULT_RATE_WINDOW_SECONDS = 60
+_rate_limit_lock = threading.Lock()
+_rate_limit_buckets: dict[tuple[str, str], deque[float]] = {}
 
 
 def _get_profile_dir() -> Path:
@@ -50,6 +62,105 @@ def _get_profile_dir() -> Path:
     if raw:
         return Path(raw)
     return Path.home() / ".douyin_email_bot" / "firefox_profile"
+
+
+def _canonical_origin(value: str, *, allow_path: bool = False) -> str | None:
+    """Return a normalized origin, or None for an invalid URL/header value."""
+    if not value or any(char.isspace() for char in value):
+        return None
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.netloc
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or (not allow_path and parsed.path not in {"", "/"})
+        or (not allow_path and (parsed.query or parsed.fragment))
+    ):
+        return None
+
+    scheme = parsed.scheme.lower()
+    hostname = hostname.lower()
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    default_port = 80 if scheme == "http" else 443
+    port_suffix = f":{port}" if port is not None and port != default_port else ""
+    return f"{scheme}://{hostname}{port_suffix}"
+
+
+def _allowed_origins() -> set[str]:
+    """Read the exact, comma-separated origin allowlist from the environment."""
+    configured = os.environ.get("WEB_LOGIN_ALLOWED_ORIGINS", "")
+    return {
+        origin
+        for item in configured.split(",")
+        if (origin := _canonical_origin(item.strip())) is not None
+    }
+
+
+def _request_origin() -> str | None:
+    return _canonical_origin(f"{request.scheme}://{request.host}")
+
+
+def _has_allowed_source() -> bool:
+    """Require Origin, or Referer when Origin is absent, to match this app."""
+    origin_header = request.headers.get("Origin")
+    if origin_header is not None:
+        source = _canonical_origin(origin_header)
+    else:
+        referer = request.headers.get("Referer")
+        source = _canonical_origin(referer, allow_path=True) if referer is not None else None
+    if source is None:
+        return False
+    return source == _request_origin() or source in _allowed_origins()
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, ""))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _rate_limit_response(path: str):
+    """Return a 429 response when this client has exhausted the endpoint quota."""
+    limit = _positive_env_int(_RATE_LIMIT_ENV_VARS[path], _RATE_LIMIT_DEFAULTS[path])
+    window = _positive_env_int("WEB_LOGIN_RATE_WINDOW_SECONDS", _DEFAULT_RATE_WINDOW_SECONDS)
+    client = request.remote_addr or "unknown"
+    now = time.monotonic()
+    bucket_key = (path, client)
+
+    with _rate_limit_lock:
+        bucket = _rate_limit_buckets.setdefault(bucket_key, deque())
+        cutoff = now - window
+        while bucket and bucket[0] <= cutoff:
+            bucket.popleft()
+        if len(bucket) >= limit:
+            retry_after = max(1, math.ceil(window - (now - bucket[0])))
+            response = jsonify({"success": False, "message": "请求过于频繁，请稍后重试"})
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["Retry-After"] = str(retry_after)
+            return response, 429
+        bucket.append(now)
+    return None
+
+
+@app.before_request
+def _protect_api_routes():
+    if request.path not in _RATE_LIMIT_ENV_VARS:
+        return None
+    if not _has_allowed_source():
+        response = jsonify({"success": False, "message": "请求来源不被允许"})
+        response.headers["Cache-Control"] = "no-store"
+        return response, 403
+    return _rate_limit_response(request.path)
 
 
 # ── Routes ─────────────────────────────────────────────────────────
@@ -293,7 +404,7 @@ loadQR();
 def main():
     parser = argparse.ArgumentParser(description="Douyin QR Web Login Service")
     parser.add_argument("--port", type=int, default=8080, help="Listen port (default: 8080)")
-    parser.add_argument("--host", type=str, default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
     args = parser.parse_args()
 
