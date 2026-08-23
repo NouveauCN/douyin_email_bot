@@ -54,9 +54,11 @@ services:
       - "192.168.1.94:8081:8081"
     volumes:
       - /srv/nas_data/douyin_downloads:/app/downloads
+      - /srv/nas_data/comics:/app/comics:ro
       - ./config.yaml:/app/config.yaml:ro
     environment:
       - DOUYIN_DOWNLOAD_PATH=/app/downloads
+      - COMICS_PICS_PATH=/app/comics/pics
       - TZ=Asia/Shanghai
     command: ["python3", "file_browser.py"]
 

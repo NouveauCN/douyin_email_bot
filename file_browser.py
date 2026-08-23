@@ -13,6 +13,7 @@ Usage:
 import argparse
 import hashlib
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -52,8 +53,8 @@ from media_processor import (  # noqa: E402
 
 _config = load_config(_PROJECT_DIR / "config.yaml")
 _DOWNLOAD_DIR = Path(_config.douyin.download_path)
+_COMICS_DIR = Path(os.environ.get("COMICS_PICS_PATH", "/app/comics/pics"))
 _THUMB_CACHE = Path("/app/.thumb_cache")
-_COMICS_PICS_URL = "http://192.168.1.94:8082/files/comics/pics/"
 
 # ── App setup ─────────────────────────────────────────────────────────
 
@@ -66,6 +67,17 @@ def _safe_subpath(subpath: str) -> Path:
     """Resolve subpath relative to download dir; reject traversal attempts."""
     root = _DOWNLOAD_DIR.resolve()
     p = (_DOWNLOAD_DIR / subpath).resolve()
+    try:
+        p.relative_to(root)
+    except ValueError:
+        abort(403, "Path traversal denied")
+    return p
+
+
+def _safe_comics_subpath(subpath: str) -> Path:
+    """Resolve a comics path and reject traversal or external symlinks."""
+    root = _COMICS_DIR.resolve()
+    p = (_COMICS_DIR / subpath).resolve()
     try:
         p.relative_to(root)
     except ValueError:
@@ -157,6 +169,37 @@ def _scan_downloads() -> dict:
         "slides": slides,
         "empty": not videos and not slides,
     }
+
+
+def _collect_comics_images() -> list[dict]:
+    """Recursively collect comics images that resolve inside the comics root."""
+    root = _COMICS_DIR.resolve()
+    if not _COMICS_DIR.is_dir():
+        return []
+
+    images = []
+    for directory, _, filenames in os.walk(_COMICS_DIR, followlinks=False):
+        for filename in sorted(filenames):
+            image = Path(directory) / filename
+            if image.suffix.lower() not in _IMAGE_EXTS:
+                continue
+            try:
+                resolved = image.resolve()
+                resolved.relative_to(root)
+                if not resolved.is_file():
+                    continue
+                size = resolved.stat().st_size
+                relpath = resolved.relative_to(root).as_posix()
+            except (OSError, ValueError):
+                continue
+            images.append({
+                "name": image.name,
+                "relpath": relpath,
+                "size_fmt": _format_size(size),
+            })
+
+    images.sort(key=lambda image: image["relpath"])
+    return images
 
 
 # Video extensions browsers can play natively
@@ -313,7 +356,8 @@ def _collect_videos(author: str | None = None) -> list[dict]:
 def index():
     """Top-level index: author folders + slideshow groups."""
     data = _scan_downloads()
-    data["comics_pics_url"] = _COMICS_PICS_URL
+    data["comics_images"] = _collect_comics_images()
+    data["empty"] = data["empty"] and not data["comics_images"]
     data["upload_success"] = request.args.get("upload_success", "")
     data["upload_error"] = request.args.get("upload_error", "")
     resp = make_response(render_template_string(INDEX_HTML, **data))
@@ -417,6 +461,36 @@ def view_image(filepath):
     )
 
 
+@app.route("/comics/image/<path:filepath>")
+def view_comics_image(filepath):
+    """Render the read-only comics image gallery."""
+    safe = _safe_comics_subpath(filepath)
+    if not safe.is_file() or safe.suffix.lower() not in _IMAGE_EXTS:
+        abort(404, "Image not found")
+
+    images = _collect_comics_images()
+    current_relpath = safe.relative_to(_COMICS_DIR.resolve()).as_posix()
+    current_index = next(
+        (index for index, image in enumerate(images)
+         if image["relpath"] == current_relpath),
+        None,
+    )
+    if current_index is None:
+        abort(404, "Image not found")
+
+    for image in images:
+        image["raw_url"] = url_for("raw_comics_file", filepath=image["relpath"])
+
+    return render_template_string(
+        IMAGE_VIEWER_HTML,
+        filename=safe.name,
+        directory_name="二次元图片",
+        back_url=url_for("index"),
+        images=images,
+        current_index=current_index,
+    )
+
+
 @app.route("/slideshow/<prefix>")
 def view_slideshow(prefix):
     """Compatibility entry point for old slideshow URLs."""
@@ -465,6 +539,18 @@ def raw_file(filepath):
     directory = str(safe.parent)
     filename = safe.name
     return send_from_directory(directory, filename, mimetype=_mime_type(filename))
+
+
+@app.route("/comics/raw/<path:filepath>")
+def raw_comics_file(filepath):
+    """Serve a read-only comics image after independent path validation."""
+    safe = _safe_comics_subpath(filepath)
+    if not safe.is_file() or safe.suffix.lower() not in _IMAGE_EXTS:
+        abort(404, "Image not found")
+
+    return send_from_directory(
+        str(safe.parent), safe.name, mimetype=_mime_type(safe.name)
+    )
 
 
 @app.route("/thumb/<path:filepath>")
@@ -1066,7 +1152,6 @@ INDEX_HTML = (
     cursor: pointer; user-select: none; transition: color 0.15s;
   }
   .section-header:hover { color: #555; }
-  .external-section-link { text-decoration: none; }
   .section-header .arrow { transition: transform 0.2s; font-size: 12px; display: inline-block; }
   .section-header.collapsed .arrow { transform: rotate(-90deg); }
   .section-count { font-size: 13px; font-weight: 400; color: #bbb; margin-left: auto; }
@@ -1120,6 +1205,7 @@ INDEX_HTML = (
   .upload-submit { background: #25a55a; }
   .upload-submit:disabled { cursor: wait; opacity: 0.55; }
   .upload-status { font-size: 12px; color: #999; word-break: break-all; }
+  .comics-empty-state { color: #999; padding: 24px 20px; text-align: center; }
 </style>
 </head>
 <body>
@@ -1147,20 +1233,6 @@ INDEX_HTML = (
 
   <!-- Pending duplicates section (populated by JS) -->
   <div id="dupSection"></div>
-
-  <a class="section-header external-section-link" href="{{ comics_pics_url }}"
-     target="_blank" rel="noopener noreferrer" title="打开 NAS 二次元图片目录">
-    <span class="arrow">↗</span> 🖼️ 二次元图片
-    <span class="section-count">NAS 批量导入 ↗</span>
-  </a>
-
-  {% if empty %}
-  <div class="empty-state">
-    <div class="icon">📭</div>
-    <p>暂无下载内容</p>
-    <p style="font-size:13px;margin-top:8px">发送抖音链接到邮箱，机器人会自动下载</p>
-  </div>
-  {% endif %}
 
   {% if videos %}
   <div class="section-header collapsed" onclick="toggleSection(this)" title="点击折叠/展开">
@@ -1204,6 +1276,40 @@ INDEX_HTML = (
       <button class="del-btn" onclick="confirmDelete(event, '{{ s.relpath|e }}', '图片 {{ s.name|e }}')" title="删除">✕</button>
     </div>
   {% endfor %}
+  </div>
+  {% endif %}
+
+  <div class="section-header collapsed" onclick="toggleSection(this)" title="点击折叠/展开"
+       style="margin-top:{% if videos or slides %}10{% else %}0{% endif %}px">
+    <span class="arrow">▼</span> 🖼️ 二次元图片
+    <span class="section-count">{{ comics_images | length }} 张</span>
+  </div>
+  <div class="collapsible-body collapsed">
+  {% if comics_images %}
+  <div class="card-grid">
+  {% for c in comics_images %}
+    <div class="card comics-card">
+      <a class="card-inner" href="{{ url_for('view_comics_image', filepath=c.relpath) }}">
+        <img class="card-thumb" src="{{ url_for('raw_comics_file', filepath=c.relpath) }}" loading="lazy" alt="" width="180" height="320">
+        <div class="vname">{{ c.name }}</div>
+        <div class="meta" style="margin-top:4px">
+          <span class="stat">{{ c.relpath }}</span>
+          <span class="stat">{{ c.size_fmt }}</span>
+        </div>
+      </a>
+    </div>
+  {% endfor %}
+  </div>
+  {% else %}
+  <div class="comics-empty-state">暂无二次元图片</div>
+  {% endif %}
+  </div>
+
+  {% if empty %}
+  <div class="empty-state">
+    <div class="icon">📭</div>
+    <p>暂无下载内容</p>
+    <p style="font-size:13px;margin-top:8px">发送抖音链接到邮箱，机器人会自动下载</p>
   </div>
   {% endif %}
 </div>
