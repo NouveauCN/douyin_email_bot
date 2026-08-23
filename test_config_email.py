@@ -40,6 +40,44 @@ cookie_extractor:
     assert config.cookie_extractor.profile_dir == ""
 
 
+def test_transient_retry_paths_honor_env_and_resolve_relative_to_config(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+bot:
+  transient_pending_file: yaml-pending.json
+  transient_failed_file: yaml-failed.txt
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BOT_TRANSIENT_PENDING_FILE", "state/pending.json")
+    monkeypatch.setenv("BOT_TRANSIENT_FAILED_FILE", str(tmp_path / "env-failed.txt"))
+
+    config = load_config(config_path)
+
+    assert config.bot.transient_pending_file == str((tmp_path / "state/pending.json").resolve())
+    assert config.bot.transient_failed_file == str((tmp_path / "env-failed.txt").resolve())
+
+
+def test_transient_retry_paths_keep_yaml_defaults_without_env(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+bot:
+  transient_pending_file: yaml-pending.json
+  transient_failed_file: yaml-failed.txt
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("BOT_TRANSIENT_PENDING_FILE", raising=False)
+    monkeypatch.delenv("BOT_TRANSIENT_FAILED_FILE", raising=False)
+
+    config = load_config(config_path)
+
+    assert config.bot.transient_pending_file == str((tmp_path / "yaml-pending.json").resolve())
+    assert config.bot.transient_failed_file == str((tmp_path / "yaml-failed.txt").resolve())
+
+
 def test_try_extract_cookie_forwards_configured_options(monkeypatch):
     captured = {}
 
