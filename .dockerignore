@@ -11,10 +11,9 @@ venv/
 .gitattributes
 
 # Tests, tools, one-shot scripts
-test_download.py
+smoke_download.py
 play.py
 migrate_downloads.py
-scripts/
 
 # IDE / OS
 .vscode/

@@ -52,14 +52,15 @@ class BilibiliDownloader:
                 timeout=self.config.timeout,
                 check=False,
             )
-        except ModuleNotFoundError:
-            return self._error("未安装 yutto，请先运行 uv sync 或 pip install -r requirements.txt")
         except subprocess.TimeoutExpired:
             logger.warning("Bilibili download timed out after %ds: %s", self.config.timeout, url)
             return self._error("B站下载超时，请稍后重试或调大 bilibili.timeout")
         except OSError as exc:
             logger.warning("Failed to run yutto: %s", exc)
-            return self._error(f"无法启动 yutto：{exc}")
+            return self._error(
+                f"无法启动 yutto：{exc}。请在主项目环境外安装 yutto，"
+                "或配置 bilibili.yutto_bin / BILIBILI_YUTTO_BIN"
+            )
 
         output = _strip_ansi("\n".join(
             part for part in (completed.stdout, completed.stderr) if part

@@ -34,8 +34,11 @@ uv sync
 ### 3. 获取抖音 Cookie
 
 ```bash
-uv run f2 dy --auto-cookie chrome
+uv run python get_cookie.py
 ```
+
+首次运行会打开 Firefox 供扫码登录；之后可用
+`uv run python get_cookie.py --headless` 复用持久化登录状态。
 
 ### 4. 配置 .env 文件
 
@@ -143,9 +146,9 @@ uv run python process_media.py "/path/to/video.mp4" --apply --force-review
 向机器人邮箱发送邮件：
 - **主题**：含"自动获取cookie"
 
-机器人会依次尝试 Firefox → Chrome → Edge 浏览器，提取已登录的抖音 cookie 并自动更新。
+机器人会复用 Playwright Firefox 持久化配置，提取已登录的抖音 cookie 并自动更新。
 
-> 提示：Windows 上建议安装 Firefox 并登录 douyin.com，Firefox 的 cookie 存储不加密，提取成功率最高。
+> 提示：首次使用前先运行 `uv run python get_cookie.py` 完成 Firefox 登录。
 
 ## 配置说明
 
@@ -159,8 +162,8 @@ uv run python process_media.py "/path/to/video.mp4" --apply --force-review
 | `email.password` | str | `""` | **必填**（.env `EMAIL_PASSWORD`），QQ 邮箱授权码 |
 | `email.poll_interval` | int | `30` | 收件箱轮询间隔（秒） |
 | `douyin.cookie` | str | `""` | **必填**（.env `DOUYIN_COOKIE`），抖音登录 cookie |
-| `douyin.download_path` | str | `"./downloads"` | 视频下载目录 |
-| `bilibili.download_path` | str | `"./downloads/bilibili"` | B站视频下载目录 |
+| `douyin.download_path` | str | `"/srv/nas_data/douyin_downloads"` | 视频下载目录（提交配置） |
+| `bilibili.download_path` | str | `"/srv/nas_data/douyin_downloads/bilibili"` | B站视频下载目录（提交配置） |
 | `bilibili.auth` | str | `""` | 可选（.env `BILIBILI_AUTH`），B站登录 cookie |
 | `bilibili.auth_file` | str | `""` | 可选（env `BILIBILI_AUTH_FILE`），yutto 扫码登录认证文件 |
 | `bilibili.video_quality` | int | `127` | yutto 视频清晰度，127=请求最高可用画质 |

@@ -57,3 +57,19 @@ def test_bootstrap_f2_is_idempotent():
         TokenManager.gen_real_msToken.__func__,
         BarkConfManager.merge.__func__,
     )
+
+
+def test_bootstrap_preserves_existing_f2_config(tmp_path):
+    from f2_bootstrap import _ensure_config
+
+    conf_dir = tmp_path / "conf"
+    conf_dir.mkdir()
+    custom_conf = "f2:\n  enable_bark: true\n  custom: keep-me\n"
+    custom_app = "bark:\n  token: keep-me\n"
+    (conf_dir / "conf.yaml").write_text(custom_conf, encoding="utf-8")
+    (conf_dir / "app.yaml").write_text(custom_app, encoding="utf-8")
+
+    _ensure_config(tmp_path)
+
+    assert (conf_dir / "conf.yaml").read_text(encoding="utf-8") == custom_conf
+    assert (conf_dir / "app.yaml").read_text(encoding="utf-8") == custom_app

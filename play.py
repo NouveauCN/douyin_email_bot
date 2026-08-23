@@ -541,10 +541,6 @@ def _seed_repr() -> str:
     return f"{_SEED:016x} (generated at {_SEED_TIME})"
 
 
-def _get_seed() -> int:
-    return _SEED
-
-
 # ── CLI ─────────────────────────────────────────────────────────────
 
 def main() -> None:

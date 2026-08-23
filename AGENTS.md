@@ -46,6 +46,8 @@ IMAP -> EmailBot -> UrlExtractor -> platform downloader -> SMTP reply
   without terminating the long-running poll loop.
 - Preserve `_safe_subpath()` checks around every `file_browser.py` route that
   accepts a user path.
+- Destructive file-browser routes must reject any path that resolves to the
+  download root itself.
 - `file_browser.py` is unauthenticated and writable: upload, delete, and
   duplicate-resolution endpoints modify the download tree. Keep it trusted-LAN
   only unless an explicit security change is requested.
@@ -97,9 +99,13 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   `<root>/<author>/<YYYYMMDD_HHMMSS>_<aweme_id>.mp4` when folderized.
 - Static slideshow images go to `<root>/slides/`; animated MP4 clips follow the
   author-folder layout. Extension detection is heuristic and defaults to WebP.
+- Slideshow retries reuse completed items by aweme ID and item index even when
+  the timestamp prefix changes, so partial-success retries do not duplicate files.
 - Downloaded images, regular videos, and animated clips pass through the shared
   `media_processor.py` edge-crop pipeline. Post-processing failures must not
   turn successful downloads into failures.
+- Media downloads stream into unique same-directory temporary files and replace
+  the destination atomically; empty files are never treated as successful.
 - `douyin.max_tasks` is configured but single downloads currently force one
   task.
 
@@ -146,13 +152,14 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
 - First login may be interactive; later extraction reuses the profile headlessly.
 - QR generation opens the Douyin login dialog, captures the complete viewport,
   and serializes Firefox access between QR and status requests.
+- QR status responses must never expose cookie contents to the browser and must
+  remain non-cacheable; successful cookies are persisted server-side only.
 - Keep auth-cookie indicators aligned between `cookie_extractor.py` and
   `douyin_downloader.py`.
 - `.env` update helpers currently write in place rather than atomically. Keep
   their formatting consistent and prefer a shared atomic implementation when
   changing them.
-- YAML loads `cookie_extractor.headless` and `.validate`, but email-triggered
-  extraction currently hardcodes both to `True`.
+- Email-triggered extraction honors `cookie_extractor.headless` and `.validate`.
 
 ## Configuration And Paths
 
@@ -246,12 +253,10 @@ sudo docker compose down
 
 ## Known Gaps
 
-- `README.md` and `.env.example` still contain legacy cookie instructions and
-  stale default paths.
 - The thumbnail cache is fixed at `/app/.thumb_cache`.
 - Flask HTML, CSS, and JavaScript remain inline in Python modules.
-- The unused cookie-extractor configuration fields should eventually be
-  corrected rather than documented indefinitely.
+- `pyproject.toml`/`uv.lock` and Docker's `requirements.txt` still duplicate the
+  primary dependency declarations.
 
 Any substantial change to architecture, media layout, configuration,
 dependencies, or startup/deployment behavior must update this file.

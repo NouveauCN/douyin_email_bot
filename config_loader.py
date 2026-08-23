@@ -66,8 +66,14 @@ def _parse_allowed_senders(value) -> list[str]:
     return []
 
 
-def _resolve_project_path(config_path: Path, value: str) -> str:
-    """Resolve a project-relative path from config.yaml."""
+def _resolve_project_path(config_path: Path, value: str | None) -> str:
+    """Resolve a project-relative path from config.yaml.
+
+    Empty optional paths stay empty instead of resolving to the directory
+    containing the config file.
+    """
+    if not value:
+        return ""
     target = Path(value)
     if not target.is_absolute():
         target = config_path.parent / target
@@ -231,7 +237,10 @@ def load_config(path: Path) -> AppConfig:
     bilibili = BilibiliConfig(
         download_path=str(_bili_dl_path.resolve()),
         auth=os.getenv("BILIBILI_AUTH") or bilibili_raw.get("auth", ""),
-        auth_file=_env_str("BILIBILI_AUTH_FILE", bilibili_raw.get("auth_file", "")),
+        auth_file=_resolve_project_path(
+            path,
+            _env_str("BILIBILI_AUTH_FILE", bilibili_raw.get("auth_file", "")),
+        ),
         timeout=_env_int("BILIBILI_TIMEOUT", bilibili_raw.get("timeout", 3600)),
         batch=_env_bool("BILIBILI_BATCH", bilibili_raw.get("batch", False)),
         video_quality=_env_int(
@@ -302,9 +311,9 @@ def load_config(path: Path) -> AppConfig:
     # ── Cookie Extractor ──
     extractor_raw = raw.get("cookie_extractor", {})
     cookie_extractor = CookieExtractorConfig(
-        profile_dir=_env_str(
-            "COOKIE_PROFILE_DIR",
-            extractor_raw.get("profile_dir", ""),
+        profile_dir=_resolve_project_path(
+            path,
+            _env_str("COOKIE_PROFILE_DIR", extractor_raw.get("profile_dir", "")),
         ),
         headless=extractor_raw.get("headless", True),
         validate=extractor_raw.get("validate", True),

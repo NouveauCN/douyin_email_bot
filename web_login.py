@@ -11,12 +11,11 @@ Usage:
 import argparse
 import logging
 import os
-import sys
 import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, render_template_string
 
 # ── Bootstrap: same as main.py (needed before any F2 imports) ─────
 _PROJECT_DIR = Path(__file__).parent
@@ -43,6 +42,7 @@ from cookie_extractor import (  # noqa: E402
 app = Flask(__name__)
 log = logging.getLogger("web_login")
 _browser_lock = threading.Lock()
+_STATUS_RESPONSE_FIELDS = ("status", "auth_count", "message")
 
 
 def _get_profile_dir() -> Path:
@@ -68,9 +68,13 @@ def api_qr():
         b64, msg = screenshot_qr_code(profile_dir)
     if b64:
         log.info("QR screenshot: %d chars", len(b64))
-        return jsonify({"success": True, "qr_image": b64, "message": msg})
+        response = jsonify({"success": True, "qr_image": b64, "message": msg})
+        response.headers["Cache-Control"] = "no-store"
+        return response
     log.error("QR screenshot failed: %s", msg)
-    return jsonify({"success": False, "message": msg}), 500
+    response = jsonify({"success": False, "message": msg})
+    response.headers["Cache-Control"] = "no-store"
+    return response, 500
 
 
 @app.route("/api/status")
@@ -80,27 +84,24 @@ def api_status():
     with _browser_lock:
         result = check_auth_cookies(profile_dir)
 
-    if result["status"] == "logged_in" and result["cookie_str"]:
+    cookie_str = result.get("cookie_str")
+    if result.get("status") == "logged_in" and cookie_str:
         # Validate cookie quality before saving
-        grade, _ = _assess_quality(result["cookie_str"])
+        grade, _ = _assess_quality(cookie_str)
         result["message"] += f" — {grade}"
 
         # Persist to .env
-        _write_env(str(_env_path), "DOUYIN_COOKIE", result["cookie_str"])
-        os.environ["DOUYIN_COOKIE"] = result["cookie_str"]
+        _write_env(str(_env_path), "DOUYIN_COOKIE", cookie_str)
+        os.environ["DOUYIN_COOKIE"] = cookie_str
         log.info(
             "Login success! Cookie saved (%d chars, %d auth tokens) — %s",
-            len(result["cookie_str"]), result["auth_count"], grade,
+            len(cookie_str), result["auth_count"], grade,
         )
 
-    return jsonify(result)
-
-
-@app.route("/api/stop", methods=["POST"])
-def api_stop():
-    """Graceful shutdown (for containerised use)."""
-    log.info("Shutdown requested via /api/stop")
-    return jsonify({"success": True, "message": "Shutting down..."})
+    # Cookie contents are used only for persistence and must never reach clients.
+    response = jsonify({key: result.get(key) for key in _STATUS_RESPONSE_FIELDS})
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 # ── .env writeback ─────────────────────────────────────────────────
@@ -167,11 +168,6 @@ LOGIN_HTML = r"""<!DOCTYPE html>
   }
   .btn:hover { opacity: 0.85; }
   .btn:disabled { opacity: 0.4; cursor: not-allowed; }
-  .cookie-preview {
-    margin-top: 16px; padding: 12px; background: #111; border-radius: 8px;
-    font-size: 11px; color: #4caf50; word-break: break-all; text-align: left;
-    max-height: 100px; overflow-y: auto; display: none;
-  }
 </style>
 </head>
 <body>
@@ -187,7 +183,6 @@ LOGIN_HTML = r"""<!DOCTYPE html>
   </div>
 
   <div id="status" class="status wait">正在生成二维码...</div>
-  <div id="cookie-preview" class="cookie-preview"></div>
 
   <button id="refresh-btn" class="btn" onclick="loadQR()" style="display:none">
     🔄 刷新二维码
@@ -260,17 +255,11 @@ async function pollStatus() {
     const resp = await fetch('/api/status');
     const data = await resp.json();
     const el = document.getElementById('status');
-    const cp = document.getElementById('cookie-preview');
 
     if (data.status === 'logged_in') {
       stopPolling();
       el.textContent = '✅ 登录成功！Cookie 已保存 (' + data.auth_count + ' 个认证 token)';
       el.className = 'status ok';
-
-      if (data.cookie_str) {
-        cp.textContent = 'Cookie: ' + data.cookie_str.substring(0, 200) + '...';
-        cp.style.display = 'block';
-      }
 
       document.getElementById('refresh-btn').style.display = 'none';
       document.getElementById('qr-img').style.opacity = '0.4';

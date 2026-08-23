@@ -13,17 +13,17 @@ import sys
 _BOOTSTRAPPED = False
 
 
-def _write_if_changed(path: Path, content: str) -> None:
-    """Create the minimal F2 config without touching an unchanged file."""
-    if not path.exists() or path.read_text(encoding="utf-8") != content:
+def _write_if_missing(path: Path, content: str) -> None:
+    """Create minimal F2 config without overwriting user customization."""
+    if not path.exists():
         path.write_text(content, encoding="utf-8")
 
 
 def _ensure_config(project_dir: Path) -> None:
     conf_dir = project_dir / "conf"
     conf_dir.mkdir(exist_ok=True)
-    _write_if_changed(conf_dir / "conf.yaml", "f2:\n  enable_bark: false\n")
-    _write_if_changed(conf_dir / "app.yaml", "bark: {}\n")
+    _write_if_missing(conf_dir / "conf.yaml", "f2:\n  enable_bark: false\n")
+    _write_if_missing(conf_dir / "app.yaml", "bark: {}\n")
 
 
 def bootstrap_f2(project_dir: Path | None = None) -> None:
