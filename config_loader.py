@@ -24,6 +24,8 @@ Docker env-var overrides:
     BOT_SUBJECT_KEYWORD   — overrides bot.subject_keyword
     BOT_TRANSIENT_RETRY_ATTEMPTS — overrides bot.transient_retry_attempts
     BOT_TRANSIENT_RETRY_DELAY_SECONDS — overrides bot.transient_retry_delay_seconds
+    BOT_TRANSIENT_PENDING_FILE — overrides bot.transient_pending_file
+    BOT_TRANSIENT_FAILED_FILE — overrides bot.transient_failed_file
     MEDIA_BACKUP_RETENTION_DAYS — overrides media_cleanup.backup_retention_days
     MEDIA_BACKUP_CHECK_INTERVAL_DAYS — overrides media_cleanup.check_interval_days
     COOKIE_PROFILE_DIR    — overrides cookie_extractor.profile_dir
@@ -280,11 +282,17 @@ def load_config(path: Path) -> AppConfig:
         ),
         transient_pending_file=_resolve_project_path(
             path,
-            bot_raw.get("transient_pending_file", "./pending_retries.json"),
+            _env_str(
+                "BOT_TRANSIENT_PENDING_FILE",
+                bot_raw.get("transient_pending_file", "./pending_retries.json"),
+            ),
         ),
         transient_failed_file=_resolve_project_path(
             path,
-            bot_raw.get("transient_failed_file", "./failed_links.txt"),
+            _env_str(
+                "BOT_TRANSIENT_FAILED_FILE",
+                bot_raw.get("transient_failed_file", "./failed_links.txt"),
+            ),
         ),
         commands=bot_commands,
     )
