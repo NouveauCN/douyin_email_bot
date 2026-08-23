@@ -9,7 +9,19 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # ── System deps + ffmpeg ───────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    curl \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# Codex is used by the bot's failure hook. Authentication is kept in the
+# compose-managed Codex home volume and is not baked into the image.
+RUN curl -fsSL https://chatgpt.com/codex/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+RUN codex --version >/dev/null
+# Keep the persistent auth/config home separate from the installer-managed
+# package directory under /root/.codex, so the compose volume cannot hide the
+# installed executable.
+ENV CODEX_HOME="/root/codex-home"
 
 WORKDIR /app
 
@@ -32,7 +44,7 @@ RUN python3 -m playwright install firefox
 COPY . .
 
 # Ensure volume mount points exist
-RUN mkdir -p /app/downloads /app/logs /app/firefox_profile /app/conf
+RUN mkdir -p /app/downloads /app/logs /app/firefox_profile /app/conf /root/codex-home
 
 # ── Runtime ────────────────────────────────────────────────────────
 # Bot entrypoint (web_login overrides via docker-compose command)
