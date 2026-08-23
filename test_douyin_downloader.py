@@ -115,6 +115,7 @@ class DouyinDownloadTests(unittest.IsolatedAsyncioTestCase):
             "https://www.douyin.com/note/1234567891/?region=cn",
             "https://m.douyin.com/share/video/1234567892",
             "https://www.douyin.com/share/note/1234567893/",
+            "https://www.iesdouyin.com/share/note/1234567894/",
         )
         for location in locations:
             with self.subTest(location=location):
