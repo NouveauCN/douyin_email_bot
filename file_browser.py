@@ -53,6 +53,7 @@ from media_processor import (  # noqa: E402
 _config = load_config(_PROJECT_DIR / "config.yaml")
 _DOWNLOAD_DIR = Path(_config.douyin.download_path)
 _THUMB_CACHE = Path("/app/.thumb_cache")
+_COMICS_PICS_URL = "https://192.168.1.94:8082/files/comics/pics/"
 
 # ── App setup ─────────────────────────────────────────────────────────
 
@@ -312,6 +313,7 @@ def _collect_videos(author: str | None = None) -> list[dict]:
 def index():
     """Top-level index: author folders + slideshow groups."""
     data = _scan_downloads()
+    data["comics_pics_url"] = _COMICS_PICS_URL
     data["upload_success"] = request.args.get("upload_success", "")
     data["upload_error"] = request.args.get("upload_error", "")
     resp = make_response(render_template_string(INDEX_HTML, **data))
@@ -1064,6 +1066,7 @@ INDEX_HTML = (
     cursor: pointer; user-select: none; transition: color 0.15s;
   }
   .section-header:hover { color: #555; }
+  .external-section-link { text-decoration: none; }
   .section-header .arrow { transition: transform 0.2s; font-size: 12px; display: inline-block; }
   .section-header.collapsed .arrow { transform: rotate(-90deg); }
   .section-count { font-size: 13px; font-weight: 400; color: #bbb; margin-left: auto; }
@@ -1144,6 +1147,12 @@ INDEX_HTML = (
 
   <!-- Pending duplicates section (populated by JS) -->
   <div id="dupSection"></div>
+
+  <a class="section-header external-section-link" href="{{ comics_pics_url }}"
+     target="_blank" rel="noopener noreferrer" title="打开 NAS 二次元图片目录">
+    <span class="arrow">↗</span> 🖼️ 二次元图片
+    <span class="section-count">NAS 批量导入 ↗</span>
+  </a>
 
   {% if empty %}
   <div class="empty-state">

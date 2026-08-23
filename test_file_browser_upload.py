@@ -47,6 +47,18 @@ class UploadFormTests(unittest.TestCase):
         self.assertIn("multiple", page)
         self.assertNotIn("uploadInput').click()", page)
 
+    def test_empty_home_exposes_comics_nas_entry(self):
+        response = self.client.get("/")
+        page = response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(
+            'href="https://192.168.1.94:8082/files/comics/pics/"', page
+        )
+        self.assertIn("二次元图片", page)
+        self.assertIn('target="_blank"', page)
+        self.assertIn('rel="noopener noreferrer"', page)
+
     def test_enhanced_mobile_upload_returns_json(self):
         response = self.client.post(
             "/api/upload",
