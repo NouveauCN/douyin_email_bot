@@ -11,7 +11,9 @@ import json
 import logging
 import os
 import re
+import stat
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -202,7 +204,7 @@ class DouyinDownloader:
 
         # Step 5: Download
         downloaded = False
-        if filepath.exists():
+        if _has_downloaded_content(filepath):
             logger.info(f"{Fore.YELLOW}已存在: %s", filepath.name)
         else:
             await self._download_file(video_url, filepath, kwargs)
@@ -243,7 +245,7 @@ class DouyinDownloader:
         slides_dir.mkdir(parents=True, exist_ok=True)
 
         # ── Build download queues ──────────────────────────────────
-        static_urls = [u for u in images if isinstance(u, str)]
+        static_urls = [u.strip() for u in images if isinstance(u, str) and u.strip()]
         static_ext = ".webp"
         if static_urls:
             first = static_urls[0]
@@ -252,7 +254,7 @@ class DouyinDownloader:
             elif ".png" in first:
                 static_ext = ".png"
 
-        video_urls = [u for u in images_video if isinstance(u, str)]
+        video_urls = [u.strip() for u in images_video if isinstance(u, str) and u.strip()]
 
         # Animated clips → author folder (same logic as videos)
         # Only create the author directory if there are actually clips to put there.
@@ -270,15 +272,21 @@ class DouyinDownloader:
         # Static images → slides/{prefix}_{NN}.ext
         for i, url in enumerate(static_urls):
             fname = f"{prefix}_{i + 1:02d}{static_ext}"
-            downloads.append((url, slides_dir / fname, "图片"))
+            existing = _find_existing_slideshow_file(
+                slides_dir, f"_{aweme_id}_{i + 1:02d}{static_ext}"
+            )
+            downloads.append((url, existing or (slides_dir / fname), "图片"))
 
         # Animated clips → <author>/{prefix}.mp4 (or {prefix}_{NN}.mp4 if multiple)
         for i, url in enumerate(video_urls):
             if len(video_urls) == 1:
                 fname = f"{prefix}.mp4"
+                suffix = f"_{aweme_id}.mp4"
             else:
                 fname = f"{prefix}_{i + 1:02d}.mp4"
-            downloads.append((url, video_dir / fname, "动图"))
+                suffix = f"_{aweme_id}_{i + 1:02d}.mp4"
+            existing = _find_existing_slideshow_file(video_dir, suffix)
+            downloads.append((url, existing or (video_dir / fname), "动图"))
 
         if not downloads:
             return self._error("图文内容为空，无法下载")
@@ -298,20 +306,25 @@ class DouyinDownloader:
 
         done = 0
         total_size = 0
+        successful_paths: list[Path] = []
+        failures: list[str] = []
         for url, filepath, label in downloads:
-            if filepath.exists():
+            if _has_downloaded_content(filepath):
                 logger.info(f"{Fore.YELLOW}已存在: %s", filepath)
                 done += 1
                 total_size += filepath.stat().st_size
+                successful_paths.append(filepath)
                 continue
 
             try:
                 await self._download_file(url, filepath, kwargs)
                 done += 1
                 total_size += filepath.stat().st_size
+                successful_paths.append(filepath)
                 await _process_downloaded_media(filepath)
             except Exception as exc:
                 logger.warning("Failed to download %s %s: %s", label, filepath.name, exc)
+                failures.append(f"{label} {filepath.name}: {exc}")
 
         logger.info(
             f"{Fore.GREEN}{Style.BRIGHT}[DONE] 图文下载完成: %s "
@@ -320,15 +333,31 @@ class DouyinDownloader:
             total_size / 1_000_000,
         )
 
+        total = len(downloads)
+        result_title = f"{title} [图文 {len(static_urls)}图+{len(video_urls)}动图]"
+        partial = bool(done and failures)
+        if successful_paths:
+            successful_parents = {path.parent for path in successful_paths}
+            result_path = successful_paths[0].parent if len(successful_parents) == 1 else download_dir
+        else:
+            result_path = None
         return {
-            "success": True,
-            "filepath": str(slides_dir if not video_urls else video_dir),
-            "title": f"{title} [图文 {len(static_urls)}图+{len(video_urls)}动图]",
-            "error": None,
+            "success": done > 0,
+            "partial": partial,
+            "filepath": str(result_path) if result_path else None,
+            "files": [str(path) for path in successful_paths],
+            "file_count": done,
+            "failed_count": len(failures),
+            "failed_items": failures,
+            "title": result_title,
+            "error": None if done else (
+                f"图文内容下载失败 {len(failures)} 个，未生成有效文件："
+                + "；".join(failures)
+            ),
         }
 
     async def _download_file(self, url: str, filepath: Path, kwargs: dict) -> None:
-        """Download a file from url to filepath with retries."""
+        """Stream a file into a same-directory temp file, then replace atomically."""
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -338,25 +367,63 @@ class DouyinDownloader:
             "Referer": "https://www.douyin.com/",
         }
 
-        max_retries = kwargs.get("max_retries", 3)
+        max_retries = max(1, int(kwargs.get("max_retries", 3)))
         timeout = kwargs.get("timeout", 30)
 
         last_error = None
         for attempt in range(1, max_retries + 1):
+            temp_path: Path | None = None
+            temp_fd: int | None = None
             try:
+                filepath.parent.mkdir(parents=True, exist_ok=True)
+                temp_fd, temp_name = tempfile.mkstemp(
+                    prefix=f".{filepath.name}.",
+                    suffix=".tmp",
+                    dir=str(filepath.parent),
+                )
+                temp_path = Path(temp_name)
                 async with httpx.AsyncClient(
                     timeout=timeout, follow_redirects=True, headers=headers,
                     trust_env=False,
                 ) as client:
-                    response = await client.get(url)
-                    response.raise_for_status()
-                    filepath.write_bytes(response.content)
-                    return
-            except httpx.HTTPError as e:
+                    async with client.stream("GET", url) as response:
+                        response.raise_for_status()
+                        with os.fdopen(temp_fd, "wb") as output:
+                            temp_fd = None
+                            total_bytes = 0
+                            async for chunk in response.aiter_bytes():
+                                if chunk:
+                                    output.write(chunk)
+                                    total_bytes += len(chunk)
+                            if total_bytes == 0:
+                                raise ValueError("download response was empty")
+                            output.flush()
+                            os.fsync(output.fileno())
+
+                if filepath.exists():
+                    final_mode = stat.S_IMODE(filepath.stat().st_mode)
+                else:
+                    final_mode = 0o644
+                temp_path.chmod(final_mode)
+                temp_path.replace(filepath)
+                temp_path = None
+                return
+            except Exception as e:
                 last_error = e
                 logger.warning("Download attempt %d/%d failed: %s", attempt, max_retries, e)
                 if attempt < max_retries:
                     await asyncio.sleep(1)
+            finally:
+                if temp_fd is not None:
+                    try:
+                        os.close(temp_fd)
+                    except OSError:
+                        pass
+                if temp_path is not None:
+                    try:
+                        temp_path.unlink()
+                    except FileNotFoundError:
+                        pass
 
         raise last_error  # type: ignore[misc]
 
@@ -373,6 +440,27 @@ def _normalize_share_url(url: str) -> str:
 def _download_timestamp() -> str:
     """Return a stable timestamp prefix for newly downloaded files."""
     return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _has_downloaded_content(filepath: Path) -> bool:
+    """Return whether filepath is a usable, non-empty regular file."""
+    try:
+        return filepath.is_file() and filepath.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _find_existing_slideshow_file(directory: Path, suffix: str) -> Path | None:
+    """Reuse a completed slideshow item when a retry has a new timestamp."""
+    suffix = suffix.lower()
+    try:
+        candidates = directory.iterdir()
+    except OSError:
+        return None
+    for candidate in candidates:
+        if candidate.name.lower().endswith(suffix) and _has_downloaded_content(candidate):
+            return candidate
+    return None
 
 
 async def _resolve_short_link(path: str, headers: dict) -> str:

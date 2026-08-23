@@ -13,3 +13,6 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "pyyaml>=6.0",
 ]
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"

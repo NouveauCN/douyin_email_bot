@@ -12,102 +12,14 @@ import sys
 from pathlib import Path
 
 from colorama import Fore, Style, init as colorama_init
+from f2_bootstrap import bootstrap_f2
 
 # ── Initialize colorama for Windows console color support ──────────
 colorama_init(autoreset=True)
 
-# ── Disable F2's Bark notification BEFORE F2 is imported ──────────
-# F2 reads config at module import time.  Its default config enables
-# Bark (api.day.app) which causes a 405 error on every download.
-_F2_CONF_DIR = Path(__file__).parent / "conf"
-_F2_CONF_DIR.mkdir(exist_ok=True)
-_F2_CONF_FILE = _F2_CONF_DIR / "conf.yaml"
-if not _F2_CONF_FILE.exists():
-    _F2_CONF_FILE.write_text("f2:\n  enable_bark: false\n", encoding="utf-8")
-(_F2_CONF_DIR / "app.yaml").write_text("bark: {}\n", encoding="utf-8")
-
-# ── Patch F2's douyin ClientConfManager for missing config ─────────
-# F2 expects a fully populated conf.yaml with BaseRequestModel etc.
-# When config is missing, brm_os/brm_version/brm_browser/brm_engine
-# return a str instead of dict, which crashes pydantic model defaults.
-# This monkey-patch ensures those accessors always return a dict.
-import f2.apps.douyin.utils as _douyin_utils  # noqa: E402
-
-_DOUYIN_CCM = _douyin_utils.ClientConfManager
-
-_orig_brm_os = _DOUYIN_CCM.brm_os.__func__
-_orig_brm_version = _DOUYIN_CCM.brm_version.__func__
-_orig_brm_browser = _DOUYIN_CCM.brm_browser.__func__
-_orig_brm_engine = _DOUYIN_CCM.brm_engine.__func__
-
-# Platform-aware values matching the Firefox profile used for cookie login.
-# F2's bundled config defaults to Edge/Win32 even in Linux containers.  A
-# Firefox cookie paired with that mismatched fingerprint gets HTTP 200 empty
-# responses from Douyin, so do not preserve the bundled browser defaults.
-_PLATFORM = "Linux" if sys.platform.startswith("linux") else (
-    "Darwin" if sys.platform == "darwin" else "Windows"
-)
-_BROWSER_PLATFORM = "Linux x86_64" if _PLATFORM == "Linux" else (
-    "MacIntel" if _PLATFORM == "Darwin" else "Win32"
-)
-
-@classmethod
-def _safe_brm_os(cls):
-    v = _orig_brm_os(cls)
-    return v if isinstance(v, dict) else {"name": _PLATFORM, "version": "10"}
-
-@classmethod
-def _safe_brm_version(cls):
-    v = _orig_brm_version(cls)
-    return v if isinstance(v, dict) else {"code": "290100", "name": "29.1.0"}
-
-@classmethod
-def _safe_brm_browser(cls):
-    return {
-        "name": "Firefox", "version": "130.0.0.0",
-        "language": "zh-CN", "platform": _BROWSER_PLATFORM,
-    }
-
-@classmethod
-def _safe_brm_engine(cls):
-    return {"name": "Gecko", "version": "130.0.0.0"}
-
-_DOUYIN_CCM.brm_os = _safe_brm_os
-_DOUYIN_CCM.brm_version = _safe_brm_version
-_DOUYIN_CCM.brm_browser = _safe_brm_browser
-_DOUYIN_CCM.brm_engine = _safe_brm_engine
-
-# F2 0.0.1.7 has a bug: the except handler calls gen_real_msToken() again
-# instead of gen_false_msToken().  Also TokenManager.token_conf may be
-# empty when conf.yaml lacks msToken keys, causing KeyError on "magic".
-# Patch gen_real_msToken to fall back gracefully.
-_TokenManager = _douyin_utils.TokenManager
-_orig_gen_real = _TokenManager.gen_real_msToken.__func__
-
-@classmethod
-def _safe_gen_real_msToken(cls):
-    try:
-        return _orig_gen_real(cls)
-    except Exception:
-        return cls.gen_false_msToken()
-
-_TokenManager.gen_real_msToken = _safe_gen_real_msToken
-
-# BarkClientConfManager.merge() calls merge_config() which raises
-# ValueError when both bark configs are empty (which is our case since
-# we disabled Bark).  Patch merge() to return {} gracefully.
-import f2.apps.bark.utils as _bark_utils  # noqa: E402
-_orig_bark_merge = _bark_utils.ClientConfManager.merge.__func__
-
-@classmethod
-def _safe_bark_merge(cls):
-    c = cls.client()
-    a = cls.app()
-    if not c and not a:
-        return {}
-    return _orig_bark_merge(cls)
-
-_bark_utils.ClientConfManager.merge = _safe_bark_merge
+# F2 reads config while its modules import, so this must stay before the
+# email bot/downloader imports below.
+bootstrap_f2()
 
 from dotenv import load_dotenv  # noqa: E402
 

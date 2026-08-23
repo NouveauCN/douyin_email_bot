@@ -591,12 +591,18 @@ def api_delete():
         return {"success": False, "error": "缺少 path 参数"}, 400
 
     target = _safe_subpath(subpath)
+    download_root = _DOWNLOAD_DIR.resolve()
+    if target == download_root:
+        return {"success": False, "error": "不允许删除下载根目录"}, 403
     if not target.exists():
         return {"success": False, "error": "文件或目录不存在"}, 404
 
     try:
+        # Save this before deletion: ``Path.is_dir()`` is false after rmtree,
+        # which would otherwise leave stale directory entries in dedup state.
+        target_was_dir = target.is_dir()
         cleanup_start = target.parent
-        if target.is_dir():
+        if target_was_dir:
             shutil.rmtree(target)
             cleanup_start = target.parent
         else:
@@ -609,7 +615,7 @@ def api_delete():
         # Clean up dedup state
         deleted_rel = str(target.relative_to(_DOWNLOAD_DIR)).replace("\\", "/")
         global _DEDUP_INDEX, _PENDING_DUPS
-        if target.is_dir():
+        if target_was_dir:
             prefix = deleted_rel + "/"
             _DEDUP_INDEX = {k: v for k, v in _DEDUP_INDEX.items()
                             if not k.startswith(prefix) and k != deleted_rel}
@@ -623,7 +629,6 @@ def api_delete():
                              if d["new_file"] != deleted_rel
                              and d["match_file"] != deleted_rel]
 
-        download_root = _DOWNLOAD_DIR.resolve()
         return {
             "success": True,
             "removed_empty_dirs": [

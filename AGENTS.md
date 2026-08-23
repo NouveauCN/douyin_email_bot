@@ -23,7 +23,7 @@ web_login.py            Flask QR login service
 file_browser.py         Flask browser, playlist, upload, dedup, and delete UI
 play.py                 Local shuffled MP4 player
 migrate_downloads.py    One-shot slideshow layout migration
-test_download.py        Live Douyin smoke download
+smoke_download.py       Live Douyin smoke download
 config.yaml             Non-secret runtime configuration
 Dockerfile              Python 3.12 image with FFmpeg, Playwright, and yutto
 docker-compose.yml      bot, web_login, and file_browser services
@@ -40,12 +40,14 @@ IMAP -> EmailBot -> UrlExtractor -> platform downloader -> SMTP reply
 - Never commit credentials, cookies, yutto auth files, Firefox profiles,
   downloaded media, or logs. Secrets belong in the gitignored `.env`.
 - Preserve unrelated user changes in a dirty worktree.
-- Do not casually run `test_download.py`: it uses a hardcoded live URL, valid
+- Do not casually run `smoke_download.py`: it uses a hardcoded live URL, valid
   credentials, network access, and the configured download destination.
 - Network, IMAP, SMTP, browser, and download failures must be logged and handled
   without terminating the long-running poll loop.
 - Preserve `_safe_subpath()` checks around every `file_browser.py` route that
   accepts a user path.
+- Destructive file-browser routes must reject any path that resolves to the
+  download root itself.
 - `file_browser.py` is unauthenticated and writable: upload, delete, and
   duplicate-resolution endpoints modify the download tree. Keep it trusted-LAN
   only unless an explicit security change is requested.
@@ -66,8 +68,8 @@ IMAP -> EmailBot -> UrlExtractor -> platform downloader -> SMTP reply
 - tolerates empty Bark configuration.
 
 Moving F2-dependent imports above this bootstrap reproduces import-time crashes
-or HTTP 200 responses with empty Douyin data. `test_download.py` duplicates the
-patches and must stay synchronized until they move into a shared module.
+or HTTP 200 responses with empty Douyin data. `f2_bootstrap.py` is the shared
+bootstrap used by both entry points; keep it before any F2-dependent imports.
 
 ## Runtime Invariants
 
@@ -97,9 +99,13 @@ patches and must stay synchronized until they move into a shared module.
   `<root>/<author>/<YYYYMMDD_HHMMSS>_<aweme_id>.mp4` when folderized.
 - Static slideshow images go to `<root>/slides/`; animated MP4 clips follow the
   author-folder layout. Extension detection is heuristic and defaults to WebP.
+- Slideshow retries reuse completed items by aweme ID and item index even when
+  the timestamp prefix changes, so partial-success retries do not duplicate files.
 - Downloaded images, regular videos, and animated clips pass through the shared
   `media_processor.py` edge-crop pipeline. Post-processing failures must not
   turn successful downloads into failures.
+- Media downloads stream into unique same-directory temporary files and replace
+  the destination atomically; empty files are never treated as successful.
 - `douyin.max_tasks` is configured but single downloads currently force one
   task.
 
@@ -146,13 +152,14 @@ patches and must stay synchronized until they move into a shared module.
 - First login may be interactive; later extraction reuses the profile headlessly.
 - QR generation opens the Douyin login dialog, captures the complete viewport,
   and serializes Firefox access between QR and status requests.
+- QR status responses must never expose cookie contents to the browser and must
+  remain non-cacheable; successful cookies are persisted server-side only.
 - Keep auth-cookie indicators aligned between `cookie_extractor.py` and
   `douyin_downloader.py`.
 - `.env` update helpers currently write in place rather than atomically. Keep
   their formatting consistent and prefer a shared atomic implementation when
   changing them.
-- YAML loads `cookie_extractor.headless` and `.validate`, but email-triggered
-  extraction currently hardcodes both to `True`.
+- Email-triggered extraction honors `cookie_extractor.headless` and `.validate`.
 
 ## Configuration And Paths
 
@@ -170,7 +177,7 @@ Relative configured paths resolve against the directory containing
 
 The checked-in config points downloads directly at
 `/srv/nas_data/douyin_downloads`. Docker overrides that host path with
-`/app/downloads`. `test_download.py` and `migrate_downloads.py` follow the
+`/app/downloads`. `smoke_download.py` and `migrate_downloads.py` follow the
 configured path, while `play.py` ignores `config.yaml` and defaults to the
 checkout-local `./downloads/`. Pass the NAS path explicitly when using it on the
 deployment host.
@@ -246,12 +253,10 @@ sudo docker compose down
 
 ## Known Gaps
 
-- `README.md` and `.env.example` still contain legacy cookie instructions and
-  stale default paths.
 - The thumbnail cache is fixed at `/app/.thumb_cache`.
 - Flask HTML, CSS, and JavaScript remain inline in Python modules.
-- The unused cookie-extractor configuration fields should eventually be
-  corrected rather than documented indefinitely.
+- `pyproject.toml`/`uv.lock` and Docker's `requirements.txt` still duplicate the
+  primary dependency declarations.
 
 Any substantial change to architecture, media layout, configuration,
 dependencies, or startup/deployment behavior must update this file.

@@ -9,6 +9,7 @@ import email
 import imaplib
 import json
 import logging
+import math
 import os
 import re
 import smtplib
@@ -32,6 +33,8 @@ _TRANSIENT_ERROR_HINTS = ("超时", "网络连接失败", "网络", "timeout", "
 
 def _format_success_reply(result: dict, filepath: str, prefix: str = "下载完成！") -> str:
     """Format a download success reply, including multi-file Bilibili results."""
+    if result.get("partial"):
+        prefix = "部分下载完成。"
     title = result.get("title") or "未知标题"
     lines = [prefix, f"标题：{title}", f"保存位置：{filepath}"]
 
@@ -53,11 +56,21 @@ def _format_success_reply(result: dict, filepath: str, prefix: str = "下载完�
         if len(covers) > 5:
             lines.append(f"- ...另有 {len(covers) - 5} 张封面")
 
+    if result.get("partial"):
+        failed_count = int(result.get("failed_count") or 0)
+        lines.append(f"注意：有 {failed_count} 个资源下载失败，本次仅保存了上述文件。")
+        for detail in (result.get("failed_items") or [])[:5]:
+            lines.append(f"- {detail}")
+        if result.get("retry_queued"):
+            lines.append("失败资源已加入自动重试队列；已下载的文件不会重复下载。")
+
     return "\n".join(lines)
 
 
 def _success_subject_status(result: dict, refreshed_cookie: bool = False) -> str:
     """Build a short status phrase for reply subjects."""
+    if result.get("partial"):
+        return f"部分成功（{result.get('file_count', 0)}个文件）"
     files = result.get("files") or []
     file_count = result.get("file_count") or len(files)
     if file_count > 1:
@@ -252,6 +265,17 @@ class EmailBot:
         result = self._download_url(url)
 
         if result["success"]:
+            partial_error = _partial_failure_error(result)
+            if partial_error and _is_transient_failure(partial_error):
+                self._enqueue_retry(
+                    url=url,
+                    sender=sender,
+                    subject=subject,
+                    platform=platform or "unknown",
+                    error_msg=partial_error,
+                    bot_cfg=bot_cfg,
+                )
+                result["retry_queued"] = True
             self._cooldowns[sender] = time.time()
             filepath = result["filepath"] or "未知路径"
             logger.info(
@@ -303,6 +327,8 @@ class EmailBot:
                 logger.info("Attempting auto cookie refresh from Firefox profile...")
                 refreshed_cookie, refresh_msg = _try_extract_cookie(
                     profile_dir=self.config.cookie_extractor.profile_dir or None,
+                    headless=self.config.cookie_extractor.headless,
+                    validate=self.config.cookie_extractor.validate,
                 )
                 if refreshed_cookie and refreshed_cookie != self.downloader.config.cookie:
                     # Hot-reload new cookie and retry
@@ -400,7 +426,7 @@ class EmailBot:
         now = time.time()
         key = self._retry_key(sender, url)
         existing = self._pending_retries.get(key, {})
-        attempts = int(existing.get("attempts", 0)) + 1
+        attempts = _retry_attempts(existing, key) + 1
         item = {
             "url": url,
             "sender": sender,
@@ -426,10 +452,22 @@ class EmailBot:
             return
 
         now = time.time()
-        due_keys = [
-            key for key, item in self._pending_retries.items()
-            if float(item.get("next_attempt_at", 0)) <= now
-        ]
+        due_keys = []
+        invalid_keys = []
+        for key, item in self._pending_retries.items():
+            if not isinstance(item, dict):
+                logger.warning("Discarding malformed pending retry %s: expected an object", key)
+                invalid_keys.append(key)
+                continue
+            next_attempt_at = _retry_next_attempt_at(item, key)
+            if next_attempt_at is None:
+                invalid_keys.append(key)
+            elif next_attempt_at <= now:
+                due_keys.append(key)
+        if invalid_keys:
+            for key in invalid_keys:
+                self._pending_retries.pop(key, None)
+            self._save_pending_retries()
         if not due_keys:
             return
 
@@ -440,7 +478,10 @@ class EmailBot:
 
             url = item.get("url", "")
             sender = item.get("sender", "")
-            attempts = int(item.get("attempts", 0))
+            attempts = _retry_attempts(item, key)
+            # Normalize malformed values so a later retry does not encounter
+            # the same bad value again.
+            item["attempts"] = attempts
             logger.info(
                 "Retrying transient failure %d/%d for %s: %s",
                 attempts + 1,
@@ -449,8 +490,9 @@ class EmailBot:
                 url,
             )
             result = self._download_url(url)
+            partial_error = _partial_failure_error(result)
 
-            if result["success"]:
+            if result["success"] and not partial_error:
                 self._pending_retries.pop(key, None)
                 self._save_pending_retries()
                 filepath = result["filepath"] or "未知路径"
@@ -467,7 +509,7 @@ class EmailBot:
                 )
                 continue
 
-            error_msg = result.get("error") or "未知错误"
+            error_msg = partial_error or result.get("error") or "未知错误"
             attempts += 1
             item["attempts"] = attempts
             item["last_error"] = error_msg
@@ -476,16 +518,21 @@ class EmailBot:
                 self._pending_retries.pop(key, None)
                 self._save_pending_retries()
                 self._record_failed_link(item, error_msg)
+                retry_prefix = (
+                    "自动重试后仍有部分资源未下载，已把链接保存到失败清单。"
+                    if result.get("partial") else
+                    "自动重试后仍未下载成功，已把链接保存到失败清单。"
+                )
                 self._send_reply(
                     cfg,
                     sender,
                     (
-                        "自动重试后仍未下载成功，已把链接保存到失败清单。\n"
+                        f"{retry_prefix}\n"
                         f"链接：{url}\n"
                         f"失败清单：{self._failed_links_file}\n"
                         f"最后错误：{error_msg}"
                     ),
-                    subject_status="重试失败",
+                    subject_status="部分资源重试失败" if result.get("partial") else "重试失败",
                 )
                 continue
 
@@ -592,6 +639,8 @@ class EmailBot:
 
         cookie_str, status_msg = _try_extract_cookie(
             profile_dir=self.config.cookie_extractor.profile_dir or None,
+            headless=self.config.cookie_extractor.headless,
+            validate=self.config.cookie_extractor.validate,
         )
 
         if cookie_str:
@@ -734,6 +783,36 @@ def _is_transient_failure(error_msg: str | None) -> bool:
     return any(hint in lowered for hint in _TRANSIENT_ERROR_HINTS)
 
 
+def _partial_failure_error(result: dict) -> str | None:
+    """Return retryable detail for a partial result without breaking success/error semantics."""
+    if not result.get("partial"):
+        return None
+    details = [str(item) for item in (result.get("failed_items") or []) if item]
+    return "；".join(details) or None
+
+
+def _retry_attempts(item: dict, key: str) -> int:
+    """Read retry attempts without letting one malformed item abort polling."""
+    try:
+        return max(0, int(item.get("attempts", 0)))
+    except (TypeError, ValueError, OverflowError):
+        logger.warning("Malformed attempts for pending retry %s; treating as zero", key)
+        return 0
+
+
+def _retry_next_attempt_at(item: dict, key: str) -> float | None:
+    """Read a retry timestamp, returning None for malformed entries."""
+    try:
+        value = float(item.get("next_attempt_at", 0))
+    except (TypeError, ValueError, OverflowError):
+        logger.warning("Malformed next_attempt_at for pending retry %s; discarding item", key)
+        return None
+    if not math.isfinite(value):
+        logger.warning("Malformed next_attempt_at for pending retry %s; discarding item", key)
+        return None
+    return value
+
+
 def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
@@ -767,15 +846,22 @@ def _write_env(env_path: Path, key: str, value: str) -> bool:
 
 # ── Browser cookie extraction ─────────────────────────────────────
 
-def _try_extract_cookie(profile_dir: Path | None = None) -> tuple[str | None, str]:
+def _try_extract_cookie(
+    profile_dir: Path | None = None,
+    *,
+    headless: bool = True,
+    validate: bool = True,
+) -> tuple[str | None, str]:
     """Extract douyin.com cookies via headless Playwright Firefox.
 
     Args:
         profile_dir: Firefox profile directory (None = use default).
+        headless: Whether Firefox should run without a visible window.
+        validate: Whether to validate the extracted cookie.
 
     Returns:
         (cookie_string_or_None, status_message).
     """
     from cookie_extractor import extract_cookies  # noqa: E402
 
-    return extract_cookies(profile_dir=profile_dir, headless=True, validate=True)
+    return extract_cookies(profile_dir=profile_dir, headless=headless, validate=validate)
