@@ -53,7 +53,7 @@ class UploadFormTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn(
-            'href="https://192.168.1.94:8082/files/comics/pics/"', page
+            'href="http://192.168.1.94:8082/files/comics/pics/"', page
         )
         self.assertIn("二次元图片", page)
         self.assertIn('target="_blank"', page)
