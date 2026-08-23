@@ -51,6 +51,7 @@ _DOUYIN_REDIRECT_HOSTS = frozenset({
     "douyin.com",
     "www.douyin.com",
     "m.douyin.com",
+    "www.iesdouyin.com",
 })
 SHORT_LINK_CACHE_PATH = Path(
     os.getenv("DOUYIN_SHORT_LINK_CACHE")
