@@ -59,6 +59,35 @@ class UploadFormTests(unittest.TestCase):
         self.assertIn('target="_blank"', page)
         self.assertIn('rel="noopener noreferrer"', page)
 
+    def test_home_local_sections_start_collapsed(self):
+        (self.download_dir / "author").mkdir()
+        (self.download_dir / "author" / "sample.mp4").write_bytes(b"video")
+        (self.download_dir / "slides").mkdir()
+        (self.download_dir / "slides" / "sample.png").write_bytes(_TEST_PNG)
+
+        page = self.client.get("/").get_data(as_text=True)
+
+        self.assertIn(
+            '<div class="section-header collapsed" onclick="toggleSection(this)"'
+            ' title="点击折叠/展开">\n    <span class="arrow">▼</span> 📹 视频',
+            page,
+        )
+        self.assertIn(
+            '<div class="section-header collapsed" onclick="toggleSection(this)"'
+            ' title="点击折叠/展开"\n       style="margin-top:10px">\n'
+            '    <span class="arrow">▼</span> 🖼️ 图片',
+            page,
+        )
+        self.assertEqual(page.count('class="collapsible-body card-grid collapsed"'), 2)
+        self.assertIn("header.className = 'section-header collapsed';", page)
+        self.assertIn(
+            "body.className = 'collapsible-body dup-section collapsed';", page
+        )
+        self.assertIn(
+            '<a class="section-header external-section-link" href="http://192.168.1.94:8082/files/comics/pics/"',
+            page,
+        )
+
     def test_enhanced_mobile_upload_returns_json(self):
         response = self.client.post(
             "/api/upload",
