@@ -53,7 +53,7 @@ from media_processor import (  # noqa: E402
 _config = load_config(_PROJECT_DIR / "config.yaml")
 _DOWNLOAD_DIR = Path(_config.douyin.download_path)
 _THUMB_CACHE = Path("/app/.thumb_cache")
-_COMICS_PICS_URL = "https://192.168.1.94:8082/files/comics/pics/"
+_COMICS_PICS_URL = "http://192.168.1.94:8082/files/comics/pics/"
 
 # ── App setup ─────────────────────────────────────────────────────────
 
