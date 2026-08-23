@@ -253,6 +253,7 @@ sudo docker compose down
 
 ## Known Gaps
 
+- The prioritized remediation and upgrade sequence is tracked in `ROADMAP.md`.
 - The thumbnail cache is fixed at `/app/.thumb_cache`.
 - Flask HTML, CSS, and JavaScript remain inline in Python modules.
 - `pyproject.toml`/`uv.lock` and Docker's `requirements.txt` still duplicate the
