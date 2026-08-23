@@ -91,6 +91,8 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
 - Retry cookie-like Douyin failures once after Firefox extraction succeeds.
 - Persist transient network/timeout failures in the configured retry queue;
   exhausted links go to the configured failure file.
+- In Docker, keep the retry queue and failure file under the bot's named
+  `state` volume (`/app/state`); do not rely on the container writable layer.
 - Cache successful `v.douyin.com` resolutions so later attempts can use the
   aweme ID without repeating flaky redirects.
 - Resolve `v.douyin.com` short links over verified HTTPS only. Accept redirects
@@ -198,6 +200,10 @@ and `BILIBILI_AUTH`; `BILIBILI_AUTH_FILE` may reference sensitive login state.
 Relative configured paths resolve against the directory containing
 `config.yaml`, not the process working directory.
 
+`BOT_TRANSIENT_PENDING_FILE` and `BOT_TRANSIENT_FAILED_FILE` override the
+transient retry queue and exhausted-link file paths. The Docker bot sets them
+to `/app/state/pending_retries.json` and `/app/state/failed_links.txt`.
+
 The checked-in config points downloads directly at
 `/srv/nas_data/douyin_downloads`. Docker overrides that host path with
 `/app/downloads`. `smoke_download.py` and `migrate_downloads.py` follow the
@@ -261,8 +267,9 @@ sudo docker compose --profile login up web_login
 sudo docker compose down
 ```
 
-- The bot owns the logs volume; bot and `web_login` share the Firefox-profile
-  volume.
+- The bot owns the `logs` and `state` volumes; `state` persists
+  `pending_retries.json` and `failed_links.txt` across bot container rebuilds.
+  Bot and `web_login` share the Firefox-profile volume.
 - Bot and `file_browser` bind the host NAS root to `/app/downloads`.
 - `file_browser` also mounts `/srv/nas_data/comics` read-only at `/app/comics`
   and uses `COMICS_PICS_PATH=/app/comics/pics` for the in-site comics gallery.

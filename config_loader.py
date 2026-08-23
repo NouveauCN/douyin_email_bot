@@ -32,6 +32,8 @@ Docker env-var overrides:
     CODEX_MODEL — overrides codex.model
     CODEX_MAX_OUTPUT_CHARS — overrides codex.max_output_chars
     CODEX_NOTIFY_EMAIL — overrides codex.notify_email
+    BOT_TRANSIENT_PENDING_FILE — overrides bot.transient_pending_file
+    BOT_TRANSIENT_FAILED_FILE — overrides bot.transient_failed_file
     MEDIA_BACKUP_RETENTION_DAYS — overrides media_cleanup.backup_retention_days
     MEDIA_BACKUP_CHECK_INTERVAL_DAYS — overrides media_cleanup.check_interval_days
     COOKIE_PROFILE_DIR    — overrides cookie_extractor.profile_dir
@@ -303,11 +305,17 @@ def load_config(path: Path) -> AppConfig:
         ),
         transient_pending_file=_resolve_project_path(
             path,
-            bot_raw.get("transient_pending_file", "./pending_retries.json"),
+            _env_str(
+                "BOT_TRANSIENT_PENDING_FILE",
+                bot_raw.get("transient_pending_file", "./pending_retries.json"),
+            ),
         ),
         transient_failed_file=_resolve_project_path(
             path,
-            bot_raw.get("transient_failed_file", "./failed_links.txt"),
+            _env_str(
+                "BOT_TRANSIENT_FAILED_FILE",
+                bot_raw.get("transient_failed_file", "./failed_links.txt"),
+            ),
         ),
         commands=bot_commands,
     )
