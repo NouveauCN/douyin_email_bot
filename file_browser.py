@@ -1408,7 +1408,7 @@ INDEX_HTML = (
   <div id="dupSection"></div>
 
   {% if videos %}
-  <div class="section-header collapsed" onclick="toggleSection(this)" title="点击折叠/展开">
+  <div class="section-header collapsed" data-section="videos" onclick="toggleSection(this)" title="点击折叠/展开">
     <span class="arrow">▼</span> 📹 视频
     <span class="section-count">{{ videos | length }} 个</span>
   </div>
@@ -1430,7 +1430,7 @@ INDEX_HTML = (
   {% endif %}
 
   {% if slides %}
-  <div class="section-header collapsed" onclick="toggleSection(this)" title="点击折叠/展开"
+  <div class="section-header collapsed" data-section="images" onclick="toggleSection(this)" title="点击折叠/展开"
        style="margin-top:{% if videos %}10{% else %}0{% endif %}px">
     <span class="arrow">▼</span> 🖼️ 图片
     <span class="section-count">{{ slides | length }} 张</span>
@@ -1452,7 +1452,7 @@ INDEX_HTML = (
   </div>
   {% endif %}
 
-  <div class="section-header collapsed" onclick="toggleSection(this)" title="点击折叠/展开"
+  <div class="section-header collapsed" data-section="comics" onclick="toggleSection(this)" title="点击折叠/展开"
        style="margin-top:{% if videos or slides %}10{% else %}0{% endif %}px">
     <span class="arrow">▼</span> 🖼️ 二次元图片
     <span class="section-count">{{ comics_images | length }} 张</span>
@@ -1492,6 +1492,59 @@ function toggleSection(header) {
   header.classList.toggle('collapsed');
   header.nextElementSibling.classList.toggle('collapsed');
 }
+var savedSectionState = null;
+function restoreSectionState() {
+  if (savedSectionState === null) {
+    savedSectionState = {};
+    try {
+      savedSectionState = JSON.parse(
+        sessionStorage.getItem('fileBrowserSectionState') || '{}'
+      );
+      sessionStorage.removeItem('fileBrowserSectionState');
+    } catch (e) {}
+  }
+  document.querySelectorAll('.section-header[data-section]').forEach(function(header) {
+    if (savedSectionState[header.dataset.section] !== true) return;
+    header.classList.remove('collapsed');
+    if (header.nextElementSibling) {
+      header.nextElementSibling.classList.remove('collapsed');
+    }
+  });
+}
+function reloadPreservingSections() {
+  var state = {};
+  document.querySelectorAll('.section-header[data-section]').forEach(function(header) {
+    state[header.dataset.section] = !header.classList.contains('collapsed');
+  });
+  try {
+    sessionStorage.setItem('fileBrowserSectionState', JSON.stringify(state));
+  } catch (e) {}
+  location.reload();
+}
+function removeDeletedCard(card) {
+  if (!card) {
+    reloadPreservingSections();
+    return;
+  }
+  var body = card.parentElement;
+  var header = body && body.previousElementSibling;
+  card.remove();
+  if (!body || !header) return;
+  var hasCards = Array.from(body.children).some(function(child) {
+    return child.classList.contains('card');
+  });
+  if (!hasCards) {
+    header.remove();
+    body.remove();
+    return;
+  }
+  var count = header.querySelector('.section-count');
+  if (count) {
+    var remaining = body.querySelectorAll('.card').length;
+    count.textContent = remaining + (header.dataset.section === 'videos' ? ' 个' : ' 张');
+  }
+}
+restoreSectionState();
 function confirmDelete(event, path, label) {
   event.stopPropagation();
   event.preventDefault();
@@ -1501,7 +1554,7 @@ function confirmDelete(event, path, label) {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({path: path})
   }).then(r => r.json()).then(function(data) {
-    if (data.success) location.reload();
+    if (data.success) removeDeletedCard(event.target.closest('.card'));
     else alert('删除失败: ' + (data.error || '未知错误'));
   }).catch(function(e) { alert('请求失败: ' + e.message); });
 }
@@ -1552,7 +1605,7 @@ uploadForm.addEventListener('submit', function(event) {
             data.failed_count ? '#fff3cd' : '#d4edda',
             data.failed_count ? '#856404' : '#155724'
           );
-          setTimeout(function() { location.reload(); }, 1800);
+          setTimeout(reloadPreservingSections, 1800);
         } else {
           uploadSubmit.disabled = false;
           uploadInput.value = '';
@@ -1573,7 +1626,7 @@ uploadForm.addEventListener('submit', function(event) {
             '#d4edda', '#155724'
           );
         }
-        setTimeout(function() { location.reload(); }, 1500);
+        setTimeout(reloadPreservingSections, 1500);
       } else {
         uploadSubmit.disabled = false;
         uploadInput.value = '';
@@ -1600,6 +1653,7 @@ function loadDups() {
 
       var header = document.createElement('div');
       header.className = 'section-header collapsed';
+      header.dataset.section = 'duplicates';
       header.title = '点击折叠/展开';
       header.onclick = function() { toggleSection(header); };
       header.innerHTML = '<span class="arrow">▼</span> ⚠️ 待确认重复' +
@@ -1684,6 +1738,7 @@ function loadDups() {
       });
 
       container.appendChild(body);
+      restoreSectionState();
     }).catch(function() {});
 }
 function resolveDup(path, action, label) {
@@ -1694,7 +1749,7 @@ function resolveDup(path, action, label) {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({path: path})
   }).then(function(r) { return r.json(); }).then(function(data) {
-    if (data.success) location.reload();
+    if (data.success) reloadPreservingSections();
     else alert('操作失败: ' + (data.error || '未知错误'));
   }).catch(function(e) { alert('请求失败: ' + e.message); });
 }
