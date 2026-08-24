@@ -1,6 +1,6 @@
 import json
 
-from failure_flag import FailureFlagStore, failure_flag_key
+from failure_flag import FailureFlagStore, ProcessRequestStore, failure_flag_key
 
 
 def test_failure_flag_round_trip_and_clear(tmp_path):
@@ -28,3 +28,26 @@ def test_failure_flag_round_trip_and_clear(tmp_path):
 
     assert store.clear("sender@example.com", "https://example.invalid/video")
     assert json.loads(path.read_text(encoding="utf-8")) == {}
+
+
+def test_process_request_atomic_roundtrip_and_filters(tmp_path):
+    store = ProcessRequestStore(tmp_path / "requests")
+
+    first = store.create_request(
+        sender="one@example.com",
+        url="https://example.invalid/one",
+        subject="处理失败",
+    )
+    second = store.create_request(sender="two@example.com")
+
+    assert first != second
+    assert first.exists() and second.exists()
+    assert not list((tmp_path / "requests").glob("*.tmp"))
+    assert store.list_requests(sender="one@example.com")[0][1]["url"] == (
+        "https://example.invalid/one"
+    )
+    assert store.list_requests(url="https://example.invalid/one")[0][0] == first
+    assert store.list_requests(sender="missing@example.com") == []
+
+    assert store.delete_request(first)
+    assert store.list_requests(url="https://example.invalid/one") == []

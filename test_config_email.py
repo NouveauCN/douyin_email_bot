@@ -60,12 +60,18 @@ codex:
     )
     monkeypatch.setenv("CODEX_FAILURE_FLAG_ENABLED", "false")
     monkeypatch.setenv("CODEX_FAILURE_FLAG_FILE", "state/env-flags.json")
+    monkeypatch.setenv("CODEX_PROCESS_REQUEST_DIR", "state/requests")
+    monkeypatch.setenv("CODEX_AUTO_INTERVAL_SECONDS", "42")
     monkeypatch.setenv("CODEX_NOTIFY_EMAIL", "env@example.com")
 
     config = load_config(config_path)
 
     assert config.codex.enabled is False
     assert config.codex.flag_file == str((tmp_path / "state/env-flags.json").resolve())
+    assert config.codex.process_request_dir == str(
+        (tmp_path / "state/requests").resolve()
+    )
+    assert config.codex.interval_seconds == 42
     assert config.codex.notify_email == "env@example.com"
 
 
@@ -249,7 +255,7 @@ def test_failure_alert_contains_actionable_context(tmp_path):
     assert str(tmp_path / "failed.txt") in body
 
 
-def test_failure_notifications_include_owner_without_duplicate(monkeypatch):
+def test_failure_notifications_only_include_requester(monkeypatch):
     bot = object.__new__(EmailBot)
     bot.config = SimpleNamespace(
         codex=SimpleNamespace(notify_email="owner@example.com")
@@ -266,7 +272,7 @@ def test_failure_notifications_include_owner_without_duplicate(monkeypatch):
         "failure details",
         "下载失败",
     )
-    assert sent == ["requester@example.com", "owner@example.com"]
+    assert sent == ["requester@example.com"]
 
     sent.clear()
     bot._send_failure_notifications(
@@ -275,7 +281,7 @@ def test_failure_notifications_include_owner_without_duplicate(monkeypatch):
     assert sent == ["owner@example.com"]
 
 
-def test_partial_failure_notification_is_sent_to_requester_and_owner(tmp_path):
+def test_partial_failure_notification_is_sent_only_to_requester(tmp_path):
     bot = object.__new__(EmailBot)
     bot.config = SimpleNamespace(
         codex=SimpleNamespace(notify_email="owner@example.com")
@@ -295,8 +301,37 @@ def test_partial_failure_notification_is_sent_to_requester_and_owner(tmp_path):
         "部分资源失败",
     )
 
-    assert [recipient for recipient, _, _ in sent] == [
-        "requester@example.com",
-        "owner@example.com",
-    ]
+    assert [recipient for recipient, _, _ in sent] == ["requester@example.com"]
     assert all("视频下载失败详细通知" in body for _, body, _ in sent)
+
+
+def test_codex_process_command_writes_request_and_replies_only_to_sender(tmp_path):
+    from failure_flag import ProcessRequestStore
+
+    bot = object.__new__(EmailBot)
+    bot.config = SimpleNamespace(
+        codex=SimpleNamespace(process_request_dir=str(tmp_path / "requests"))
+    )
+    bot.extractor = SimpleNamespace(
+        extract=lambda text: "https://example.invalid/video"
+    )
+    bot._process_requests = ProcessRequestStore(tmp_path / "requests")
+    sent = []
+    bot._send_reply = lambda cfg, recipient, body, subject_status: sent.append(
+        (recipient, body, subject_status)
+    )
+
+    class Mail:
+        def store(self, *args):
+            self.seen = args
+
+    bot._handle_codex_process(
+        Mail(), b"7", SimpleNamespace(), "requester@example.com", "处理失败", "url"
+    )
+
+    requests = bot._process_requests.list_requests()
+    assert len(requests) == 1
+    assert requests[0][1]["sender"] == "requester@example.com"
+    assert requests[0][1]["url"] == "https://example.invalid/video"
+    assert [item[0] for item in sent] == ["requester@example.com"]
+    assert "已请求宿主机 Codex 处理" in sent[0][1]

@@ -27,6 +27,14 @@ Docker env-var overrides:
     CODEX_FAILURE_FLAG_ENABLED — overrides codex.enabled
     CODEX_NOTIFY_EMAIL — overrides codex.notify_email
     CODEX_FAILURE_FLAG_FILE — overrides codex.flag_file
+    CODEX_PROCESS_REQUEST_DIR — overrides codex.process_request_dir
+    CODEX_EXECUTABLE — overrides codex.executable
+    CODEX_SANDBOX — overrides codex.sandbox
+    CODEX_TIMEOUT_SECONDS — overrides codex.timeout_seconds
+    CODEX_WORKING_DIRECTORY — overrides codex.working_directory
+    CODEX_MODEL — overrides codex.model
+    CODEX_MAX_OUTPUT_CHARS — overrides codex.max_output_chars
+    CODEX_AUTO_INTERVAL_SECONDS — overrides codex.interval_seconds
     BOT_TRANSIENT_PENDING_FILE — overrides bot.transient_pending_file
     BOT_TRANSIENT_FAILED_FILE — overrides bot.transient_failed_file
     MEDIA_BACKUP_RETENTION_DAYS — overrides media_cleanup.backup_retention_days
@@ -139,6 +147,7 @@ class BotCommands:
 
     cookie_update: str = "更新cookie"  # Paste new cookie in body
     cookie_auto: str = "自动获取cookie"  # Auto-extract from browser
+    codex_process: str = "处理失败"  # Ask the host worker to process failures
 
 
 @dataclass
@@ -160,7 +169,16 @@ class CodexConfig:
     """Failure FLAG settings for host-side Codex diagnosis."""
 
     enabled: bool = True
-    flag_file: str = "./codex_failure_flags.json"
+    flag_file: str = "./codex_state/codex_failure_flags.json"
+    process_request_dir: str = "./codex_state/process_requests"
+    executable: str = "codex"
+    sandbox: str = "read-only"
+    timeout_seconds: int = 900
+    working_directory: str = "."
+    model: str = ""
+    max_output_chars: int = 12000
+    interval_seconds: int = 3600
+    # Deprecated compatibility setting; it is never used as a recipient.
     notify_email: str = ""
 
 
@@ -277,6 +295,7 @@ def load_config(path: Path) -> AppConfig:
     bot_commands = BotCommands(
         cookie_update=cmd_raw.get("cookie_update", "更新cookie"),
         cookie_auto=cmd_raw.get("cookie_auto", "自动获取cookie"),
+        codex_process=cmd_raw.get("codex_process", "处理失败"),
     )
     bot = BotConfig(
         allowed_senders=_parse_allowed_senders(
@@ -326,7 +345,39 @@ def load_config(path: Path) -> AppConfig:
             path,
             _env_str(
                 "CODEX_FAILURE_FLAG_FILE",
-                codex_raw.get("flag_file", "./codex_failure_flags.json"),
+                codex_raw.get("flag_file", "./codex_state/codex_failure_flags.json"),
+            ),
+        ),
+        process_request_dir=_resolve_project_path(
+            path,
+            _env_str(
+                "CODEX_PROCESS_REQUEST_DIR",
+                codex_raw.get("process_request_dir", "./codex_state/process_requests"),
+            ),
+        ),
+        executable=_env_str("CODEX_EXECUTABLE", codex_raw.get("executable", "codex")),
+        sandbox=_env_str("CODEX_SANDBOX", codex_raw.get("sandbox", "read-only")),
+        timeout_seconds=max(
+            1,
+            _env_int("CODEX_TIMEOUT_SECONDS", codex_raw.get("timeout_seconds", 900)),
+        ),
+        working_directory=_resolve_project_path(
+            path,
+            _env_str(
+                "CODEX_WORKING_DIRECTORY", codex_raw.get("working_directory", ".")
+            ),
+        ),
+        model=_env_str("CODEX_MODEL", codex_raw.get("model", "")),
+        max_output_chars=max(
+            1,
+            _env_int(
+                "CODEX_MAX_OUTPUT_CHARS", codex_raw.get("max_output_chars", 12000)
+            ),
+        ),
+        interval_seconds=max(
+            1,
+            _env_int(
+                "CODEX_AUTO_INTERVAL_SECONDS", codex_raw.get("interval_seconds", 3600)
             ),
         ),
         notify_email=_env_str("CODEX_NOTIFY_EMAIL", codex_raw.get("notify_email", "")),

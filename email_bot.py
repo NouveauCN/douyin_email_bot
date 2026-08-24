@@ -23,7 +23,7 @@ from backup_cleanup import BackupCleanupScheduler
 from bilibili_downloader import BilibiliDownloader
 from colorama import Fore, Style
 from douyin_downloader import DouyinDownloader
-from failure_flag import FailureFlagStore
+from failure_flag import FailureFlagStore, ProcessRequestStore
 from url_extractor import UrlExtractor, detect_platform
 
 logger = logging.getLogger("EmailBot")
@@ -139,6 +139,7 @@ class EmailBot:
         self._seen_ids: set[str] = set()  # dedup across poll cycles
         self._pending_retries: dict[str, dict] = {}
         self._failure_flags = FailureFlagStore(config.codex.flag_file)
+        self._process_requests = ProcessRequestStore(config.codex.process_request_dir)
         self._pending_retry_file = Path(config.bot.transient_pending_file)
         self._failed_links_file = Path(config.bot.transient_failed_file)
         self._backup_cleanup = BackupCleanupScheduler(
@@ -278,6 +279,11 @@ class EmailBot:
 
         body = _get_body_text(msg)
         commands = bot_cfg.commands
+
+        # ── Command: ask the host worker to process failure FLAGs ───
+        if commands.codex_process and commands.codex_process in subject:
+            self._handle_codex_process(mail, msg_id, cfg, sender, subject, body)
+            return
 
         # ── Command: cookie update (manual paste) ──────────────────
         if commands.cookie_update and commands.cookie_update in subject:
@@ -771,27 +777,52 @@ class EmailBot:
         body: str,
         subject_status: str,
     ) -> None:
-        """Send the detailed failure report to the requester and bot owner."""
+        """Send the detailed failure report only to the original requester."""
         body = _redact_sensitive_text(body, self.config, cfg)
-        recipients = [sender]
-        owner = self._codex_notify_email(cfg)
-        if owner and owner not in recipients:
-            recipients.append(owner)
+        try:
+            self._send_reply(cfg, sender, body, subject_status=subject_status)
+        except Exception:
+            logger.exception("Failed to send failure notification to %s", sender)
+            raise
 
-        requester_error = None
-        for recipient in recipients:
-            try:
-                self._send_reply(cfg, recipient, body, subject_status=subject_status)
-            except Exception as exc:
-                logger.exception("Failed to send failure notification to %s", recipient)
-                if recipient == sender:
-                    requester_error = exc
-        if requester_error is not None:
-            raise requester_error
+    def _handle_codex_process(
+        self,
+        mail,
+        msg_id,
+        cfg,
+        sender: str,
+        subject: str,
+        body: str,
+    ) -> None:
+        """Queue a host-side Codex request without executing Codex in the bot."""
+        url = self.extractor.extract(subject + " " + body) or ""
+        try:
+            request_store = getattr(self, "_process_requests", None)
+            if request_store is None:
+                request_store = ProcessRequestStore(
+                    self.config.codex.process_request_dir
+                )
+                self._process_requests = request_store
+            request_store.create_request(sender=sender, url=url, subject=subject)
+        except Exception:
+            logger.exception("Failed to persist Codex process request from %s", sender)
+            self._send_reply(
+                cfg,
+                sender,
+                "宿主机 Codex 处理请求写入失败，请稍后重试。",
+                subject_status="请求失败",
+            )
+            _mark_seen(mail, msg_id)
+            return
 
-    def _codex_notify_email(self, cfg) -> str:
-        codex_cfg = getattr(getattr(self, "config", None), "codex", None)
-        return str(getattr(codex_cfg, "notify_email", "") or getattr(cfg, "email", ""))
+        scope = f"链接：{url}" if url else "将处理该发件人的全部失败记录"
+        self._send_reply(
+            cfg,
+            sender,
+            f"已请求宿主机 Codex 处理。\n{scope}",
+            subject_status="已请求宿主机处理",
+        )
+        _mark_seen(mail, msg_id)
 
     def _set_failure_flag(
         self,
