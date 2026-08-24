@@ -88,31 +88,6 @@ uv run python main.py
 Docker 部署时，失败清单和自动重试队列保存在 bot 的 `state` named volume
 中，不会因重建 bot 容器而丢失；对应文件位于容器内的
 `/app/state/failed_links.txt` 和 `/app/state/pending_retries.json`。
-Codex 失败 FLAG 与主动处理请求位于宿主机可见的 `./codex_state` 目录，容器内
-路径分别为 `/app/codex_state/codex_failure_flags.json` 和
-`/app/codex_state/process_requests/`。
-
-下载失败或部分失败时，容器只会把已脱敏的失败上下文写入
-`codex_failure_flags.json` 并置位，不在容器内安装或唤起 Codex。详细失败信息
-只发送给原始请求者。宿主机上的 worker 默认每小时扫描一次 FLAG，并使用宿主机
-已有的 Codex 处理；诊断结果也只发送给原始请求者。对应资源成功重试后，FLAG
-会自动清除。
-
-发送主题包含 `处理失败` 的邮件可主动请求宿主机立即处理；正文可选填某个抖音或
-B 站链接，不填则处理该发件人的全部待处理 FLAG。首次部署宿主机 worker：
-
-```bash
-sudo install -m 644 systemd/douyin-codex-failure-worker.service \
-  /etc/systemd/system/douyin-codex-failure-worker.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now douyin-codex-failure-worker
-```
-
-宿主机也可用以下命令查看当前待处理 FLAG：
-
-```bash
-cat ~/douyin_email_bot/codex_state/codex_failure_flags.json
-```
 
 ## 局域网 + Tailscale Web 访问
 
@@ -227,13 +202,6 @@ uv run python process_media.py "/path/to/video.mp4" --apply --force-review
 | `bot.transient_failed_file` | str | `./failed_links.txt` | 重试耗尽链接的失败清单；可由 `BOT_TRANSIENT_FAILED_FILE` 覆盖 |
 | `bot.commands.cookie_update` | str | `"更新cookie"` | 手动更新 cookie 的邮件主题关键词 |
 | `bot.commands.cookie_auto` | str | `"自动获取cookie"` | 浏览器自动提取 cookie 的邮件主题关键词 |
-| `codex.enabled` | bool | `true` | 下载失败时是否写入 FLAG；可由 `CODEX_FAILURE_FLAG_ENABLED` 覆盖 |
-| `codex.flag_file` | str | `./codex_state/codex_failure_flags.json` | 失败 FLAG 文件；可由 `CODEX_FAILURE_FLAG_FILE` 覆盖 |
-| `codex.process_request_dir` | str | `./codex_state/process_requests` | 邮件主动处理请求目录；可由 `CODEX_PROCESS_REQUEST_DIR` 覆盖 |
-| `codex.executable` | str | `"codex"` | 宿主机 Codex 可执行文件 |
-| `codex.sandbox` | str | `"read-only"` | 宿主机 Codex 沙箱权限 |
-| `codex.timeout_seconds` | int | `900` | 单次宿主机 Codex 诊断超时 |
-| `codex.interval_seconds` | int | `3600` | 宿主机自动扫描间隔（1 小时） |
 | `FILE_BROWSER_ALLOWED_ORIGINS` | str | 当前请求 origin | 文件浏览器精确允许来源（逗号分隔） |
 | `WEB_LOGIN_ALLOWED_ORIGINS` | str | 当前请求 origin | QR 服务精确允许来源（逗号分隔） |
 | `DOUYIN_SHORT_LINK_CA_BUNDLE` | str | 系统 CA | 私有 CA bundle 路径；不配置时使用正常证书校验 |
