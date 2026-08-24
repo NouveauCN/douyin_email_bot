@@ -67,21 +67,6 @@ bot:
     cookie_update: "更新cookie"
     # "自动获取cookie" — auto-extract from browser on this machine
     cookie_auto: "自动获取cookie"
-    # "处理失败" — ask the host-side worker to process failure FLAGs
-    codex_process: "处理失败"
-
-# Persist failure context for the host-side Codex diagnosis workflow.
-codex:
-  enabled: true
-  flag_file: "./codex_state/codex_failure_flags.json"
-  process_request_dir: "./codex_state/process_requests"
-  executable: "codex"
-  sandbox: "read-only"
-  timeout_seconds: 900
-  working_directory: "."
-  model: ""
-  max_output_chars: 12000
-  interval_seconds: 3600
 
 # Original media retained after automatic/manual edge cropping
 media_cleanup:

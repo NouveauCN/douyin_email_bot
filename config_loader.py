@@ -24,16 +24,6 @@ Docker env-var overrides:
     BOT_SUBJECT_KEYWORD   — overrides bot.subject_keyword
     BOT_TRANSIENT_RETRY_ATTEMPTS — overrides bot.transient_retry_attempts
     BOT_TRANSIENT_RETRY_DELAY_SECONDS — overrides bot.transient_retry_delay_seconds
-    CODEX_FAILURE_FLAG_ENABLED — overrides codex.enabled
-    CODEX_FAILURE_FLAG_FILE — overrides codex.flag_file
-    CODEX_PROCESS_REQUEST_DIR — overrides codex.process_request_dir
-    CODEX_EXECUTABLE — overrides codex.executable
-    CODEX_SANDBOX — overrides codex.sandbox
-    CODEX_TIMEOUT_SECONDS — overrides codex.timeout_seconds
-    CODEX_WORKING_DIRECTORY — overrides codex.working_directory
-    CODEX_MODEL — overrides codex.model
-    CODEX_MAX_OUTPUT_CHARS — overrides codex.max_output_chars
-    CODEX_AUTO_INTERVAL_SECONDS — overrides codex.interval_seconds
     BOT_TRANSIENT_PENDING_FILE — overrides bot.transient_pending_file
     BOT_TRANSIENT_FAILED_FILE — overrides bot.transient_failed_file
     MEDIA_BACKUP_RETENTION_DAYS — overrides media_cleanup.backup_retention_days
@@ -103,8 +93,8 @@ class EmailConfig:
     imap_port: int = 993
     smtp_server: str = "smtp.qq.com"
     smtp_port: int = 587
-    email: str = ""  # From EMAIL_ADDRESS env var
-    password: str = ""  # From EMAIL_PASSWORD env var
+    email: str = ""       # From EMAIL_ADDRESS env var
+    password: str = ""    # From EMAIL_PASSWORD env var
     poll_interval: int = 30
 
 
@@ -116,7 +106,7 @@ class DouyinConfig:
     """
 
     download_path: str = "./downloads"
-    cookie: str = ""  # From DOUYIN_COOKIE env var
+    cookie: str = ""       # From DOUYIN_COOKIE env var
     naming: str = "{create}_{aweme_id}"
     folderize: bool = True
     timeout: int = 30
@@ -132,8 +122,8 @@ class BilibiliConfig:
     """
 
     download_path: str = "./downloads/bilibili"
-    auth: str = ""  # From BILIBILI_AUTH env var
-    auth_file: str = ""  # From BILIBILI_AUTH_FILE env var
+    auth: str = ""          # From BILIBILI_AUTH env var
+    auth_file: str = ""     # From BILIBILI_AUTH_FILE env var
     timeout: int = 3600
     batch: bool = False
     video_quality: int = 127
@@ -144,9 +134,8 @@ class BilibiliConfig:
 class BotCommands:
     """Email subject keywords that trigger special actions."""
 
-    cookie_update: str = "更新cookie"  # Paste new cookie in body
-    cookie_auto: str = "自动获取cookie"  # Auto-extract from browser
-    codex_process: str = "处理失败"  # Ask the host worker to process failures
+    cookie_update: str = "更新cookie"    # Paste new cookie in body
+    cookie_auto: str = "自动获取cookie"   # Auto-extract from browser
 
 
 @dataclass
@@ -164,28 +153,12 @@ class BotConfig:
 
 
 @dataclass
-class CodexConfig:
-    """Failure FLAG settings for host-side Codex diagnosis."""
-
-    enabled: bool = True
-    flag_file: str = "./codex_state/codex_failure_flags.json"
-    process_request_dir: str = "./codex_state/process_requests"
-    executable: str = "codex"
-    sandbox: str = "read-only"
-    timeout_seconds: int = 900
-    working_directory: str = "."
-    model: str = ""
-    max_output_chars: int = 12000
-    interval_seconds: int = 3600
-
-
-@dataclass
 class CookieExtractorConfig:
     """Headless Firefox cookie extraction settings."""
 
-    profile_dir: str = ""  # empty = use default ~/.douyin_email_bot/firefox_profile/
-    headless: bool = True  # run browser in headless mode
-    validate: bool = True  # validate cookies after extraction
+    profile_dir: str = ""      # empty = use default ~/.douyin_email_bot/firefox_profile/
+    headless: bool = True      # run browser in headless mode
+    validate: bool = True      # validate cookies after extraction
 
 
 @dataclass
@@ -204,7 +177,6 @@ class AppConfig:
     douyin: DouyinConfig
     bilibili: BilibiliConfig
     bot: BotConfig
-    codex: CodexConfig
     media_cleanup: MediaCleanupConfig
     cookie_extractor: CookieExtractorConfig
 
@@ -240,12 +212,10 @@ def load_config(path: Path) -> AppConfig:
     # Resolve relative download_path against config.yaml's directory
     # so downloads always land in the project tree regardless of CWD.
     # DOUYIN_DOWNLOAD_PATH env var takes precedence over YAML.
-    _dl_path = Path(
-        _env_str(
-            "DOUYIN_DOWNLOAD_PATH",
-            douyin_raw.get("download_path", "./downloads"),
-        )
-    )
+    _dl_path = Path(_env_str(
+        "DOUYIN_DOWNLOAD_PATH",
+        douyin_raw.get("download_path", "./downloads"),
+    ))
     if not _dl_path.is_absolute():
         _dl_path = path.parent / _dl_path
     douyin = DouyinConfig(
@@ -260,12 +230,10 @@ def load_config(path: Path) -> AppConfig:
 
     # ── Bilibili ──
     bilibili_raw = raw.get("bilibili", {})
-    _bili_dl_path = Path(
-        _env_str(
-            "BILIBILI_DOWNLOAD_PATH",
-            bilibili_raw.get("download_path", str(_dl_path / "bilibili")),
-        )
-    )
+    _bili_dl_path = Path(_env_str(
+        "BILIBILI_DOWNLOAD_PATH",
+        bilibili_raw.get("download_path", str(_dl_path / "bilibili")),
+    ))
     if not _bili_dl_path.is_absolute():
         _bili_dl_path = path.parent / _bili_dl_path
     bilibili = BilibiliConfig(
@@ -281,9 +249,7 @@ def load_config(path: Path) -> AppConfig:
             "BILIBILI_VIDEO_QUALITY",
             bilibili_raw.get("video_quality", 127),
         ),
-        yutto_bin=_env_str(
-            "BILIBILI_YUTTO_BIN", bilibili_raw.get("yutto_bin", "yutto")
-        ),
+        yutto_bin=_env_str("BILIBILI_YUTTO_BIN", bilibili_raw.get("yutto_bin", "yutto")),
     )
 
     # ── Bot ──
@@ -292,11 +258,11 @@ def load_config(path: Path) -> AppConfig:
     bot_commands = BotCommands(
         cookie_update=cmd_raw.get("cookie_update", "更新cookie"),
         cookie_auto=cmd_raw.get("cookie_auto", "自动获取cookie"),
-        codex_process=cmd_raw.get("codex_process", "处理失败"),
     )
     bot = BotConfig(
         allowed_senders=_parse_allowed_senders(
-            os.getenv("BOT_ALLOWED_SENDERS") or bot_raw.get("allowed_senders", [])
+            os.getenv("BOT_ALLOWED_SENDERS")
+            or bot_raw.get("allowed_senders", [])
         ),
         cooldown_seconds=_env_int(
             "BOT_COOLDOWN_SECONDS",
@@ -329,54 +295,6 @@ def load_config(path: Path) -> AppConfig:
             ),
         ),
         commands=bot_commands,
-    )
-
-    # ── Host-side Codex failure flags ──
-    codex_raw = raw.get("codex", {})
-    codex = CodexConfig(
-        enabled=_env_bool(
-            "CODEX_FAILURE_FLAG_ENABLED",
-            codex_raw.get("enabled", True),
-        ),
-        flag_file=_resolve_project_path(
-            path,
-            _env_str(
-                "CODEX_FAILURE_FLAG_FILE",
-                codex_raw.get("flag_file", "./codex_state/codex_failure_flags.json"),
-            ),
-        ),
-        process_request_dir=_resolve_project_path(
-            path,
-            _env_str(
-                "CODEX_PROCESS_REQUEST_DIR",
-                codex_raw.get("process_request_dir", "./codex_state/process_requests"),
-            ),
-        ),
-        executable=_env_str("CODEX_EXECUTABLE", codex_raw.get("executable", "codex")),
-        sandbox=_env_str("CODEX_SANDBOX", codex_raw.get("sandbox", "read-only")),
-        timeout_seconds=max(
-            1,
-            _env_int("CODEX_TIMEOUT_SECONDS", codex_raw.get("timeout_seconds", 900)),
-        ),
-        working_directory=_resolve_project_path(
-            path,
-            _env_str(
-                "CODEX_WORKING_DIRECTORY", codex_raw.get("working_directory", ".")
-            ),
-        ),
-        model=_env_str("CODEX_MODEL", codex_raw.get("model", "")),
-        max_output_chars=max(
-            1,
-            _env_int(
-                "CODEX_MAX_OUTPUT_CHARS", codex_raw.get("max_output_chars", 12000)
-            ),
-        ),
-        interval_seconds=max(
-            1,
-            _env_int(
-                "CODEX_AUTO_INTERVAL_SECONDS", codex_raw.get("interval_seconds", 3600)
-            ),
-        ),
     )
 
     # ── Media backup cleanup ──
@@ -414,7 +332,6 @@ def load_config(path: Path) -> AppConfig:
         douyin=douyin,
         bilibili=bilibili,
         bot=bot,
-        codex=codex,
         media_cleanup=media_cleanup,
         cookie_extractor=cookie_extractor,
     )

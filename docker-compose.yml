@@ -8,7 +8,6 @@ services:
       - logs:/app/logs
       - state:/app/state
       - firefox_profile:/app/firefox_profile
-      - ./codex_state:/app/codex_state
       - ./config.yaml:/app/config.yaml:ro
       - ./.env:/app/.env
     environment:
@@ -19,8 +18,6 @@ services:
       - COOKIE_PROFILE_DIR=/app/firefox_profile
       - BOT_TRANSIENT_PENDING_FILE=/app/state/pending_retries.json
       - BOT_TRANSIENT_FAILED_FILE=/app/state/failed_links.txt
-      - CODEX_FAILURE_FLAG_FILE=/app/codex_state/codex_failure_flags.json
-      - CODEX_PROCESS_REQUEST_DIR=/app/codex_state/process_requests
       - TZ=Asia/Shanghai
       # Keep Douyin traffic direct even when the Docker host has proxy vars set.
       - HTTP_PROXY=
