@@ -100,7 +100,7 @@ def _format_failure_alert(
     pending_retry_file: Path,
     failed_links_file: Path,
 ) -> str:
-    """Build the detailed failure message sent to the requester and owner."""
+    """Build the detailed failure message sent to the original requester."""
     lines = [
         "视频下载失败详细通知",
         f"时间：{_now_iso()}",

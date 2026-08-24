@@ -25,7 +25,6 @@ Docker env-var overrides:
     BOT_TRANSIENT_RETRY_ATTEMPTS — overrides bot.transient_retry_attempts
     BOT_TRANSIENT_RETRY_DELAY_SECONDS — overrides bot.transient_retry_delay_seconds
     CODEX_FAILURE_FLAG_ENABLED — overrides codex.enabled
-    CODEX_NOTIFY_EMAIL — overrides codex.notify_email
     CODEX_FAILURE_FLAG_FILE — overrides codex.flag_file
     CODEX_PROCESS_REQUEST_DIR — overrides codex.process_request_dir
     CODEX_EXECUTABLE — overrides codex.executable
@@ -178,8 +177,6 @@ class CodexConfig:
     model: str = ""
     max_output_chars: int = 12000
     interval_seconds: int = 3600
-    # Deprecated compatibility setting; it is never used as a recipient.
-    notify_email: str = ""
 
 
 @dataclass
@@ -380,7 +377,6 @@ def load_config(path: Path) -> AppConfig:
                 "CODEX_AUTO_INTERVAL_SECONDS", codex_raw.get("interval_seconds", 3600)
             ),
         ),
-        notify_email=_env_str("CODEX_NOTIFY_EMAIL", codex_raw.get("notify_email", "")),
     )
 
     # ── Media backup cleanup ──

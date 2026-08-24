@@ -54,7 +54,6 @@ def test_codex_settings_support_yaml_and_environment_overrides(tmp_path, monkeyp
         """
 codex:
   flag_file: yaml-flags.json
-  notify_email: yaml@example.com
 """,
         encoding="utf-8",
     )
@@ -62,7 +61,6 @@ codex:
     monkeypatch.setenv("CODEX_FAILURE_FLAG_FILE", "state/env-flags.json")
     monkeypatch.setenv("CODEX_PROCESS_REQUEST_DIR", "state/requests")
     monkeypatch.setenv("CODEX_AUTO_INTERVAL_SECONDS", "42")
-    monkeypatch.setenv("CODEX_NOTIFY_EMAIL", "env@example.com")
 
     config = load_config(config_path)
 
@@ -72,7 +70,6 @@ codex:
         (tmp_path / "state/requests").resolve()
     )
     assert config.codex.interval_seconds == 42
-    assert config.codex.notify_email == "env@example.com"
 
 
 def test_transient_retry_paths_honor_env_and_resolve_relative_to_config(
@@ -257,9 +254,7 @@ def test_failure_alert_contains_actionable_context(tmp_path):
 
 def test_failure_notifications_only_include_requester(monkeypatch):
     bot = object.__new__(EmailBot)
-    bot.config = SimpleNamespace(
-        codex=SimpleNamespace(notify_email="owner@example.com")
-    )
+    bot.config = SimpleNamespace()
     sent = []
     bot._send_reply = lambda cfg, recipient, body, subject_status: sent.append(
         recipient
@@ -283,9 +278,7 @@ def test_failure_notifications_only_include_requester(monkeypatch):
 
 def test_partial_failure_notification_is_sent_only_to_requester(tmp_path):
     bot = object.__new__(EmailBot)
-    bot.config = SimpleNamespace(
-        codex=SimpleNamespace(notify_email="owner@example.com")
-    )
+    bot.config = SimpleNamespace()
     bot._pending_retry_file = tmp_path / "pending.json"
     bot._failed_links_file = tmp_path / "failed.txt"
     sent = []
