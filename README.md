@@ -14,7 +14,6 @@
 - [uv](https://docs.astral.sh/uv/)（Python 包管理器）
 - FFmpeg（Docker 镜像会自动安装）
 - yutto CLI（Docker 镜像会隔离安装；本机开发只在需要 B 站下载时单独安装）
-- Codex CLI（Docker 镜像自动安装，用于下载失败诊断）
 - 一个 QQ 邮箱账号（作为机器人邮箱）
 - 无需特定操作系统（Windows / macOS / Linux 均可）
 
@@ -88,18 +87,18 @@ uv run python main.py
 
 Docker 部署时，失败清单和自动重试队列保存在 bot 的 `state` named volume
 中，不会因重建 bot 容器而丢失；对应文件位于容器内的
-`/app/state/failed_links.txt` 和 `/app/state/pending_retries.json`。
+`/app/state/failed_links.txt`、`/app/state/pending_retries.json` 和
+`/app/state/codex_failure_flags.json`。
 
-下载失败时，机器人会在后台唤起 `codex exec` 做只读诊断，并把详细失败信息
-及后续诊断结果通过邮件发送给请求者和机器人邮箱。Docker 首次部署后需完成
-一次 Codex 登录，认证状态保存在 `codex_home` named volume：
+下载失败或部分失败时，容器只会把已脱敏的失败上下文写入
+`codex_failure_flags.json` 并置位，不在容器内安装或唤起 Codex，也不要求即时
+诊断或修复。详细失败信息仍会通过邮件发送给请求者和机器人邮箱；宿主机上的
+Codex 或人工流程可读取该 FLAG 后再处理。对应资源成功重试后，FLAG 会自动清除。
+宿主机可用以下命令查看当前待处理 FLAG：
 
 ```bash
-sudo docker compose run --rm bot codex login
+sudo docker exec douyin_email_bot cat /app/state/codex_failure_flags.json
 ```
-
-默认 `codex.sandbox` 为 `read-only`，不会自动修改生产代码；如不希望启用，
-可在 `config.yaml` 中设置 `codex.enabled: false`。
 
 ## 局域网 + Tailscale Web 访问
 
@@ -214,10 +213,9 @@ uv run python process_media.py "/path/to/video.mp4" --apply --force-review
 | `bot.transient_failed_file` | str | `./failed_links.txt` | 重试耗尽链接的失败清单；可由 `BOT_TRANSIENT_FAILED_FILE` 覆盖 |
 | `bot.commands.cookie_update` | str | `"更新cookie"` | 手动更新 cookie 的邮件主题关键词 |
 | `bot.commands.cookie_auto` | str | `"自动获取cookie"` | 浏览器自动提取 cookie 的邮件主题关键词 |
-| `codex.enabled` | bool | `true` | 下载失败时是否后台唤起 Codex |
-| `codex.sandbox` | str | `"read-only"` | Codex 沙箱权限；建议保持只读 |
-| `codex.timeout_seconds` | int | `900` | 单次 Codex 诊断超时；可由 `CODEX_TIMEOUT_SECONDS` 覆盖 |
-| `codex.notify_email` | str | `""` | Codex/失败通知收件人；空值使用 `EMAIL_ADDRESS` |
+| `codex.enabled` | bool | `true` | 下载失败时是否写入 FLAG；可由 `CODEX_FAILURE_FLAG_ENABLED` 覆盖 |
+| `codex.flag_file` | str | `./codex_failure_flags.json` | 失败 FLAG 文件；可由 `CODEX_FAILURE_FLAG_FILE` 覆盖 |
+| `codex.notify_email` | str | `""` | 失败通知收件人；空值使用 `EMAIL_ADDRESS` |
 | `FILE_BROWSER_ALLOWED_ORIGINS` | str | 当前请求 origin | 文件浏览器精确允许来源（逗号分隔） |
 | `WEB_LOGIN_ALLOWED_ORIGINS` | str | 当前请求 origin | QR 服务精确允许来源（逗号分隔） |
 | `DOUYIN_SHORT_LINK_CA_BUNDLE` | str | 系统 CA | 私有 CA bundle 路径；不配置时使用正常证书校验 |

@@ -104,13 +104,12 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
 - Allowlist-, keyword-, and cooldown-skipped mail is initially left unseen but
   already present in `_seen_ids`; the next poll normally marks it seen. A restart
   before then can evaluate it again.
-- Failed or partial downloads trigger at most one background Codex diagnosis per
-  sender/link at a time. Codex uses `codex exec` with the configured sandbox and
-  must not block polling, alter download outcomes, or receive cookies, auth
-  files, passwords, private browser profiles, or downloaded media. The default
-  `read-only` sandbox is intentional; enabling write access requires an explicit
-  configuration decision and review. Detailed failure mail goes to the requester
-  and the configured owner mailbox, followed by a separate Codex result mail.
+- Failed or partial downloads write a redacted, durable Codex failure FLAG under
+  the bot's `state` volume. The container must not install or invoke Codex, and
+  FLAG writing must not alter download outcomes or block polling. Detailed
+  failure mail goes to the requester and the configured owner mailbox. A
+  host-side Codex process or operator may process the FLAG later; successful
+  downloads clear the corresponding unresolved FLAG.
 
 ### Douyin downloads
 
@@ -181,13 +180,11 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   their formatting consistent and prefer a shared atomic implementation when
   changing them.
 - Email-triggered extraction honors `cookie_extractor.headless` and `.validate`.
-- Codex failure diagnosis requires a trusted, authenticated `codex` executable
-  in the runtime environment. The Docker image installs the CLI and persists
-  its authentication under the compose-managed `codex_home` volume; complete
-  first-time authentication with `sudo docker compose run --rm bot codex login`
-  or provide the supported API-key environment. If it is unavailable, the bot
-  must continue normally and report that limitation by email/log rather than
-  treating the download as a new failure.
+- Codex failure diagnosis is intentionally host-side and deferred. The Docker
+  bot only writes the redacted FLAG file configured by `codex.flag_file` (the
+  deployment path is `/app/state/codex_failure_flags.json`) and must not require
+  a Codex executable or authentication inside the container. A later host-side
+  process may inspect and clear the FLAG after handling it.
 
 ## Configuration And Paths
 
@@ -271,8 +268,9 @@ sudo docker compose down
 ```
 
 - The bot owns the `logs` and `state` volumes; `state` persists
-  `pending_retries.json` and `failed_links.txt` across bot container rebuilds.
-  Bot and `web_login` share the Firefox-profile volume.
+  `pending_retries.json`, `failed_links.txt`, and
+  `codex_failure_flags.json` across bot container rebuilds. Bot and `web_login`
+  share the Firefox-profile volume.
 - Bot and `file_browser` bind the host NAS root to `/app/downloads`.
 - `file_browser` also mounts `/srv/nas_data/comics` read-only at `/app/comics`
   and uses `COMICS_PICS_PATH=/app/comics/pics` for the in-site comics gallery.
