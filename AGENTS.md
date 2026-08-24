@@ -105,11 +105,12 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   already present in `_seen_ids`; the next poll normally marks it seen. A restart
   before then can evaluate it again.
 - Failed or partial downloads write a redacted, durable Codex failure FLAG under
-  the bot's `state` volume. The container must not install or invoke Codex, and
-  FLAG writing must not alter download outcomes or block polling. Detailed
-  failure mail goes to the requester and the configured owner mailbox. A
-  host-side Codex process or operator may process the FLAG later; successful
-  downloads clear the corresponding unresolved FLAG.
+  the host-visible `codex_state` bind mount. The container must not install or
+  invoke Codex, and FLAG writing must not alter download outcomes or block
+  polling. Detailed failure mail and deferred Codex result mail go only to the
+  original requester. The host worker scans pending FLAGs every hour; the
+  `处理失败` email command writes a host-visible request FLAG for immediate
+  processing. Successful downloads clear the corresponding unresolved FLAG.
 
 ### Douyin downloads
 
@@ -182,9 +183,12 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
 - Email-triggered extraction honors `cookie_extractor.headless` and `.validate`.
 - Codex failure diagnosis is intentionally host-side and deferred. The Docker
   bot only writes the redacted FLAG file configured by `codex.flag_file` (the
-  deployment path is `/app/state/codex_failure_flags.json`) and must not require
-  a Codex executable or authentication inside the container. A later host-side
-  process may inspect and clear the FLAG after handling it.
+  deployment path is `/app/codex_state/codex_failure_flags.json`) and request
+  files under `codex.process_request_dir`; it must not require a Codex
+  executable or authentication inside the container. The host worker runs with
+  the host user's authenticated Codex, scans automatically every hour, and
+  handles request files immediately. It sends result mail only to the original
+  requester.
 
 ## Configuration And Paths
 
@@ -268,9 +272,9 @@ sudo docker compose down
 ```
 
 - The bot owns the `logs` and `state` volumes; `state` persists
-  `pending_retries.json`, `failed_links.txt`, and
-  `codex_failure_flags.json` across bot container rebuilds. Bot and `web_login`
-  share the Firefox-profile volume.
+  `pending_retries.json` and `failed_links.txt` across bot container rebuilds.
+  The host-visible `./codex_state` bind mount persists failure and process
+  request FLAGs. Bot and `web_login` share the Firefox-profile volume.
 - Bot and `file_browser` bind the host NAS root to `/app/downloads`.
 - `file_browser` also mounts `/srv/nas_data/comics` read-only at `/app/comics`
   and uses `COMICS_PICS_PATH=/app/comics/pics` for the in-site comics gallery.

@@ -9,6 +9,7 @@ import os
 import re
 import tempfile
 import threading
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -123,3 +124,110 @@ class FailureFlagStore:
                     tmp_path.unlink(missing_ok=True)
                 except OSError:
                     pass
+
+
+class ProcessRequestStore:
+    """Atomically create and consume host-visible Codex process requests.
+
+    Requests live in separate files so concurrent email commands cannot
+    overwrite one another.  They intentionally contain only the sender,
+    optional URL, and subject needed by the host-side worker.
+    """
+
+    def __init__(self, directory: str | Path):
+        self.directory = Path(directory)
+
+    def create_request(
+        self,
+        *,
+        sender: str,
+        url: str = "",
+        subject: str = "",
+    ) -> Path:
+        record = {
+            "sender": _sanitize(sender),
+            "url": _sanitize(url),
+            "subject": _sanitize(subject),
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.directory.mkdir(parents=True, exist_ok=True)
+        path = (
+            self.directory
+            / f"{datetime.now().strftime('%Y%m%d%H%M%S%f')}-{uuid.uuid4().hex}.json"
+        )
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.directory,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as tmp:
+                tmp_path = Path(tmp.name)
+                json.dump(record, tmp, ensure_ascii=False, indent=2, sort_keys=True)
+                tmp.write("\n")
+                tmp.flush()
+                os.fsync(tmp.fileno())
+            os.replace(tmp_path, path)
+            return path
+        except OSError:
+            logger.exception(
+                "Failed to save Codex process request in %s", self.directory
+            )
+            raise
+        finally:
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    write_request = create_request
+
+    def list_requests(
+        self,
+        *,
+        sender: str | None = None,
+        url: str | None = None,
+    ) -> list[tuple[Path, dict]]:
+        """Return valid request files matching optional exact filters."""
+        try:
+            paths = sorted(self.directory.glob("*.json"))
+        except OSError as exc:
+            logger.warning(
+                "Failed to list Codex process requests %s: %s", self.directory, exc
+            )
+            return []
+        requests = []
+        for path in paths:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError) as exc:
+                logger.warning(
+                    "Ignoring malformed Codex process request %s: %s", path, exc
+                )
+                continue
+            if not isinstance(data, dict) or not data.get("sender"):
+                continue
+            if sender is not None and data.get("sender") != sender:
+                continue
+            if url is not None and data.get("url", "") != url:
+                continue
+            requests.append((path, data))
+        return requests
+
+    def delete_request(self, path: str | Path) -> bool:
+        try:
+            Path(path).unlink()
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            logger.warning("Failed to delete Codex process request %s: %s", path, exc)
+            return False
+
+
+# Keep the generic name available for callers/tests that refer to request flags.
+RequestFlagStore = ProcessRequestStore
