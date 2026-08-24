@@ -8,7 +8,6 @@ services:
       - logs:/app/logs
       - state:/app/state
       - firefox_profile:/app/firefox_profile
-      - codex_home:/root/codex-home
       - ./config.yaml:/app/config.yaml:ro
       - ./.env:/app/.env
     environment:
@@ -17,9 +16,9 @@ services:
       - BILIBILI_AUTH_FILE=/app/firefox_profile/yutto_auth.json
       - BILIBILI_YUTTO_BIN=yutto
       - COOKIE_PROFILE_DIR=/app/firefox_profile
-      - CODEX_HOME=/root/codex-home
       - BOT_TRANSIENT_PENDING_FILE=/app/state/pending_retries.json
       - BOT_TRANSIENT_FAILED_FILE=/app/state/failed_links.txt
+      - CODEX_FAILURE_FLAG_FILE=/app/state/codex_failure_flags.json
       - TZ=Asia/Shanghai
       # Keep Douyin traffic direct even when the Docker host has proxy vars set.
       - HTTP_PROXY=
@@ -87,6 +86,4 @@ volumes:
   firefox_profile:
     driver: local
   state:
-    driver: local
-  codex_home:
     driver: local

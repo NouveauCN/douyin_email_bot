@@ -13,7 +13,6 @@ import math
 import os
 import re
 import smtplib
-import threading
 import time
 from datetime import datetime
 from email.header import decode_header
@@ -22,9 +21,9 @@ from pathlib import Path
 
 from backup_cleanup import BackupCleanupScheduler
 from bilibili_downloader import BilibiliDownloader
-from codex_failure_handler import CodexRunResult, run_codex_failure_handler
 from colorama import Fore, Style
 from douyin_downloader import DouyinDownloader
+from failure_flag import FailureFlagStore
 from url_extractor import UrlExtractor, detect_platform
 
 logger = logging.getLogger("EmailBot")
@@ -36,7 +35,9 @@ _CODEX_SECRET_ASSIGNMENT_RE = re.compile(
 )
 
 
-def _format_success_reply(result: dict, filepath: str, prefix: str = "下载完成！") -> str:
+def _format_success_reply(
+    result: dict, filepath: str, prefix: str = "下载完成！"
+) -> str:
     """Format a download success reply, including multi-file Bilibili results."""
     if result.get("partial"):
         prefix = "部分下载完成。"
@@ -68,8 +69,8 @@ def _format_success_reply(result: dict, filepath: str, prefix: str = "下载完�
             lines.append(f"- {detail}")
         if result.get("retry_queued"):
             lines.append("失败资源已加入自动重试队列；已下载的文件不会重复下载。")
-        if result.get("codex_status"):
-            lines.append(f"Codex处理：{result['codex_status']}")
+        if result.get("flag_status"):
+            lines.append(f"失败 FLAG：{result['flag_status']}")
 
     return "\n".join(lines)
 
@@ -95,7 +96,7 @@ def _format_failure_alert(
     error_msg: str,
     attempts: int | None,
     retry_status: str,
-    codex_status: str,
+    flag_status: str,
     pending_retry_file: Path,
     failed_links_file: Path,
 ) -> str:
@@ -108,7 +109,7 @@ def _format_failure_alert(
         f"原邮件主题：{subject or '（无主题）'}",
         f"错误：{error_msg or '未知错误'}",
         f"当前重试状态：{retry_status}",
-        f"Codex处理状态：{codex_status}",
+        f"失败 FLAG 状态：{flag_status}",
     ]
     if attempts is not None:
         lines.append(f"已尝试次数：{attempts}")
@@ -116,7 +117,7 @@ def _format_failure_alert(
         [
             f"重试队列文件：{pending_retry_file}",
             f"失败清单文件：{failed_links_file}",
-            "说明：Codex 诊断在后台运行，完成后会单独发送诊断结果。",
+            "说明：失败 FLAG 已持久化，等待宿主机 Codex 处理。",
         ]
     )
     return "\n".join(lines)
@@ -137,8 +138,7 @@ class EmailBot:
         self._project_dir = Path(__file__).parent
         self._seen_ids: set[str] = set()  # dedup across poll cycles
         self._pending_retries: dict[str, dict] = {}
-        self._codex_inflight: set[str] = set()
-        self._codex_lock = threading.Lock()
+        self._failure_flags = FailureFlagStore(config.codex.flag_file)
         self._pending_retry_file = Path(config.bot.transient_pending_file)
         self._failed_links_file = Path(config.bot.transient_failed_file)
         self._backup_cleanup = BackupCleanupScheduler(
@@ -150,10 +150,16 @@ class EmailBot:
 
         # Optional .env auto-reload (for Docker: web_login writes cookie → bot picks it up)
         self._env_path = self._project_dir / ".env"
-        self._env_watch = os.getenv("ENV_AUTO_RELOAD", "").lower() in ("1", "true", "yes")
+        self._env_watch = os.getenv("ENV_AUTO_RELOAD", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
         if self._env_watch:
             try:
-                self._env_mtime: float = self._env_path.stat().st_mtime if self._env_path.exists() else 0.0
+                self._env_mtime: float = (
+                    self._env_path.stat().st_mtime if self._env_path.exists() else 0.0
+                )
             except OSError:
                 self._env_mtime = 0.0
             logger.debug(".env auto-reload enabled")
@@ -177,7 +183,9 @@ class EmailBot:
             except smtplib.SMTPException as e:
                 logger.error("SMTP error: %s", e)
             except (ConnectionError, OSError) as e:
-                logger.error("Network error: %s — retrying in %ds", e, cfg.poll_interval)
+                logger.error(
+                    "Network error: %s — retrying in %ds", e, cfg.poll_interval
+                )
             except Exception:
                 logger.exception("Unexpected error during poll cycle")
 
@@ -199,6 +207,7 @@ class EmailBot:
 
         # Re-read .env
         from dotenv import load_dotenv
+
         load_dotenv(self._env_path, override=True)
         new_cookie = os.getenv("DOUYIN_COOKIE", "")
         if new_cookie and new_cookie != self.downloader.config.cookie:
@@ -250,7 +259,11 @@ class EmailBot:
             return
 
         # ── Dedup: skip already-processed message IDs ───────────────
-        msg_id_str = msg_id.decode("ascii", errors="replace") if isinstance(msg_id, bytes) else str(msg_id)
+        msg_id_str = (
+            msg_id.decode("ascii", errors="replace")
+            if isinstance(msg_id, bytes)
+            else str(msg_id)
+        )
         if msg_id_str in self._seen_ids:
             logger.debug("Skipping already-processed message: %s", msg_id_str)
             _mark_seen(mail, msg_id)
@@ -279,7 +292,9 @@ class EmailBot:
         # ── Normal: download ───────────────────────────────────────
         keyword = bot_cfg.subject_keyword
         if keyword and keyword not in subject:
-            logger.debug("Skipping — subject missing keyword '%s': %s", keyword, subject)
+            logger.debug(
+                "Skipping — subject missing keyword '%s': %s", keyword, subject
+            )
             return
 
         url = self.extractor.extract(subject + " " + body)
@@ -311,7 +326,7 @@ class EmailBot:
         if result["success"]:
             partial_error = _partial_failure_error(result)
             if partial_error:
-                result["codex_status"] = self._trigger_codex_failure(
+                result["flag_status"] = self._set_failure_flag(
                     cfg=cfg,
                     sender=sender,
                     subject=subject,
@@ -358,7 +373,7 @@ class EmailBot:
                         self._retry_key(sender, url), {}
                     ).get("attempts", 1),
                     retry_status=retry_status,
-                    codex_status=result.get("codex_status", "未触发"),
+                    flag_status=result.get("flag_status", "未置位"),
                     pending_retry_file=self._pending_retry_file,
                     failed_links_file=self._failed_links_file,
                 )
@@ -369,8 +384,10 @@ class EmailBot:
                     subject_status="部分资源失败",
                 )
             else:
+                self._clear_failure_flag(sender, url)
                 self._send_reply(
-                    cfg, sender,
+                    cfg,
+                    sender,
                     success_body,
                     subject_status=_success_subject_status(result),
                 )
@@ -385,14 +402,16 @@ class EmailBot:
                     error_msg=error_msg,
                     bot_cfg=bot_cfg,
                 )
-                codex_status = self._trigger_codex_failure(
+                flag_status = self._set_failure_flag(
                     cfg=cfg,
                     sender=sender,
                     subject=subject,
                     url=url,
                     platform=platform or "unknown",
                     error_msg=error_msg,
-                    attempts=self._pending_retries.get(self._retry_key(sender, url), {}).get("attempts"),
+                    attempts=self._pending_retries.get(
+                        self._retry_key(sender, url), {}
+                    ).get("attempts"),
                     retry_status=(
                         f"已加入自动重试队列（最多 {bot_cfg.transient_retry_attempts} 次，"
                         f"间隔 {bot_cfg.transient_retry_delay_seconds} 秒）"
@@ -403,28 +422,29 @@ class EmailBot:
                     platform=platform or "unknown",
                     subject=subject,
                     error_msg=error_msg,
-                    attempts=self._pending_retries.get(self._retry_key(sender, url), {}).get("attempts"),
+                    attempts=self._pending_retries.get(
+                        self._retry_key(sender, url), {}
+                    ).get("attempts"),
                     retry_status=(
                         f"已加入自动重试队列（最多 {bot_cfg.transient_retry_attempts} 次，"
                         f"间隔 {bot_cfg.transient_retry_delay_seconds} 秒）"
                     ),
-                    codex_status=codex_status,
+                    flag_status=flag_status,
                     pending_retry_file=self._pending_retry_file,
                     failed_links_file=self._failed_links_file,
                 )
-                self._send_failure_notifications(cfg, sender, body, subject_status="已加入重试")
+                self._send_failure_notifications(
+                    cfg, sender, body, subject_status="已加入重试"
+                )
                 _mark_seen(mail, msg_id)
                 return
 
             # ── Douyin-only: auto-refresh cookie and retry once ─────
-            is_cookie_issue = (
-                platform == "douyin"
-                and (
+            is_cookie_issue = platform == "douyin" and (
                 "删" in error_msg
                 or "私密" in error_msg
                 or "cookie" in error_msg.lower()
                 or "异常" in error_msg
-                )
             )
             if is_cookie_issue:
                 logger.info("Attempting auto cookie refresh from Firefox profile...")
@@ -433,17 +453,24 @@ class EmailBot:
                     headless=self.config.cookie_extractor.headless,
                     validate=self.config.cookie_extractor.validate,
                 )
-                if refreshed_cookie and refreshed_cookie != self.downloader.config.cookie:
+                if (
+                    refreshed_cookie
+                    and refreshed_cookie != self.downloader.config.cookie
+                ):
                     # Hot-reload new cookie and retry
                     self.downloader.config.cookie = refreshed_cookie
                     os.environ["DOUYIN_COOKIE"] = refreshed_cookie
-                    _write_env(self._project_dir / ".env", "DOUYIN_COOKIE", refreshed_cookie)
+                    _write_env(
+                        self._project_dir / ".env", "DOUYIN_COOKIE", refreshed_cookie
+                    )
                     logger.info(
                         "Cookie refreshed (%d chars → %d chars), retrying download...",
-                        len(self.config.douyin.cookie), len(refreshed_cookie),
+                        len(self.config.douyin.cookie),
+                        len(refreshed_cookie),
                     )
                     retry_result = self.downloader.download(url)
                     if retry_result["success"]:
+                        self._clear_failure_flag(sender, url)
                         self._cooldowns[sender] = time.time()
                         filepath = retry_result["filepath"] or "未知路径"
                         logger.info(
@@ -452,7 +479,8 @@ class EmailBot:
                             filepath,
                         )
                         self._send_reply(
-                            cfg, sender,
+                            cfg,
+                            sender,
                             _format_success_reply(
                                 retry_result,
                                 filepath,
@@ -466,7 +494,10 @@ class EmailBot:
                         _mark_seen(mail, msg_id)
                         return
                     else:
-                        logger.warning("Retry after cookie refresh also failed: %s", retry_result["error"])
+                        logger.warning(
+                            "Retry after cookie refresh also failed: %s",
+                            retry_result["error"],
+                        )
                         error_msg += f"\n（已尝试自动刷新 cookie 并重试，仍失败）"
 
             # Build helpful hints
@@ -476,7 +507,7 @@ class EmailBot:
                 "\n2. 抖音链接：发送主题含「自动获取cookie」的邮件，让机器人从 Firefox 配置文件提取"
                 "\n3. B站链接：如需登录内容，请在 .env 配置 BILIBILI_AUTH"
             )
-            codex_status = self._trigger_codex_failure(
+            flag_status = self._set_failure_flag(
                 cfg=cfg,
                 sender=sender,
                 subject=subject,
@@ -493,11 +524,13 @@ class EmailBot:
                 error_msg=error_msg,
                 attempts=1,
                 retry_status="未加入自动重试队列（非瞬时错误）",
-                codex_status=codex_status,
+                flag_status=flag_status,
                 pending_retry_file=self._pending_retry_file,
                 failed_links_file=self._failed_links_file,
             )
-            self._send_failure_notifications(cfg, sender, body, subject_status="下载失败")
+            self._send_failure_notifications(
+                cfg, sender, body, subject_status="下载失败"
+            )
 
         _mark_seen(mail, msg_id)
 
@@ -517,21 +550,36 @@ class EmailBot:
                     for key, value in data.items()
                     if isinstance(value, dict)
                 }
-                logger.info("Loaded %d pending retry link(s)", len(self._pending_retries))
+                logger.info(
+                    "Loaded %d pending retry link(s)", len(self._pending_retries)
+                )
         except Exception as exc:
-            logger.warning("Failed to load pending retry file %s: %s", self._pending_retry_file, exc)
+            logger.warning(
+                "Failed to load pending retry file %s: %s",
+                self._pending_retry_file,
+                exc,
+            )
 
     def _save_pending_retries(self) -> None:
         try:
             self._pending_retry_file.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = self._pending_retry_file.with_suffix(self._pending_retry_file.suffix + ".tmp")
+            tmp_path = self._pending_retry_file.with_suffix(
+                self._pending_retry_file.suffix + ".tmp"
+            )
             tmp_path.write_text(
-                json.dumps(self._pending_retries, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                json.dumps(
+                    self._pending_retries, ensure_ascii=False, indent=2, sort_keys=True
+                )
+                + "\n",
                 encoding="utf-8",
             )
             tmp_path.replace(self._pending_retry_file)
         except OSError as exc:
-            logger.error("Failed to save pending retry file %s: %s", self._pending_retry_file, exc)
+            logger.error(
+                "Failed to save pending retry file %s: %s",
+                self._pending_retry_file,
+                exc,
+            )
 
     def _enqueue_retry(
         self,
@@ -575,7 +623,9 @@ class EmailBot:
         invalid_keys = []
         for key, item in self._pending_retries.items():
             if not isinstance(item, dict):
-                logger.warning("Discarding malformed pending retry %s: expected an object", key)
+                logger.warning(
+                    "Discarding malformed pending retry %s: expected an object", key
+                )
                 invalid_keys.append(key)
                 continue
             next_attempt_at = _retry_next_attempt_at(item, key)
@@ -614,6 +664,7 @@ class EmailBot:
             if result["success"] and not partial_error:
                 self._pending_retries.pop(key, None)
                 self._save_pending_retries()
+                self._clear_failure_flag(sender, url)
                 filepath = result["filepath"] or "未知路径"
                 logger.info(
                     f"{Fore.GREEN}{Style.BRIGHT}[DONE] 自动重试下载成功: %s -> %s",
@@ -623,7 +674,9 @@ class EmailBot:
                 self._send_reply(
                     cfg,
                     sender,
-                    _format_success_reply(result, filepath, prefix="下载完成！（自动重试成功）"),
+                    _format_success_reply(
+                        result, filepath, prefix="下载完成！（自动重试成功）"
+                    ),
                     subject_status=_success_subject_status(result),
                 )
                 continue
@@ -632,7 +685,7 @@ class EmailBot:
             attempts += 1
             item["attempts"] = attempts
             item["last_error"] = error_msg
-            codex_status = self._trigger_codex_failure(
+            flag_status = self._set_failure_flag(
                 cfg=cfg,
                 sender=sender,
                 subject=item.get("subject", ""),
@@ -647,25 +700,26 @@ class EmailBot:
                 ),
             )
 
-            if attempts >= bot_cfg.transient_retry_attempts or not _is_transient_failure(error_msg):
+            if (
+                attempts >= bot_cfg.transient_retry_attempts
+                or not _is_transient_failure(error_msg)
+            ):
                 self._pending_retries.pop(key, None)
                 self._save_pending_retries()
                 self._record_failed_link(item, error_msg)
                 retry_prefix = (
                     "自动重试后仍有部分资源未下载，已把链接保存到失败清单。"
-                    if result.get("partial") else
-                    "自动重试后仍未下载成功，已把链接保存到失败清单。"
+                    if result.get("partial")
+                    else "自动重试后仍未下载成功，已把链接保存到失败清单。"
                 )
                 body = _format_failure_alert(
                     url=url,
                     platform=item.get("platform", "unknown"),
                     subject=item.get("subject", ""),
-                    error_msg=(
-                        f"{retry_prefix}\n{error_msg}"
-                    ),
+                    error_msg=(f"{retry_prefix}\n{error_msg}"),
                     attempts=attempts,
                     retry_status="重试耗尽，已写入失败清单",
-                    codex_status=codex_status,
+                    flag_status=flag_status,
                     pending_retry_file=self._pending_retry_file,
                     failed_links_file=self._failed_links_file,
                 )
@@ -673,11 +727,15 @@ class EmailBot:
                     cfg,
                     sender,
                     body,
-                    subject_status="部分资源重试失败" if result.get("partial") else "重试失败",
+                    subject_status=(
+                        "部分资源重试失败" if result.get("partial") else "重试失败"
+                    ),
                 )
                 continue
 
-            item["next_attempt_at"] = now + max(1, bot_cfg.transient_retry_delay_seconds)
+            item["next_attempt_at"] = now + max(
+                1, bot_cfg.transient_retry_delay_seconds
+            )
             self._pending_retries[key] = item
             self._save_pending_retries()
             logger.info(
@@ -702,7 +760,9 @@ class EmailBot:
                 f.write(line)
             logger.info("Recorded failed link: %s", item.get("url", ""))
         except OSError as exc:
-            logger.error("Failed to record failed link in %s: %s", self._failed_links_file, exc)
+            logger.error(
+                "Failed to record failed link in %s: %s", self._failed_links_file, exc
+            )
 
     def _send_failure_notifications(
         self,
@@ -733,7 +793,7 @@ class EmailBot:
         codex_cfg = getattr(getattr(self, "config", None), "codex", None)
         return str(getattr(codex_cfg, "notify_email", "") or getattr(cfg, "email", ""))
 
-    def _trigger_codex_failure(
+    def _set_failure_flag(
         self,
         *,
         cfg,
@@ -745,82 +805,43 @@ class EmailBot:
         attempts: int | None,
         retry_status: str,
     ) -> str:
-        """Start one isolated Codex diagnosis without blocking the poll loop."""
         codex_cfg = getattr(getattr(self, "config", None), "codex", None)
-        if codex_cfg is None:
-            return "未配置"
-        if not bool(getattr(codex_cfg, "enabled", True)):
+        if codex_cfg is not None and not getattr(codex_cfg, "enabled", True):
             return "未启用"
-
-        key = self._retry_key(sender, url)
-        lock = getattr(self, "_codex_lock", None)
-        inflight = getattr(self, "_codex_inflight", None)
-        if lock is None or inflight is None:
+        failure_flags = getattr(self, "_failure_flags", None)
+        if failure_flags is None:
             return "未初始化"
-        with lock:
-            if key in inflight:
-                return "相同链接已有 Codex 诊断在后台运行"
-            inflight.add(key)
-
-        context = {
-            "url": url,
-            "platform": platform,
-            "sender": sender,
-            "subject": _redact_sensitive_text(subject, self.config, cfg),
-            "error": _redact_sensitive_text(error_msg, self.config, cfg),
-            "attempts": attempts,
-            "retry_status": retry_status,
-            "pending_retry_file": str(self._pending_retry_file),
-            "failed_links_file": str(self._failed_links_file),
-        }
-        working_directory = (
-            Path(codex_cfg.working_directory)
-            if getattr(codex_cfg, "working_directory", "")
-            else self._project_dir
-        )
-        thread = threading.Thread(
-            target=self._run_codex_failure,
-            args=(key, cfg, context, codex_cfg, working_directory),
-            name="codex-failure-diagnosis",
-            daemon=True,
-        )
         try:
-            thread.start()
-        except Exception:
-            with lock:
-                inflight.discard(key)
-            logger.exception("Failed to start Codex failure diagnosis thread")
-            return "启动失败（详见日志）"
-        logger.info("Started background Codex diagnosis for failed download: %s", url)
-        return "已唤起，后台诊断中"
-
-    def _run_codex_failure(self, key, cfg, context, codex_cfg, working_directory) -> None:
-        try:
-            result = run_codex_failure_handler(
-                executable=str(getattr(codex_cfg, "executable", "codex")),
-                sandbox=str(getattr(codex_cfg, "sandbox", "read-only")),
-                timeout_seconds=int(getattr(codex_cfg, "timeout_seconds", 900)),
-                working_directory=working_directory,
-                failure_context=context,
-                model=str(getattr(codex_cfg, "model", "")),
-                max_output_chars=int(getattr(codex_cfg, "max_output_chars", 12000)),
-            )
-            notify_to = self._codex_notify_email(cfg)
-            body = _format_codex_result(context, result, self.config, cfg)
-            self._send_reply(
-                cfg,
-                notify_to,
-                body,
-                subject_status="Codex诊断完成" if result.success else "Codex诊断失败",
+            saved = failure_flags.set_failure(
+                sender=_redact_sensitive_text(sender, self.config, cfg),
+                url=_redact_sensitive_text(url, self.config, cfg),
+                platform=platform,
+                subject=_redact_sensitive_text(subject, self.config, cfg),
+                error=_redact_sensitive_text(error_msg, self.config, cfg),
+                attempts=attempts,
+                retry_status=retry_status,
+                key_sender=sender,
+                key_url=url,
+                pending_retry_file=str(self._pending_retry_file),
+                failed_links_file=str(self._failed_links_file),
             )
         except Exception:
-            logger.exception("Codex failure diagnosis crashed for %s", context.get("url", ""))
-        finally:
-            lock = getattr(self, "_codex_lock", None)
-            inflight = getattr(self, "_codex_inflight", None)
-            if lock is not None and inflight is not None:
-                with lock:
-                    inflight.discard(key)
+            logger.exception("Failed to persist failure FLAG for %s", url)
+            return "置位失败（详见日志）"
+        if not saved:
+            return "置位失败（详见日志）"
+        logger.info("Persisted failure FLAG for failed download: %s", url)
+        return "已置位，等待宿主机 Codex 处理"
+
+    def _clear_failure_flag(self, sender: str, url: str) -> None:
+        failure_flags = getattr(self, "_failure_flags", None)
+        if failure_flags is None:
+            return
+        try:
+            if not failure_flags.clear(sender, url):
+                logger.warning("Failed to clear failure FLAG for %s", url)
+        except Exception:
+            logger.exception("Failed to clear failure FLAG for %s", url)
 
     def _download_url(self, url: str) -> dict:
         """Dispatch a supported URL to the correct downloader."""
@@ -865,9 +886,12 @@ class EmailBot:
             return
 
         if len(new_cookie) < 100:
-            logger.warning("Cookie from %s looks too short (%d chars)", sender, len(new_cookie))
+            logger.warning(
+                "Cookie from %s looks too short (%d chars)", sender, len(new_cookie)
+            )
             self._send_reply(
-                cfg, sender,
+                cfg,
+                sender,
                 f"收到的 cookie 似乎不完整（仅 {len(new_cookie)} 字符），请确认已粘贴完整的 cookie 字符串。\n\n"
                 "获取方式: 浏览器登录 douyin.com → F12 → 控制台 → 输入 document.cookie → 复制全部输出。",
                 subject_status="Cookie 不完整",
@@ -892,7 +916,8 @@ class EmailBot:
 
         logger.info("Cookie updated by %s (%d chars)", sender, len(new_cookie))
         self._send_reply(
-            cfg, sender,
+            cfg,
+            sender,
             f"Cookie 已更新！（{len(new_cookie)} 字符）\n有效期通常 24-48 小时，过期后请重新发送。",
             subject_status="Cookie 已更新",
         )
@@ -918,9 +943,12 @@ class EmailBot:
             if ok:
                 self.downloader.config.cookie = cookie_str
                 os.environ["DOUYIN_COOKIE"] = cookie_str
-                logger.info("Cookie auto-extracted (%d chars): %s", len(cookie_str), status_msg)
+                logger.info(
+                    "Cookie auto-extracted (%d chars): %s", len(cookie_str), status_msg
+                )
                 self._send_reply(
-                    cfg, sender,
+                    cfg,
+                    sender,
                     f"Cookie 已自动获取并更新！（{len(cookie_str)} 字符）\n来源：{status_msg}",
                     subject_status="Cookie 已更新",
                 )
@@ -933,7 +961,8 @@ class EmailBot:
                 )
         else:
             self._send_reply(
-                cfg, sender,
+                cfg,
+                sender,
                 f"自动获取失败：{status_msg}\n\n"
                 "方案一：在宿主机终端运行 uv run python get_cookie.py\n"
                 "方案二：发送主题含「更新cookie」的邮件，正文粘贴 document.cookie 的输出。",
@@ -997,6 +1026,7 @@ class EmailBot:
 
 # ── Email parsing utilities ───────────────────────────────────────
 
+
 def _redact_sensitive_text(text: str, config, cfg) -> str:
     """Remove known credentials before text reaches Codex or SMTP."""
     redacted = _CODEX_SECRET_ASSIGNMENT_RE.sub("[敏感配置已隐藏]", str(text or ""))
@@ -1011,31 +1041,6 @@ def _redact_sensitive_text(text: str, config, cfg) -> str:
             redacted = redacted.replace(value, "[敏感信息已隐藏]")
     return redacted
 
-
-def _format_codex_result(context: dict, result: CodexRunResult, config, cfg) -> str:
-    """Format a Codex diagnosis result without forwarding known secrets."""
-    output = _redact_sensitive_text(result.output, config, cfg).strip()
-    error = _redact_sensitive_text(result.error, config, cfg).strip()
-    status = "成功" if result.success else "失败"
-    lines = [
-        f"Codex 下载失败诊断结果：{status}",
-        f"时间：{_now_iso()}",
-        f"平台：{context.get('platform', 'unknown')}",
-        f"链接：{context.get('url', '')}",
-        f"原邮件主题：{context.get('subject', '') or '（无主题）'}",
-        f"错误：{context.get('error', '') or '未知错误'}",
-        f"重试状态：{context.get('retry_status', '')}",
-        f"Codex 进程已启动：{'是' if result.started else '否'}",
-        f"退出码：{result.returncode if result.returncode is not None else '无'}",
-        f"耗时：{result.duration_seconds:.1f} 秒",
-    ]
-    if error:
-        lines.extend(["调用错误：", error])
-    if output:
-        lines.extend(["Codex 输出：", output])
-    if not output and not error:
-        lines.append("Codex 未返回文本输出。")
-    return "\n".join(lines)
 
 def _extract_addr(from_header: str) -> str:
     m = _ADDR_RE.search(from_header)
@@ -1075,7 +1080,11 @@ def _get_body_text(msg) -> str:
 
 def _mark_seen(mail, msg_id: bytes) -> None:
     """Mark an email as read. Tries two methods for compatibility."""
-    msg_str = msg_id.decode("ascii", errors="replace") if isinstance(msg_id, bytes) else str(msg_id)
+    msg_str = (
+        msg_id.decode("ascii", errors="replace")
+        if isinstance(msg_id, bytes)
+        else str(msg_id)
+    )
     try:
         mail.store(msg_id, "+FLAGS", "\\Seen")
     except Exception:
@@ -1115,10 +1124,14 @@ def _retry_next_attempt_at(item: dict, key: str) -> float | None:
     try:
         value = float(item.get("next_attempt_at", 0))
     except (TypeError, ValueError, OverflowError):
-        logger.warning("Malformed next_attempt_at for pending retry %s; discarding item", key)
+        logger.warning(
+            "Malformed next_attempt_at for pending retry %s; discarding item", key
+        )
         return None
     if not math.isfinite(value):
-        logger.warning("Malformed next_attempt_at for pending retry %s; discarding item", key)
+        logger.warning(
+            "Malformed next_attempt_at for pending retry %s; discarding item", key
+        )
         return None
     return value
 
@@ -1128,6 +1141,7 @@ def _now_iso() -> str:
 
 
 # ── .env file utilities ───────────────────────────────────────────
+
 
 def _write_env(env_path: Path, key: str, value: str) -> bool:
     """Update or add a key=value line in a dotenv file.
@@ -1156,6 +1170,7 @@ def _write_env(env_path: Path, key: str, value: str) -> bool:
 
 # ── Browser cookie extraction ─────────────────────────────────────
 
+
 def _try_extract_cookie(
     profile_dir: Path | None = None,
     *,
@@ -1174,4 +1189,6 @@ def _try_extract_cookie(
     """
     from cookie_extractor import extract_cookies  # noqa: E402
 
-    return extract_cookies(profile_dir=profile_dir, headless=headless, validate=validate)
+    return extract_cookies(
+        profile_dir=profile_dir, headless=headless, validate=validate
+    )
