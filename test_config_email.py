@@ -70,6 +70,7 @@ codex:
         (tmp_path / "state/requests").resolve()
     )
     assert config.codex.interval_seconds == 42
+    assert not hasattr(config.codex, "notify_email")
 
 
 def test_transient_retry_paths_honor_env_and_resolve_relative_to_config(
