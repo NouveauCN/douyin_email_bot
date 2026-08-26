@@ -10,7 +10,7 @@
 
 ## 环境要求
 
-- Python 3.11+
+- Python 3.12（由 `.python-version`、`pyproject.toml` 和 Docker 统一约束）
 - [uv](https://docs.astral.sh/uv/)（Python 包管理器）
 - FFmpeg（Docker 镜像会自动安装）
 - yutto CLI（Docker 镜像会隔离安装；本机开发只在需要 B 站下载时单独安装）
@@ -22,7 +22,7 @@
 ### 1. 安装依赖
 
 ```bash
-uv sync
+uv sync --frozen
 ```
 
 ### 2. 配置 QQ 邮箱
@@ -115,7 +115,7 @@ LAN 地址由 `LAN_BIND_ADDRESS` 显式指定。
 
 B站链接由 [yutto](https://github.com/yutto-dev/yutto) CLI 下载，支持 BV/av 投稿视频、番剧 ep/ss 以及 b23.tv 短链接。默认保存到 `downloads/bilibili/`。
 
-注意：yutto 与 F2 的部分依赖版本约束冲突，因此 Docker 镜像会把 yutto 安装到独立的 `/opt/yutto` 虚拟环境，再通过 `yutto` 命令提供给机器人。不要把 yutto 加回主项目的 `requirements.txt` 或 `pyproject.toml`。
+注意：yutto 与 F2 的部分依赖版本约束冲突，因此 Docker 镜像会从 `dependency-locks/yutto/uv.lock` 把完整锁定的 yutto 环境安装到独立的 `/opt/yutto`，再通过 `yutto` 命令提供给机器人。不要把 yutto 加回主项目的 `pyproject.toml`；主环境与 yutto 隔离环境分别使用各自的 `pyproject.toml` 和 `uv.lock`，Docker 只做冻结安装。
 
 单个 B 站链接可能解析出多个视频文件（例如多 P、合集或启用批量模式的番剧/系列）。机器人回复会包含保存位置、文件数量，并列出前 10 个文件路径。
 

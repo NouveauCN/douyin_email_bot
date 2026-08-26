@@ -11,16 +11,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
+COPY --from=ghcr.io/astral-sh/uv:0.12.5 /uv /uvx /bin/
+
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    PATH="/app/.venv/bin:$PATH"
+
 WORKDIR /app
 
-# ── Python deps (layer cache: rarely changes) ──────────────────────
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# ── Python deps (frozen from the authoritative uv lock) ────────────
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
 
-# yutto conflicts with F2's pinned aiofiles/pydantic dependency set, so keep it
-# in an isolated CLI environment and expose only the executable to the bot.
-RUN python3 -m venv /opt/yutto \
-    && /opt/yutto/bin/pip install --no-cache-dir "yutto>=2.2.0" \
+# yutto conflicts with F2's pinned aiofiles/pydantic dependency set, so install
+# its separate frozen lock into an isolated environment and expose only the CLI.
+COPY dependency-locks/yutto/pyproject.toml dependency-locks/yutto/uv.lock /tmp/yutto-lock/
+RUN UV_PROJECT_ENVIRONMENT=/opt/yutto uv sync \
+        --project /tmp/yutto-lock --frozen --no-dev --no-install-project \
     && ln -s /opt/yutto/bin/yutto /usr/local/bin/yutto \
     && yutto --help >/dev/null
 

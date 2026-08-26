@@ -207,7 +207,7 @@ artifacts must remain untracked.
 ## Development And Verification
 
 ```bash
-uv sync
+uv sync --frozen
 uv run python main.py
 uv run python web_login.py
 uv run python file_browser.py
@@ -264,6 +264,12 @@ sudo docker compose down
   and uses `COMICS_PICS_PATH=/app/comics/pics` for the in-site comics gallery.
 - All services bind `config.yaml`; only bot and `web_login` bind `.env`.
 - The bot intentionally clears proxy variables so Douyin traffic goes direct.
+- Python 3.12 is required locally and in Docker. `pyproject.toml` declares the
+  exact direct dependencies, `uv.lock` is the authoritative transitive lock,
+  and Docker installs it with `uv sync --frozen`; do not restore a parallel
+  hand-maintained `requirements.txt`. Keep yutto 2.2.0 and its transitive
+  dependencies frozen by `dependency-locks/yutto/uv.lock` and isolated in
+  `/opt/yutto` because its dependency set conflicts with F2.
 - The deployment checkout is `~/douyin_email_bot` on `nouveau@nouveauserver`.
   NAS writes outside Docker may require `sudo`.
 - When editing elsewhere, push first, then pull on the server and rebuild the
@@ -275,8 +281,6 @@ sudo docker compose down
 - The prioritized remediation and upgrade sequence is tracked in `ROADMAP.md`.
 - The thumbnail cache is fixed at `/app/.thumb_cache`.
 - Flask HTML, CSS, and JavaScript remain inline in Python modules.
-- `pyproject.toml`/`uv.lock` and Docker's `requirements.txt` still duplicate the
-  primary dependency declarations.
 
 Any substantial change to architecture, media layout, configuration,
 dependencies, or startup/deployment behavior must update this file.

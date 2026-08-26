@@ -45,8 +45,5 @@ Dockerfile
 docker-compose.yml
 .dockerignore
 
-# uv lock (using pip in Docker)
-uv.lock
-
 # F2 config (auto-generated at container start)
 conf/
