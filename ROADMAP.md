@@ -1,6 +1,6 @@
 # Security and Upgrade Roadmap
 
-Last reviewed: 2026-08-23
+Last reviewed: 2026-08-26
 
 This document records the planned follow-up work after the repository-wide
 audit merged in PR #14. Each phase should be delivered as a separate pull
@@ -100,6 +100,24 @@ Acceptance criteria:
 
 ### Phase 3: Reproducible Runtime and Dependency Upgrade (P1)
 
+Status: **Implemented; Docker build revalidation pending** (2026-08-26).
+
+Implementation delivered:
+
+- Python is constrained to the 3.12 series locally and in Docker, with a
+  checked-in `.python-version`.
+- Exact direct dependencies are declared in `pyproject.toml`; `uv.lock` is the
+  sole complete runtime lock and Docker installs it with `uv sync --frozen`.
+  The duplicate hand-maintained `requirements.txt` was removed.
+- Playwright and python-dotenv were upgraded to 1.62.0 and 1.2.3. F2 remains
+  exactly pinned to 0.0.1.7, which requires httpx 0.27.2 and PyYAML 6.0.2.
+- yutto remains isolated in `/opt/yutto`; its exact 2.2.0 package and complete
+  transitive set have a separate frozen lock under `dependency-locks/yutto/`.
+- Frozen local installation, the mocked test suite, F2 bootstrap coverage,
+  Playwright Firefox startup, and Compose configuration pass. The Docker build
+  was interrupted after the host's Debian package mirror repeatedly timed out
+  and returned HTTP 502; rerun it when that external mirror is healthy.
+
 Standardize local development and Docker on Python 3.12 for the next upgrade
 cycle. Do not jump to Python 3.14 until F2, Playwright, FFmpeg, and media tests
 have been verified together.
@@ -193,8 +211,8 @@ Acceptance criteria:
    updating the dedicated secrets directory.
 3. Decided: reject broken TLS by default; support only an explicitly configured
    private CA through `DOUYIN_SHORT_LINK_CA_BUNDLE`.
-4. Docker dependency workflow: install with uv in the image, or commit a frozen
-   `uv export` runtime requirements artifact.
+4. Decided: install the authoritative `uv.lock` directly with a pinned uv
+   version in the image; do not commit a second exported requirements artifact.
 
 ## Verification Baseline for Every Phase
 
