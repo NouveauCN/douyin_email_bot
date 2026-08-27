@@ -13,6 +13,7 @@ import math
 import os
 import re
 import smtplib
+import threading
 import time
 from datetime import datetime
 from email.header import decode_header
@@ -23,6 +24,8 @@ from backup_cleanup import BackupCleanupScheduler
 from bilibili_downloader import BilibiliDownloader
 from colorama import Fore, Style
 from douyin_downloader import DouyinDownloader
+from mail_state import MailStateStore
+from migrate_mail_state import import_pending_retries
 from url_extractor import UrlExtractor, detect_platform
 
 logger = logging.getLogger("EmailBot")
@@ -97,12 +100,34 @@ class EmailBot:
         self._pending_retries: dict[str, dict] = {}
         self._pending_retry_file = Path(config.bot.transient_pending_file)
         self._failed_links_file = Path(config.bot.transient_failed_file)
+        self._durable_mail_enabled = bool(getattr(config.bot, "durable_mail_enabled", True))
+        self._state: MailStateStore | None = None
+        if self._durable_mail_enabled:
+            self._state = MailStateStore(
+                getattr(config.bot, "state_db", str(self._project_dir / "state" / "mail_state.sqlite3")),
+                default_lease_seconds=getattr(config.bot, "lease_seconds", 300),
+            )
+        self._stop_event = threading.Event()
+        self._runtime_threads: list[threading.Thread] = []
+        self._platform_locks = {
+            "douyin": threading.BoundedSemaphore(
+                max(1, getattr(config.bot, "douyin_worker_count", 1))
+            ),
+            "bilibili": threading.BoundedSemaphore(
+                max(1, getattr(config.bot, "bilibili_worker_count", 1))
+            ),
+        }
+        self._cookie_lock = threading.Lock()
+        self._sender_locks: dict[str, threading.Lock] = {}
+        self._sender_locks_guard = threading.Lock()
         self._backup_cleanup = BackupCleanupScheduler(
             Path(config.douyin.download_path),
             retention_days=config.media_cleanup.backup_retention_days,
             check_interval_days=config.media_cleanup.check_interval_days,
         )
         self._load_pending_retries()
+        if self._state is not None:
+            self._migrate_legacy_retries()
 
         # Optional .env auto-reload (for Docker: web_login writes cookie → bot picks it up)
         self._env_path = self._project_dir / ".env"
@@ -124,20 +149,481 @@ class EmailBot:
             cfg.poll_interval,
         )
 
-        while True:
-            try:
-                self._backup_cleanup.run_if_due()
-                self._poll_once(cfg, bot_cfg)
-            except imaplib.IMAP4.error as e:
-                logger.error("IMAP error: %s — retrying in %ds", e, cfg.poll_interval)
-            except smtplib.SMTPException as e:
-                logger.error("SMTP error: %s", e)
-            except (ConnectionError, OSError) as e:
-                logger.error("Network error: %s — retrying in %ds", e, cfg.poll_interval)
-            except Exception:
-                logger.exception("Unexpected error during poll cycle")
+        self._backup_cleanup.run_if_due()
+        self._start_runtime()
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    if self._state is None:
+                        self._backup_cleanup.run_if_due()
+                    self._poll_once(cfg, bot_cfg)
+                except imaplib.IMAP4.error as e:
+                    logger.error("IMAP error: %s — retrying in %ds", e, cfg.poll_interval)
+                except smtplib.SMTPException as e:
+                    logger.error("SMTP error: %s", e)
+                except (ConnectionError, OSError) as e:
+                    logger.error("Network error: %s — retrying in %ds", e, cfg.poll_interval)
+                except Exception:
+                    logger.exception("Unexpected error during poll cycle")
+                self._stop_event.wait(cfg.poll_interval)
+        finally:
+            self.shutdown()
 
-            time.sleep(cfg.poll_interval)
+    def shutdown(self) -> None:
+        """Stop intake and let bounded runtime threads finish their current work."""
+        self._stop_event.set()
+        for thread in self._runtime_threads:
+            thread.join(timeout=10)
+        self._runtime_threads.clear()
+        if self._state is not None:
+            self._state.close()
+
+    def _start_runtime(self) -> None:
+        if self._state is None or self._runtime_threads:
+            return
+        worker_count = max(1, getattr(self.config.bot, "worker_count", 2))
+        for index in range(worker_count):
+            thread = threading.Thread(
+                target=self._task_worker_loop,
+                args=(f"download-{index + 1}",),
+                name=f"mail-download-{index + 1}",
+                daemon=True,
+            )
+            thread.start()
+            self._runtime_threads.append(thread)
+        outbox = threading.Thread(
+            target=self._outbox_worker_loop,
+            name="mail-smtp-outbox",
+            daemon=True,
+        )
+        outbox.start()
+        self._runtime_threads.append(outbox)
+        maintenance = threading.Thread(
+            target=self._maintenance_loop,
+            name="mail-maintenance",
+            daemon=True,
+        )
+        maintenance.start()
+        self._runtime_threads.append(maintenance)
+
+    def _maintenance_loop(self) -> None:
+        """Recover leases and run retries/cleanup independently of IMAP intake."""
+        interval = max(1, min(30, getattr(self.config.email, "poll_interval", 30)))
+        while not self._stop_event.wait(interval):
+            try:
+                if self._state is not None:
+                    recovered = self._state.recover_expired()
+                    if recovered["tasks"] or recovered["outbox"]:
+                        logger.warning("Recovered expired mail leases: %s", recovered)
+                self._backup_cleanup.run_if_due()
+                if self._state is None:
+                    self._process_pending_retries(self.config.email, self.config.bot)
+            except Exception:
+                logger.exception("Independent mail maintenance failed")
+
+    def _migrate_legacy_retries(self) -> None:
+        """Import JSON retry entries without deleting the rollback source."""
+        if self._state is None:
+            return
+        try:
+            report = import_pending_retries(self._pending_retry_file, self._state)
+            if report["imported"]:
+                logger.info("Imported %d legacy retry record(s) into SQLite", report["imported"])
+            if report["skipped"]:
+                logger.warning("Skipped %d malformed legacy retry record(s)", report["skipped"])
+        except Exception:
+            logger.exception("Could not import legacy retry file %s", self._pending_retry_file)
+
+    def _task_worker_loop(self, worker_id: str) -> None:
+        assert self._state is not None
+        while not self._stop_event.is_set():
+            try:
+                tasks = self._state.claim_tasks(
+                    1,
+                    lease_seconds=getattr(self.config.bot, "lease_seconds", 300),
+                    worker_id=worker_id,
+                )
+                if not tasks:
+                    self._stop_event.wait(0.5)
+                    continue
+                for task in tasks:
+                    self._process_durable_task(task)
+            except Exception:
+                logger.exception("Durable download worker %s failed", worker_id)
+                self._stop_event.wait(1)
+
+    def _process_durable_task(self, task: dict) -> None:
+        assert self._state is not None
+        task_id = int(task["id"])
+        token = task["lease_token"]
+        platform = task.get("platform") or detect_platform(task.get("original_url", ""))
+        lock = self._platform_locks.get(platform)
+        # Do not hold a lease while waiting for another task of the same
+        # platform. The task is returned to the queue and can be claimed when
+        # that bounded capacity becomes available.
+        acquired = lock.acquire(blocking=False) if lock else True
+        if not acquired:
+            self._state.fail_task(
+                task_id,
+                token,
+                "platform worker capacity busy",
+                retry_at=time.time() + 1,
+            )
+            return
+
+        heartbeat_stop = threading.Event()
+        heartbeat = threading.Thread(
+            target=self._heartbeat_task,
+            args=(task_id, token, heartbeat_stop),
+            name=f"mail-heartbeat-{task_id}",
+            daemon=True,
+        )
+        heartbeat.start()
+        sender = str((task.get("payload") or {}).get("sender") or "")
+        sender_lock = self._sender_lock(sender)
+        sender_lock.acquire()
+        try:
+            if sender:
+                remaining = getattr(self.config.bot, "cooldown_seconds", 0) - (
+                    time.time() - self._cooldowns.get(sender, 0)
+                )
+                if remaining > 0:
+                    getattr(self, "_stop_event", threading.Event()).wait(remaining)
+            if platform == "notice":
+                # Notice tasks are normally completed during intake. This
+                # branch closes the crash window between their enqueue and
+                # the atomic task/outbox transition.
+                notification = (task.get("payload") or {}).get("notification")
+                if notification:
+                    self._state.complete_task(
+                        task_id,
+                        token,
+                        result={"notice": (task.get("payload") or {}).get("event")},
+                        notification=notification,
+                        outbox_event=(task.get("payload") or {}).get("event", "notice"),
+                    )
+                else:
+                    self._complete_durable_failure(task, token, "notice payload missing")
+                return
+            if platform == "cookie":
+                notification, safe_payload = self._process_cookie_command(task)
+                completed = self._state.complete_task(
+                    task_id,
+                    token,
+                    result={"command": task.get("payload", {}).get("command")},
+                    notification=notification,
+                )
+                if completed is not None:
+                    self._state.redact_task_payload(task_id, safe_payload)
+                return
+            result = self._download_url(task["original_url"])
+            if (
+                not result.get("success")
+                and platform == "douyin"
+                and _is_cookie_failure(result.get("error"))
+            ):
+                result = self._retry_douyin_after_cookie_refresh(task["original_url"], result)
+            partial_error = _partial_failure_error(result)
+            error_msg = partial_error or result.get("error")
+            if result.get("success") and partial_error:
+                if _is_transient_failure(partial_error):
+                    attempts = int(task.get("attempts") or 1)
+                    if attempts < self.config.bot.transient_retry_attempts:
+                        self._state.fail_task(
+                            task_id,
+                            token,
+                            partial_error,
+                            retry_at=time.time() + max(1, self.config.bot.transient_retry_delay_seconds),
+                        )
+                        return
+                self._complete_durable_failure(task, token, partial_error, result)
+                return
+            if result.get("success"):
+                if sender:
+                    self._cooldowns[sender] = time.time()
+                filepath = result.get("filepath") or "未知路径"
+                payload = {
+                    "to_addr": task.get("payload", {}).get("sender", ""),
+                    "body": _format_success_reply(result, filepath),
+                    "subject_status": _success_subject_status(result),
+                }
+                completed = self._state.complete_task(
+                    task_id,
+                    token,
+                    result=result,
+                    notification=payload,
+                )
+                if completed is None:
+                    logger.warning("Lost lease before completing task %d", task_id)
+                else:
+                    self._remove_legacy_retry(task.get("payload", {}))
+                return
+
+            if error_msg and _is_transient_failure(error_msg):
+                attempts = int(task.get("attempts") or 1)
+                if attempts < self.config.bot.transient_retry_attempts:
+                    self._state.fail_task(
+                        task_id,
+                        token,
+                        error_msg,
+                        retry_at=time.time() + max(1, self.config.bot.transient_retry_delay_seconds),
+                    )
+                    return
+
+            self._complete_durable_failure(task, token, error_msg or "未知错误")
+        except Exception as exc:
+            logger.exception("Durable task %d failed", task_id)
+            attempts = int(task.get("attempts") or 1)
+            if attempts < self.config.bot.transient_retry_attempts:
+                self._state.fail_task(
+                    task_id,
+                    token,
+                    str(exc),
+                    retry_at=time.time() + max(1, self.config.bot.transient_retry_delay_seconds),
+                )
+            else:
+                self._complete_durable_failure(task, token, str(exc))
+        finally:
+            heartbeat_stop.set()
+            heartbeat.join(timeout=2)
+            if lock:
+                lock.release()
+            sender_lock.release()
+
+    def _sender_lock(self, sender: str) -> threading.Lock:
+        with self._sender_locks_guard:
+            return self._sender_locks.setdefault(sender, threading.Lock())
+
+    def _process_cookie_command(self, task: dict) -> tuple[dict, dict]:
+        """Execute a durable cookie command and return a safe outbox payload."""
+        payload = task.get("payload") or {}
+        sender = payload.get("sender", "")
+        command = payload.get("command")
+        body = str(payload.get("body") or "").strip()
+        safe_payload = {
+            "sender": sender,
+            "subject": payload.get("subject", ""),
+            "command": command,
+        }
+        if command == "cookie_update":
+            if not body:
+                return {
+                    "to_addr": sender,
+                    "body": "邮件正文为空，请粘贴新的 cookie 后重试。",
+                    "subject_status": "Cookie 更新失败",
+                }, safe_payload
+            if len(body) < 100:
+                return {
+                    "to_addr": sender,
+                    "body": (
+                        f"收到的 cookie 似乎不完整（仅 {len(body)} 字符），请确认已粘贴完整的 cookie 字符串。\n\n"
+                        "获取方式: 浏览器登录 douyin.com → F12 → 控制台 → 输入 document.cookie → 复制全部输出。"
+                    ),
+                    "subject_status": "Cookie 不完整",
+                }, safe_payload
+            if not _write_env(self._project_dir / ".env", "DOUYIN_COOKIE", body):
+                return {
+                    "to_addr": sender,
+                    "body": "写入 .env 文件失败，请检查文件权限。",
+                    "subject_status": "Cookie 写入失败",
+                }, safe_payload
+            with self._cookie_lock:
+                self.downloader.config.cookie = body
+                os.environ["DOUYIN_COOKIE"] = body
+            return {
+                "to_addr": sender,
+                "body": f"Cookie 已更新！（{len(body)} 字符）\n有效期通常 24-48 小时，过期后请重新发送。",
+                "subject_status": "Cookie 已更新",
+            }, safe_payload
+
+        if command == "cookie_auto":
+            with self._cookie_lock:
+                cookie, status = _try_extract_cookie(
+                    profile_dir=self.config.cookie_extractor.profile_dir or None,
+                    headless=self.config.cookie_extractor.headless,
+                    validate=self.config.cookie_extractor.validate,
+                )
+                if cookie and _write_env(self._project_dir / ".env", "DOUYIN_COOKIE", cookie):
+                    self.downloader.config.cookie = cookie
+                    os.environ["DOUYIN_COOKIE"] = cookie
+                    return {
+                        "to_addr": sender,
+                        "body": f"Cookie 已自动获取并更新！（{len(cookie)} 字符）\n来源：{status}",
+                        "subject_status": "Cookie 已更新",
+                    }, safe_payload
+            return {
+                "to_addr": sender,
+                "body": (
+                    f"自动获取失败：{status}\n\n"
+                    "方案一：在宿主机终端运行 uv run python get_cookie.py\n"
+                    "方案二：发送主题含「更新cookie」的邮件，正文粘贴 document.cookie 的输出。"
+                ),
+                "subject_status": "Cookie 获取失败",
+            }, safe_payload
+
+        return {
+            "to_addr": sender,
+            "body": "不支持的 cookie 命令。",
+            "subject_status": "Cookie 操作失败",
+        }, safe_payload
+
+    def _complete_durable_failure(
+        self,
+        task: dict,
+        token: str,
+        error: str,
+        result: dict | None = None,
+    ) -> None:
+        """Terminally fail a task and persist its user notification atomically."""
+        assert self._state is not None
+        payload = task.get("payload") or {}
+        sender = payload.get("sender", "")
+        if result and result.get("success"):
+            filepath = result.get("filepath") or "未知路径"
+            body = _format_success_reply(
+                result,
+                filepath,
+                prefix="部分下载完成，但自动重试已耗尽。",
+            ) + f"\n最后错误：{error}"
+            subject_status = "部分下载失败"
+        else:
+            body = f"下载失败：{error}"
+            subject_status = "下载失败"
+        self._record_failed_link(
+            {
+                "sender": sender,
+                "platform": task.get("platform", ""),
+                "attempts": task.get("attempts", ""),
+                "url": task.get("original_url", ""),
+            },
+            error,
+        )
+        self._state.fail_task(
+            int(task["id"]),
+            token,
+            error,
+            notification={
+                "to_addr": sender,
+                "body": body,
+                "subject_status": subject_status,
+            },
+            outbox_event="partial-failed" if result and result.get("success") else "failed",
+        )
+
+    def _heartbeat_task(self, task_id: int, token: str, stop: threading.Event) -> None:
+        assert self._state is not None
+        interval = max(1, getattr(self.config.bot, "heartbeat_seconds", 30))
+        while not stop.wait(interval):
+            try:
+                if self._state.heartbeat_task(
+                    task_id,
+                    token,
+                    lease_seconds=getattr(self.config.bot, "lease_seconds", 300),
+                ) is None:
+                    return
+            except Exception:
+                logger.exception("Task heartbeat failed for %d", task_id)
+
+    def _retry_douyin_after_cookie_refresh(self, url: str, first_result: dict) -> dict:
+        """Serialize Firefox access and preserve the existing cookie retry."""
+        with self._cookie_lock:
+            refreshed_cookie, refresh_msg = _try_extract_cookie(
+                profile_dir=self.config.cookie_extractor.profile_dir or None,
+                headless=self.config.cookie_extractor.headless,
+                validate=self.config.cookie_extractor.validate,
+            )
+            if not refreshed_cookie or refreshed_cookie == self.downloader.config.cookie:
+                return first_result
+            old_length = len(self.downloader.config.cookie)
+            self.downloader.config.cookie = refreshed_cookie
+            os.environ["DOUYIN_COOKIE"] = refreshed_cookie
+            _write_env(self._project_dir / ".env", "DOUYIN_COOKIE", refreshed_cookie)
+            logger.info(
+                "Cookie refreshed (%d chars -> %d chars; %s), retrying durable task",
+                old_length,
+                len(refreshed_cookie),
+                refresh_msg,
+            )
+            return self.downloader.download(url)
+
+    def _outbox_worker_loop(self) -> None:
+        assert self._state is not None
+        while not self._stop_event.is_set():
+            try:
+                items = self._state.claim_outbox(
+                    1,
+                    lease_seconds=getattr(self.config.bot, "lease_seconds", 300),
+                    worker_id="smtp-outbox",
+                )
+                if not items:
+                    self._stop_event.wait(0.5)
+                    continue
+                for item in items:
+                    self._deliver_outbox(item)
+            except Exception:
+                logger.exception("SMTP outbox worker failed")
+                self._stop_event.wait(1)
+
+    def _deliver_outbox(self, item: dict) -> None:
+        assert self._state is not None
+        heartbeat_stop = threading.Event()
+        heartbeat = threading.Thread(
+            target=self._heartbeat_outbox,
+            args=(int(item["id"]), item["lease_token"], heartbeat_stop),
+            name=f"mail-outbox-heartbeat-{item['id']}",
+            daemon=True,
+        )
+        heartbeat.start()
+        try:
+            payload = item.get("payload") or {}
+            self._send_reply(
+                self.config.email,
+                payload.get("to_addr", ""),
+                payload.get("body", ""),
+                subject_status=payload.get("subject_status", "通知"),
+                message_id=item.get("message_id"),
+            )
+        except Exception as exc:
+            attempts = int(item.get("attempts") or 1)
+            max_attempts = max(1, getattr(self.config.bot, "outbox_retry_attempts", 5))
+            retry_at = None
+            if attempts < max_attempts:
+                retry_at = time.time() + max(1, getattr(self.config.bot, "outbox_retry_delay_seconds", 60))
+            self._state.mark_outbox_failed(
+                int(item["id"]),
+                item["lease_token"],
+                str(exc),
+                retry_at=retry_at,
+            )
+            logger.warning("SMTP outbox %d delivery failed (attempt %d/%d): %s", item["id"], attempts, max_attempts, exc)
+        else:
+            self._state.mark_outbox_sent(int(item["id"]), item["lease_token"])
+        finally:
+            heartbeat_stop.set()
+            heartbeat.join(timeout=2)
+
+    def _heartbeat_outbox(self, outbox_id: int, token: str, stop: threading.Event) -> None:
+        assert self._state is not None
+        interval = max(1, getattr(self.config.bot, "heartbeat_seconds", 30))
+        while not stop.wait(interval):
+            try:
+                if self._state.heartbeat_outbox(
+                    outbox_id,
+                    token,
+                    lease_seconds=getattr(self.config.bot, "lease_seconds", 300),
+                ) is None:
+                    return
+            except Exception:
+                logger.exception("SMTP outbox heartbeat failed for %d", outbox_id)
+
+    def _remove_legacy_retry(self, payload: dict) -> None:
+        key = payload.get("legacy_retry_key")
+        if not key or key not in self._pending_retries:
+            return
+        # The task completion transaction already made the notification
+        # durable. It is now safe to remove the legacy retry entry.
+        self._pending_retries.pop(key, None)
+        self._save_pending_retries()
 
     # ── Poll cycle ────────────────────────────────────────────────
 
@@ -166,6 +652,9 @@ class EmailBot:
 
     def _poll_once(self, cfg, bot_cfg) -> None:
         self._check_env_reload()
+        if self._state is not None:
+            self._poll_once_durable(cfg, bot_cfg)
+            return
         self._process_pending_retries(cfg, bot_cfg)
         mail = self._imap_connect(cfg)
         try:
@@ -184,6 +673,248 @@ class EmailBot:
                 self._process_email(mail, msg_id, cfg, bot_cfg)
         finally:
             self._safe_logout(mail)
+
+    def _poll_once_durable(self, cfg, bot_cfg) -> None:
+        """Fetch UIDs and durably accept them before acknowledging ``\\Seen``."""
+        assert self._state is not None
+        mailbox = "INBOX"
+        mail = self._imap_connect(cfg)
+        try:
+            mail.select(mailbox)
+            uidvalidity = self._imap_uidvalidity(mail)
+            position = self._state.get_mailbox_position(mailbox)
+            reset = position is None or position["uidvalidity"] != uidvalidity
+            start_uid = 1 if reset else int(position["last_uid"]) + 1
+            if reset:
+                # Establish the new UID epoch even when the mailbox is empty;
+                # otherwise every empty reconciliation would repeat the reset.
+                self._state.set_mailbox_position(mailbox, uidvalidity, 0)
+
+            # Re-acknowledge messages whose intake commit succeeded but whose
+            # IMAP STORE failed in a previous cycle.
+            self._retry_pending_seen(mail, mailbox, uidvalidity)
+
+            uids: set[int] = set()
+            # Reconcile the durable high-water mark and still honor the
+            # service's normal UNSEEN poll contract. The union also catches a
+            # message whose Seen flag was changed outside this bot.
+            for criteria in (f"UID {start_uid}:*", "UNSEEN"):
+                status, data = mail.uid("search", None, criteria)
+                if status != "OK":
+                    logger.warning("IMAP UID SEARCH failed for %s", criteria)
+                    continue
+                uid_bytes = data[0] if data else b""
+                uids.update(
+                    int(value)
+                    for value in uid_bytes.split()
+                    if value.isdigit()
+                )
+            uids = sorted(uids)
+            for uid in uids:
+                fetched = self._imap_fetch_uid(mail, uid)
+                if fetched is None:
+                    # Do not advance beyond an un-fetchable UID. The next
+                    # reconciliation will retry it instead of silently
+                    # skipping a message.
+                    logger.warning("Could not fetch IMAP UID %d; stopping reconciliation", uid)
+                    break
+                source_id = f"{mailbox}:{uidvalidity}:{uid}"
+                accepted = self._durably_accept_email(
+                    mail, mailbox, uidvalidity, uid, source_id, fetched, cfg, bot_cfg
+                )
+                if not accepted:
+                    break
+        finally:
+            self._safe_logout(mail)
+
+    @staticmethod
+    def _imap_uidvalidity(mail) -> int:
+        try:
+            _status, values = mail.response("UIDVALIDITY")
+            if values:
+                value = values[-1]
+                if isinstance(value, bytes):
+                    value = value.split()[-1]
+                return int(value)
+        except (AttributeError, TypeError, ValueError, imaplib.IMAP4.error):
+            pass
+        # A missing response is unusual but still safer than sequence-number
+        # state: force a reconciliation epoch that is stable for this poll.
+        return 0
+
+    @staticmethod
+    def _imap_fetch_uid(mail, uid: int):
+        try:
+            status, data = mail.uid("fetch", str(uid), "(UID BODY.PEEK[])")
+        except (AttributeError, imaplib.IMAP4.error, OSError):
+            try:
+                status, data = mail.fetch(str(uid), "(RFC822)")
+            except Exception:
+                return None
+        if status != "OK" or not data:
+            return None
+        for part in data:
+            if isinstance(part, tuple) and len(part) > 1 and isinstance(part[1], bytes):
+                return part[1]
+        return data[0] if isinstance(data[0], bytes) else None
+
+    def _retry_pending_seen(self, mail, mailbox: str, uidvalidity: int) -> None:
+        assert self._state is not None
+        for item in self._state.pending_seen(mailbox):
+            if int(item["uidvalidity"]) != uidvalidity:
+                continue
+            try:
+                ok = _mark_seen(mail, str(item["uid"]).encode("ascii"))
+            except Exception:
+                ok = False
+            if ok:
+                self._state.ack_message(item["source_message_id"])
+
+    def _durably_accept_email(
+        self,
+        mail,
+        mailbox: str,
+        uidvalidity: int,
+        uid: int,
+        source_id: str,
+        raw: bytes,
+        cfg,
+        bot_cfg,
+    ) -> bool:
+        """Commit source identity and route work before attempting IMAP STORE."""
+        assert self._state is not None
+        msg = email.message_from_bytes(raw)
+        sender = _extract_addr(msg.get("From", ""))
+        subject = _decode_str(msg.get("Subject", ""))
+        if not sender:
+            sender = "unknown-sender"
+        body = _get_body_text(msg)
+        metadata = {
+            "sender": sender,
+            "subject": subject,
+            "message_id": msg.get("Message-ID", ""),
+            "raw_sha256": __import__("hashlib").sha256(raw).hexdigest(),
+        }
+
+        urls: list[str] = []
+        platform = None
+        command = None
+        keyword = getattr(bot_cfg, "subject_keyword", "下载")
+        route_eligible = not keyword or keyword in subject
+        sender_allowed = not bot_cfg.allowed_senders or sender in bot_cfg.allowed_senders
+        if sender != cfg.email and sender_allowed:
+            if bot_cfg.commands.cookie_update and bot_cfg.commands.cookie_update in subject:
+                command = "cookie_update"
+            elif bot_cfg.commands.cookie_auto and bot_cfg.commands.cookie_auto in subject:
+                command = "cookie_auto"
+            elif route_eligible:
+                url = self.extractor.extract(subject + " " + body)
+                if url:
+                    urls = [url]
+                    platform = detect_platform(url)
+
+        try:
+            accepted = self._state.accept_message(
+                mailbox,
+                uidvalidity,
+                uid,
+                source_id,
+                urls,
+                metadata={**metadata, "platform": platform},
+                platform=platform,
+            )
+        except Exception:
+            logger.exception("Durable intake failed for UID %d", uid)
+            return False
+
+        if accepted["duplicate"]:
+            logger.debug("UID %d was already durably accepted", uid)
+            if command:
+                self._ensure_command_task(source_id, metadata, body, command)
+        elif urls:
+            logger.info("Durably accepted mail UID %d with %s task", uid, platform or "unknown")
+        elif command:
+            self._ensure_command_task(source_id, metadata, body, command)
+        elif sender != cfg.email and sender_allowed and route_eligible:
+            # Preserve existing user-facing behavior for mail that was
+            # accepted but had no routable URL.
+            self._ensure_task_for_notice(
+                source_id,
+                metadata,
+                "no-url",
+                {
+                    "to_addr": sender,
+                    "body": "未在邮件中找到支持的视频链接，请发送抖音或 B 站分享链接。",
+                    "subject_status": "未找到链接",
+                },
+            )
+
+        if (
+            accepted["duplicate"]
+            and not urls
+            and sender != cfg.email
+            and sender_allowed
+            and route_eligible
+            and not command
+        ):
+            self._ensure_task_for_notice(
+                source_id,
+                metadata,
+                "no-url",
+                {
+                    "to_addr": sender,
+                    "body": "未在邮件中找到支持的视频链接，请发送抖音或 B 站分享链接。",
+                    "subject_status": "未找到链接",
+                },
+            )
+
+        try:
+            if _mark_seen(mail, str(uid).encode("ascii")):
+                self._state.ack_message(source_id)
+        except Exception:
+            logger.warning("Durable intake committed but IMAP \\Seen ACK failed for UID %d", uid)
+        return True
+
+    def _ensure_command_task(
+        self, source_id: str, metadata: dict, body: str, command: str
+    ) -> int:
+        assert self._state is not None
+        task = self._state.enqueue_task(
+            source_id,
+            f"urn:mail-command:{command}",
+            payload={**metadata, "body": body, "command": command},
+            platform="cookie",
+        )
+        return int(task["id"])
+
+    def _ensure_task_for_notice(
+        self, source_id: str, metadata: dict, event: str, notification: dict
+    ) -> int:
+        assert self._state is not None
+        task = self._state.enqueue_task(
+            source_id,
+            f"urn:mail-notice:{event}",
+            payload={**metadata, "notification": notification, "event": event},
+            platform="notice",
+        )
+        claimed = self._state.claim_tasks(
+            1,
+            lease_seconds=getattr(self.config.bot, "lease_seconds", 300),
+            filter={"id": task["id"]},
+        )
+        if claimed:
+            self._state.complete_task(
+                int(task["id"]),
+                claimed[0]["lease_token"],
+                result={"notice": event},
+                notification=notification,
+                outbox_event=event,
+            )
+        else:
+            # A duplicate notice may already be complete. INSERT OR IGNORE
+            # keeps its existing durable notification intact.
+            self._state.enqueue_outbox(int(task["id"]), event, notification)
+        return int(task["id"])
 
     def _process_email(self, mail, msg_id: bytes, cfg, bot_cfg) -> None:
         status, data = mail.fetch(msg_id, "(RFC822)")
@@ -710,14 +1441,21 @@ class EmailBot:
         to_addr: str,
         body: str,
         subject_status: str = "通知",
+        message_id: str | None = None,
     ) -> None:
         msg = MIMEText(body, "plain", "utf-8")
         msg["From"] = cfg.email
         msg["To"] = to_addr
         msg["Subject"] = f"Re: 视频下载 - {subject_status}"
+        if message_id:
+            msg["Message-ID"] = message_id
 
         logger.debug("Sending reply to %s", to_addr)
-        with smtplib.SMTP(cfg.smtp_server, cfg.smtp_port) as smtp:
+        with smtplib.SMTP(
+            cfg.smtp_server,
+            cfg.smtp_port,
+            timeout=max(1, getattr(cfg, "smtp_timeout", 30)),
+        ) as smtp:
             smtp.starttls()
             smtp.login(cfg.email, cfg.password)
             smtp.send_message(msg)
@@ -763,17 +1501,18 @@ def _get_body_text(msg) -> str:
     return ""
 
 
-def _mark_seen(mail, msg_id: bytes) -> None:
+def _mark_seen(mail, msg_id: bytes) -> bool:
     """Mark an email as read. Tries two methods for compatibility."""
     msg_str = msg_id.decode("ascii", errors="replace") if isinstance(msg_id, bytes) else str(msg_id)
-    try:
-        mail.store(msg_id, "+FLAGS", "\\Seen")
-    except Exception:
+    for flag in ("\\Seen", "Seen"):
         try:
-            # Some IMAP servers need the flag without backslash
-            mail.store(msg_id, "+FLAGS", "Seen")
+            result = mail.store(msg_id, "+FLAGS", flag)
+            if not isinstance(result, tuple) or result[0] == "OK":
+                return True
         except Exception:
-            logger.warning("Failed to mark message as seen: %s", msg_str)
+            continue
+    logger.warning("Failed to mark message as seen: %s", msg_str)
+    return False
 
 
 def _is_transient_failure(error_msg: str | None) -> bool:
@@ -781,6 +1520,13 @@ def _is_transient_failure(error_msg: str | None) -> bool:
         return False
     lowered = error_msg.lower()
     return any(hint in lowered for hint in _TRANSIENT_ERROR_HINTS)
+
+
+def _is_cookie_failure(error_msg: str | None) -> bool:
+    if not error_msg:
+        return False
+    lowered = error_msg.lower()
+    return any(hint in lowered for hint in ("删", "私密", "cookie", "异常"))
 
 
 def _partial_failure_error(result: dict) -> str | None:

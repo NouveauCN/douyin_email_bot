@@ -11,6 +11,8 @@ service on port 8080, and a trusted-LAN file browser on port 8081.
 ```text
 main.py                 Bot entry point and order-sensitive F2 bootstrap
 email_bot.py            IMAP loop, routing, retries, SMTP, cookie refresh
+mail_state.py           SQLite mailbox position, task leases, and SMTP outbox
+migrate_mail_state.py   Dry-run/apply migration for legacy JSON retries
 douyin_downloader.py    F2 metadata and direct httpx media downloads
 bilibili_downloader.py  Isolated yutto CLI wrapper
 media_processor.py      Conservative shared image/video edge-border removal
@@ -104,6 +106,17 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
 - Allowlist-, keyword-, and cooldown-skipped mail is initially left unseen but
   already present in `_seen_ids`; the next poll normally marks it seen. A restart
   before then can evaluate it again.
+- Durable mail processing is enabled by default. The IMAP coordinator uses
+  `UID SEARCH`/`UID FETCH`, persists `(mailbox, UIDVALIDITY, UID)` in SQLite,
+  and marks `\\Seen` only after the intake transaction commits.
+- Download tasks and SMTP notifications run in bounded daemon workers with
+  SQLite leases and heartbeats. Expired leases are recovered by an independent
+  maintenance scheduler; the outbox reuses a stable Message-ID.
+- The old JSON retry queue remains as a rollback source and is imported
+  idempotently at startup. `BOT_DURABLE_MAIL_ENABLED=0` selects the legacy
+  polling/retry path while SQLite and the JSON source remain untouched.
+- Firefox cookie extraction remains process-serialized; Douyin and Bilibili
+  worker capacity is independently bounded by bot configuration.
 
 ### Douyin downloads
 
@@ -192,6 +205,8 @@ Relative configured paths resolve against the directory containing
 `BOT_TRANSIENT_PENDING_FILE` and `BOT_TRANSIENT_FAILED_FILE` override the
 transient retry queue and exhausted-link file paths. The Docker bot sets them
 to `/app/state/pending_retries.json` and `/app/state/failed_links.txt`.
+`BOT_STATE_DB` defaults to `/app/state/mail_state.sqlite3` in Docker; it must
+remain on the bot's persistent `state` volume and never on the NAS media mount.
 
 The checked-in config points downloads directly at
 `/srv/nas_data/douyin_downloads`. Docker overrides that host path with
@@ -216,6 +231,8 @@ uv run python get_cookie.py
 uv run python get_cookie.py --headless
 uv run python migrate_downloads.py --dry-run
 uv run python process_media.py /srv/nas_data/douyin_downloads
+uv run python migrate_mail_state.py --pending ./pending_retries.json
+uv run python migrate_mail_state.py --pending ./pending_retries.json --apply
 ```
 
 Verification baseline:

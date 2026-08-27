@@ -78,6 +78,27 @@ bot:
     assert config.bot.transient_failed_file == str((tmp_path / "yaml-failed.txt").resolve())
 
 
+def test_durable_mail_settings_resolve_and_honor_environment(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+bot:
+  durable_mail_enabled: false
+  state_db: yaml-state.sqlite
+  worker_count: 4
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("BOT_DURABLE_MAIL_ENABLED", "1")
+    monkeypatch.setenv("BOT_STATE_DB", "state/env.sqlite")
+    monkeypatch.setenv("BOT_WORKER_COUNT", "3")
+    config = load_config(config_path)
+
+    assert config.bot.durable_mail_enabled is True
+    assert config.bot.state_db == str((tmp_path / "state/env.sqlite").resolve())
+    assert config.bot.worker_count == 3
+
+
 def test_try_extract_cookie_forwards_configured_options(monkeypatch):
     captured = {}
 

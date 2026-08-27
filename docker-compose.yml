@@ -18,6 +18,15 @@ services:
       - COOKIE_PROFILE_DIR=/app/firefox_profile
       - BOT_TRANSIENT_PENDING_FILE=/app/state/pending_retries.json
       - BOT_TRANSIENT_FAILED_FILE=/app/state/failed_links.txt
+      - BOT_STATE_DB=/app/state/mail_state.sqlite3
+      - BOT_DURABLE_MAIL_ENABLED=${BOT_DURABLE_MAIL_ENABLED:-1}
+      - BOT_WORKER_COUNT=${BOT_WORKER_COUNT:-2}
+      - BOT_DOUYIN_WORKER_COUNT=${BOT_DOUYIN_WORKER_COUNT:-1}
+      - BOT_BILIBILI_WORKER_COUNT=${BOT_BILIBILI_WORKER_COUNT:-1}
+      - BOT_LEASE_SECONDS=${BOT_LEASE_SECONDS:-300}
+      - BOT_HEARTBEAT_SECONDS=${BOT_HEARTBEAT_SECONDS:-30}
+      - BOT_OUTBOX_RETRY_ATTEMPTS=${BOT_OUTBOX_RETRY_ATTEMPTS:-5}
+      - BOT_OUTBOX_RETRY_DELAY_SECONDS=${BOT_OUTBOX_RETRY_DELAY_SECONDS:-60}
       - TZ=Asia/Shanghai
       # Keep Douyin traffic direct even when the Docker host has proxy vars set.
       - HTTP_PROXY=

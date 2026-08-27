@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -57,6 +58,13 @@ class MailStateStore:
             check_same_thread=False,
         )
         self._conn.row_factory = sqlite3.Row
+        if self.path != ":memory:":
+            try:
+                os.chmod(self.path, 0o600)
+            except OSError:
+                # The database remains usable on filesystems that do not
+                # expose POSIX modes; Docker's state volume is still scoped.
+                pass
         self.initialize()
 
     def initialize(self) -> None:
@@ -104,6 +112,9 @@ class MailStateStore:
                         created_at REAL NOT NULL,
                         updated_at REAL NOT NULL
                     );
+                    CREATE UNIQUE INDEX IF NOT EXISTS source_locator_idx
+                        ON source_messages(mailbox, uidvalidity, uid)
+                        WHERE uid > 0;
 
                     CREATE TABLE IF NOT EXISTS tasks (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -492,6 +503,23 @@ class MailStateStore:
             row = self._conn.execute("SELECT * FROM tasks WHERE source_message_id = ? AND normalized_url = ?", (source_message_id, normalized)).fetchone()
             return self._row(row)  # type: ignore[return-value]
 
+    def redact_task_payload(
+        self,
+        task_id: int,
+        payload: Any,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        """Replace a completed task payload, useful for removing secret input."""
+        timestamp = self._now(now)
+        with self._lock, self._transaction():
+            self._ensure_open()
+            cursor = self._conn.execute(
+                "UPDATE tasks SET payload_json = ?, updated_at = ? WHERE id = ?",
+                (self._json(payload), timestamp, task_id),
+            )
+            return cursor.rowcount == 1
+
     def claim_tasks(
         self,
         limit: int = 1,
@@ -615,6 +643,10 @@ class MailStateStore:
         retry_at: float | None = None,
         next_attempt_at: float | None = None,
         retry: bool = False,
+        notification: Any = None,
+        outbox_payload: Any = None,
+        outbox_event: str = "failed",
+        outbox_message_id: str | None = None,
         now: float | None = None,
     ) -> dict[str, Any] | None:
         timestamp = self._now(now)
@@ -624,13 +656,23 @@ class MailStateStore:
         status = "pending" if scheduled is not None else "failed"
         with self._lock, self._transaction():
             self._ensure_open()
-            self._conn.execute(
+            cursor = self._conn.execute(
                 "UPDATE tasks SET status = ?, lease_token = NULL, lease_expires_at = NULL, "
                 "next_attempt_at = ?, last_error = ?, updated_at = ? "
                 "WHERE id = ? AND status = 'leased' AND lease_token = ? AND lease_expires_at > ?",
                 (status, scheduled, error, timestamp, task_id, lease_token, timestamp),
             )
-            return self._row(self._conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()) if self._conn.execute("SELECT changes()").fetchone()[0] else None
+            if cursor.rowcount != 1:
+                return None
+            if notification is not None or outbox_payload is not None:
+                self._insert_outbox_locked(
+                    task_id,
+                    outbox_event,
+                    outbox_payload if outbox_payload is not None else notification,
+                    outbox_message_id,
+                    timestamp,
+                )
+            return self._row(self._conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone())
 
     def recover_expired(self, *, now: float | None = None) -> dict[str, int]:
         timestamp = self._now(now)
@@ -647,6 +689,33 @@ class MailStateStore:
                 (timestamp, timestamp),
             ).rowcount
             return {"tasks": task_count, "outbox": outbox_count}
+
+    def heartbeat_outbox(
+        self,
+        outbox_id: int,
+        lease_token: str,
+        *,
+        lease_seconds: float | None = None,
+        now: float | None = None,
+    ) -> dict[str, Any] | None:
+        """Extend an SMTP outbox lease while a provider call is in flight."""
+        lease = self.default_lease_seconds if lease_seconds is None else float(lease_seconds)
+        if lease <= 0:
+            raise ValueError("lease_seconds must be positive")
+        timestamp = self._now(now)
+        with self._lock, self._transaction():
+            self._ensure_open()
+            cursor = self._conn.execute(
+                "UPDATE smtp_outbox SET lease_expires_at = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'leased' AND lease_token = ? "
+                "AND lease_expires_at > ?",
+                (timestamp + lease, timestamp, outbox_id, lease_token, timestamp),
+            )
+            if cursor.rowcount != 1:
+                return None
+            return self._row(
+                self._conn.execute("SELECT * FROM smtp_outbox WHERE id = ?", (outbox_id,)).fetchone()
+            )
 
     def enqueue_outbox(
         self,

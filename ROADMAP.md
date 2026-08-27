@@ -196,6 +196,28 @@ Acceptance criteria:
 
 ### Phase 5: Durable Mail Processing and Delivery (P1)
 
+Implementation status: **Completed in this PR** (2026-08-27).
+
+- Added a WAL-backed `sqlite3` state store under the bot state volume with
+  mailbox UID/UIDVALIDITY generations, source and normalized-URL idempotency,
+  task leases/heartbeats, recovery, and an atomic task-result/SMTP-outbox
+  transition.
+- IMAP intake now uses UID search/fetch and acknowledges `\\Seen` only after
+  durable intake commits. Failed flag updates remain pending and are retried
+  during the next reconciliation.
+- Bounded download workers and a separate SMTP outbox worker decouple slow
+  media work and delivery from the 30-second polling coordinator. Douyin and
+  Bilibili capacity are independently limited, and Firefox cookie refresh is
+  serialized.
+- Legacy JSON retries remain intact as a rollback source and are imported
+  idempotently. `migrate_mail_state.py` is dry-run by default; set
+  `BOT_DURABLE_MAIL_ENABLED=0` to use the legacy path while validating or
+  rolling back.
+- Lease recovery, UIDVALIDITY changes, duplicate intake, outbox idempotency,
+  SMTP retry, `\\Seen` failure, and legacy migration are covered by mocked
+  fault-injection tests. External webhooks, queues, and IMAP IDLE remain
+  deferred.
+
 Make mail intake reliable before optimizing its trigger latency. Keep the
 30-second polling loop as the default while this phase is being introduced.
 

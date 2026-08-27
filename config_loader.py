@@ -19,6 +19,7 @@ Docker env-var overrides:
     BILIBILI_VIDEO_QUALITY — overrides bilibili.video_quality
     BILIBILI_YUTTO_BIN    — overrides bilibili.yutto_bin
     EMAIL_POLL_INTERVAL   — overrides email.poll_interval
+    SMTP_TIMEOUT          — overrides email.smtp_timeout
     BOT_ALLOWED_SENDERS   — overrides bot.allowed_senders (comma-separated)
     BOT_COOLDOWN_SECONDS  — overrides bot.cooldown_seconds
     BOT_SUBJECT_KEYWORD   — overrides bot.subject_keyword
@@ -26,6 +27,15 @@ Docker env-var overrides:
     BOT_TRANSIENT_RETRY_DELAY_SECONDS — overrides bot.transient_retry_delay_seconds
     BOT_TRANSIENT_PENDING_FILE — overrides bot.transient_pending_file
     BOT_TRANSIENT_FAILED_FILE — overrides bot.transient_failed_file
+    BOT_DURABLE_MAIL_ENABLED — overrides bot.durable_mail_enabled
+    BOT_STATE_DB — overrides bot.state_db
+    BOT_WORKER_COUNT — overrides bot.worker_count
+    BOT_DOUYIN_WORKER_COUNT — overrides bot.douyin_worker_count
+    BOT_BILIBILI_WORKER_COUNT — overrides bot.bilibili_worker_count
+    BOT_LEASE_SECONDS — overrides bot.lease_seconds
+    BOT_HEARTBEAT_SECONDS — overrides bot.heartbeat_seconds
+    BOT_OUTBOX_RETRY_ATTEMPTS — overrides bot.outbox_retry_attempts
+    BOT_OUTBOX_RETRY_DELAY_SECONDS — overrides bot.outbox_retry_delay_seconds
     MEDIA_BACKUP_RETENTION_DAYS — overrides media_cleanup.backup_retention_days
     MEDIA_BACKUP_CHECK_INTERVAL_DAYS — overrides media_cleanup.check_interval_days
     COOKIE_PROFILE_DIR    — overrides cookie_extractor.profile_dir
@@ -96,6 +106,7 @@ class EmailConfig:
     email: str = ""       # From EMAIL_ADDRESS env var
     password: str = ""    # From EMAIL_PASSWORD env var
     poll_interval: int = 30
+    smtp_timeout: int = 30
 
 
 @dataclass
@@ -149,7 +160,29 @@ class BotConfig:
     transient_retry_delay_seconds: int = 120
     transient_pending_file: str = "./pending_retries.json"
     transient_failed_file: str = "./failed_links.txt"
+    # Durable mail processing is additive and can be disabled for rollback.
+    durable_mail_enabled: bool = True
+    state_db: str = "./state/mail_state.sqlite3"
+    worker_count: int = 2
+    douyin_worker_count: int = 1
+    bilibili_worker_count: int = 1
+    lease_seconds: int = 300
+    heartbeat_seconds: int = 30
+    outbox_retry_attempts: int = 5
+    outbox_retry_delay_seconds: int = 60
     commands: BotCommands = field(default_factory=BotCommands)
+
+    def __post_init__(self) -> None:
+        self.worker_count = max(1, int(self.worker_count))
+        self.douyin_worker_count = max(1, int(self.douyin_worker_count))
+        self.bilibili_worker_count = max(1, int(self.bilibili_worker_count))
+        self.lease_seconds = max(10, int(self.lease_seconds))
+        self.heartbeat_seconds = min(
+            max(1, int(self.heartbeat_seconds)),
+            max(1, self.lease_seconds // 3),
+        )
+        self.outbox_retry_attempts = max(1, int(self.outbox_retry_attempts))
+        self.outbox_retry_delay_seconds = max(1, int(self.outbox_retry_delay_seconds))
 
 
 @dataclass
@@ -205,6 +238,7 @@ def load_config(path: Path) -> AppConfig:
             "EMAIL_POLL_INTERVAL",
             email_raw.get("poll_interval", 30),
         ),
+        smtp_timeout=max(1, _env_int("SMTP_TIMEOUT", email_raw.get("smtp_timeout", 30))),
     )
 
     # ── Douyin ──
@@ -292,6 +326,39 @@ def load_config(path: Path) -> AppConfig:
             _env_str(
                 "BOT_TRANSIENT_FAILED_FILE",
                 bot_raw.get("transient_failed_file", "./failed_links.txt"),
+            ),
+        ),
+        durable_mail_enabled=_env_bool(
+            "BOT_DURABLE_MAIL_ENABLED",
+            bot_raw.get("durable_mail_enabled", True),
+        ),
+        state_db=_resolve_project_path(
+            path,
+            _env_str("BOT_STATE_DB", bot_raw.get("state_db", "./state/mail_state.sqlite3")),
+        ),
+        worker_count=max(1, _env_int("BOT_WORKER_COUNT", bot_raw.get("worker_count", 2))),
+        douyin_worker_count=max(
+            1,
+            _env_int("BOT_DOUYIN_WORKER_COUNT", bot_raw.get("douyin_worker_count", 1)),
+        ),
+        bilibili_worker_count=max(
+            1,
+            _env_int("BOT_BILIBILI_WORKER_COUNT", bot_raw.get("bilibili_worker_count", 1)),
+        ),
+        lease_seconds=max(10, _env_int("BOT_LEASE_SECONDS", bot_raw.get("lease_seconds", 300))),
+        heartbeat_seconds=max(
+            1,
+            _env_int("BOT_HEARTBEAT_SECONDS", bot_raw.get("heartbeat_seconds", 30)),
+        ),
+        outbox_retry_attempts=max(
+            1,
+            _env_int("BOT_OUTBOX_RETRY_ATTEMPTS", bot_raw.get("outbox_retry_attempts", 5)),
+        ),
+        outbox_retry_delay_seconds=max(
+            1,
+            _env_int(
+                "BOT_OUTBOX_RETRY_DELAY_SECONDS",
+                bot_raw.get("outbox_retry_delay_seconds", 60),
             ),
         ),
         commands=bot_commands,

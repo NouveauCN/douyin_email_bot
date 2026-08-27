@@ -128,6 +128,19 @@ def test_expired_outbox_lease_is_recoverable(tmp_path):
     store.close()
 
 
+def test_outbox_heartbeat_prevents_expiry_during_slow_smtp(tmp_path):
+    store = make_store(tmp_path)
+    task = store.enqueue_task("m1", "https://example.test/a")
+    item = store.enqueue_outbox(task["id"], "completed")
+    claimed = store.claim_outbox(now=0, lease_seconds=5)[0]
+    assert store.heartbeat_outbox(
+        item["id"], claimed["lease_token"], now=4, lease_seconds=5
+    )["lease_expires_at"] == 9
+    assert store.recover_expired(now=8)["outbox"] == 0
+    assert store.mark_outbox_sent(item["id"], claimed["lease_token"], now=8)
+    store.close()
+
+
 def test_invalid_json_payload_rolls_back_outbox_insert(tmp_path):
     store = make_store(tmp_path)
     task = store.enqueue_task("m1", "https://example.test/a")

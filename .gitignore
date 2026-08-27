@@ -7,6 +7,9 @@ __pycache__/
 downloads/
 firefox_profile/
 logs/
+state/
+*.sqlite3
+*.sqlite3-*
 douyin_users.db
 pending_retries.json
 failed_links.txt

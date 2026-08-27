@@ -39,7 +39,7 @@ RUN python3 -m playwright install firefox
 COPY . .
 
 # Ensure volume mount points exist
-RUN mkdir -p /app/downloads /app/logs /app/firefox_profile /app/conf
+RUN mkdir -p /app/downloads /app/logs /app/state /app/firefox_profile /app/conf
 
 # ── Runtime ────────────────────────────────────────────────────────
 # Bot entrypoint (web_login overrides via docker-compose command)

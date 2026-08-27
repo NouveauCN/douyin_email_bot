@@ -88,6 +88,18 @@ uv run python main.py
 Docker 部署时，失败清单和自动重试队列保存在 bot 的 `state` named volume
 中，不会因重建 bot 容器而丢失；对应文件位于容器内的
 `/app/state/failed_links.txt` 和 `/app/state/pending_retries.json`。
+邮件的 durable 状态和 SMTP outbox 也保存在同一 volume 的
+`/app/state/mail_state.sqlite3`。收件采用 IMAP UID/UIDVALIDITY 幂等入库，
+下载与回复由有界 worker 异步处理；SMTP 失败、进程重启或租约过期都会在
+后续调度中恢复。旧 JSON 队列会保留为回滚源。迁移工具默认只检查不写入：
+
+```bash
+uv run python migrate_mail_state.py --pending ./pending_retries.json
+uv run python migrate_mail_state.py --pending ./pending_retries.json --apply
+```
+
+如需回滚到旧的同步处理路径，设置 `BOT_DURABLE_MAIL_ENABLED=0`；不要在
+确认 durable 状态与 outbox 已稳定前删除 JSON 队列。
 
 ## 局域网 + Tailscale Web 访问
 
@@ -187,6 +199,7 @@ uv run python process_media.py "/path/to/video.mp4" --apply --force-review
 | `email.email` | str | `""` | **必填**（.env `EMAIL_ADDRESS`），机器人邮箱地址 |
 | `email.password` | str | `""` | **必填**（.env `EMAIL_PASSWORD`），QQ 邮箱授权码 |
 | `email.poll_interval` | int | `30` | 收件箱轮询间隔（秒） |
+| `email.smtp_timeout` | int | `30` | SMTP 连接与发送超时（秒）；可由 `SMTP_TIMEOUT` 覆盖 |
 | `douyin.cookie` | str | `""` | **必填**（.env `DOUYIN_COOKIE`），抖音登录 cookie |
 | `douyin.download_path` | str | `"/srv/nas_data/douyin_downloads"` | 视频下载目录（提交配置） |
 | `bilibili.download_path` | str | `"/srv/nas_data/douyin_downloads/bilibili"` | B站视频下载目录（提交配置） |
@@ -200,6 +213,12 @@ uv run python process_media.py "/path/to/video.mp4" --apply --force-review
 | `bot.cooldown_seconds` | int | `5` | 同一发件人冷却时间 |
 | `bot.transient_pending_file` | str | `./pending_retries.json` | 自动重试队列文件；可由 `BOT_TRANSIENT_PENDING_FILE` 覆盖 |
 | `bot.transient_failed_file` | str | `./failed_links.txt` | 重试耗尽链接的失败清单；可由 `BOT_TRANSIENT_FAILED_FILE` 覆盖 |
+| `bot.durable_mail_enabled` | bool | `true` | 启用 SQLite durable intake、worker 和 SMTP outbox；可由 `BOT_DURABLE_MAIL_ENABLED` 覆盖 |
+| `bot.state_db` | str | `./state/mail_state.sqlite3` | SQLite 状态库；Docker 中固定在 `/app/state` named volume |
+| `bot.worker_count` | int | `2` | 全局下载 worker 数；可由 `BOT_WORKER_COUNT` 覆盖 |
+| `bot.douyin_worker_count` / `bilibili_worker_count` | int | `1` / `1` | 各平台并发上限 |
+| `bot.lease_seconds` / `heartbeat_seconds` | int | `300` / `30` | worker 租约与心跳周期 |
+| `bot.outbox_retry_attempts` | int | `5` | SMTP outbox 最大重试次数 |
 | `bot.commands.cookie_update` | str | `"更新cookie"` | 手动更新 cookie 的邮件主题关键词 |
 | `bot.commands.cookie_auto` | str | `"自动获取cookie"` | 浏览器自动提取 cookie 的邮件主题关键词 |
 | `FILE_BROWSER_ALLOWED_ORIGINS` | str | 当前请求 origin | 文件浏览器精确允许来源（逗号分隔） |
