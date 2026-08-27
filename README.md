@@ -98,8 +98,14 @@ uv run python migrate_mail_state.py --pending ./pending_retries.json
 uv run python migrate_mail_state.py --pending ./pending_retries.json --apply
 ```
 
-如需回滚到旧的同步处理路径，设置 `BOT_DURABLE_MAIL_ENABLED=0`；不要在
-确认 durable 状态与 outbox 已稳定前删除 JSON 队列。
+如需回滚到旧的同步处理路径，先等待 SQLite intake、待确认的 `\\Seen`、任务和
+outbox 清空，再设置
+`BOT_DURABLE_MAIL_ENABLED=0`；若仍有在途 durable 工作，机器人会拒绝启动，
+避免已标记 `\\Seen` 的邮件或待发通知被静默遗弃。不要在确认 durable 状态
+与 outbox 已稳定前删除 JSON 队列。Cookie 命令正文只在内存中处理，不写入
+SQLite；升级旧版 SQLite 状态时，历史 Cookie 任务会先脱敏并标记为需重新发送。
+迁移还会安全清理 SQLite/WAL 中的旧页；任何外部数据库备份仍需按既有
+秘密轮换策略处理。
 
 ## 局域网 + Tailscale Web 访问
 

@@ -1,3 +1,6 @@
+import json
+import sqlite3
+
 import pytest
 
 from mail_state import MailStateStore, SCHEMA_VERSION
@@ -7,12 +10,260 @@ def make_store(tmp_path):
     return MailStateStore(tmp_path / "mail-state.sqlite", default_lease_seconds=10)
 
 
+def make_legacy_store_file(path):
+    conn = sqlite3.connect(path)
+    secret = "sessionid=" + "x" * 128
+    conn.executescript(
+        """
+        CREATE TABLE source_messages (
+            source_message_id TEXT PRIMARY KEY,
+            mailbox TEXT NOT NULL,
+            uidvalidity INTEGER NOT NULL,
+            uid INTEGER NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            seen_at REAL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        CREATE TABLE tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_message_id TEXT NOT NULL,
+            normalized_url TEXT NOT NULL,
+            original_url TEXT NOT NULL,
+            platform TEXT,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            lease_token TEXT,
+            lease_expires_at REAL,
+            next_attempt_at REAL,
+            last_error TEXT,
+            result_json TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            completed_at REAL,
+            UNIQUE (source_message_id, normalized_url)
+        );
+        CREATE TABLE smtp_outbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER NOT NULL,
+            event TEXT NOT NULL,
+            message_id TEXT NOT NULL UNIQUE,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at REAL,
+            lease_token TEXT,
+            lease_expires_at REAL,
+            last_error TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            sent_at REAL,
+            UNIQUE (task_id, event)
+        );
+        PRAGMA user_version = 1;
+        """
+    )
+    conn.execute(
+        "INSERT INTO source_messages VALUES (?, ?, ?, ?, '{}', NULL, ?, ?)",
+        ("legacy-orphan", "INBOX", 77, 12, 1, 1),
+    )
+    conn.execute(
+        "INSERT INTO source_messages VALUES (?, ?, ?, ?, ?, NULL, ?, ?)",
+        (
+            "legacy-cookie",
+            "INBOX",
+            77,
+            13,
+            json.dumps({"subject": "更新cookie " + secret}),
+            1,
+            1,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO source_messages VALUES (?, ?, ?, ?, '{}', NULL, ?, ?)",
+        ("legacy-cookie-pending", "INBOX", 77, 14, 1, 1),
+    )
+    cursor = conn.execute(
+        "INSERT INTO tasks "
+        "(source_message_id, normalized_url, original_url, platform, payload_json, created_at, updated_at) "
+        "VALUES (?, ?, ?, 'cookie', ?, ?, ?)",
+        (
+            "legacy-cookie",
+            "urn:mail-command:cookie_update",
+            "urn:mail-command:cookie_update",
+            json.dumps(
+                {
+                    "sender": "user@example.test",
+                    "subject": "更新cookie " + secret,
+                    "command": "cookie_update",
+                    "body": secret,
+                }
+            ),
+            1,
+            1,
+        ),
+    )
+    conn.execute(
+        "UPDATE tasks SET result_json = ?, last_error = ? WHERE id = ?",
+        (json.dumps({"cookie": secret}), secret, cursor.lastrowid),
+    )
+    conn.execute(
+        "INSERT INTO smtp_outbox "
+        "(task_id, event, message_id, payload_json, last_error, created_at, updated_at) "
+        "VALUES (?, 'completed', '<legacy@example.test>', ?, ?, 1, 1)",
+        (
+            cursor.lastrowid,
+            json.dumps({"to_addr": "user@example.test", "body": secret}),
+            secret,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO tasks "
+        "(source_message_id, normalized_url, original_url, platform, payload_json, created_at, updated_at) "
+        "VALUES (?, ?, ?, 'cookie', ?, ?, ?)",
+        (
+            "legacy-cookie-pending",
+            "urn:mail-command:cookie_auto",
+            "urn:mail-command:cookie_auto",
+            json.dumps(
+                {
+                    "sender": "user@example.test",
+                    "subject": "自动获取cookie",
+                    "command": "cookie_auto",
+                    "body": secret,
+                }
+            ),
+            1,
+            1,
+        ),
+    )
+    leased_task_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute(
+        "UPDATE tasks SET status = 'leased', lease_token = 'legacy-token', "
+        "lease_expires_at = 99, result_json = ?, last_error = ? WHERE id = ?",
+        (json.dumps({"cookie": secret}), secret, leased_task_id),
+    )
+    conn.commit()
+    conn.close()
+    return secret
+
+
 def test_schema_is_initialized_with_wal_and_busy_timeout(tmp_path):
     store = make_store(tmp_path)
     assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     assert store._conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
     assert store._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+    assert store._conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
     store.close()
+
+
+def test_legacy_schema_upgrade_recovers_incomplete_intake_and_scrubs_cookie(tmp_path):
+    state_path = tmp_path / "legacy.sqlite"
+    secret = make_legacy_store_file(state_path)
+
+    store = MailStateStore(state_path)
+
+    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert store.pending_intake("INBOX", 77)[0]["source_message_id"] == "legacy-orphan"
+    assert [item["source_message_id"] for item in store.pending_seen("INBOX")] == [
+        "legacy-cookie",
+        "legacy-cookie-pending",
+    ]
+    task = store._conn.execute(
+        "SELECT status, payload_json, result_json, last_error FROM tasks "
+        "WHERE source_message_id = 'legacy-cookie'"
+    ).fetchone()
+    outbox = store._conn.execute(
+        "SELECT payload_json FROM smtp_outbox WHERE task_id = 1"
+    ).fetchone()
+    assert task["status"] == "failed"
+    assert task["payload_json"] == "{}"
+    assert secret not in task["payload_json"]
+    assert task["result_json"] is None
+    assert task["last_error"] is None
+    assert secret not in outbox["payload_json"]
+    assert outbox["payload_json"].find(secret) == -1
+    metadata = store._conn.execute(
+        "SELECT metadata_json FROM source_messages "
+        "WHERE source_message_id = 'legacy-cookie'"
+    ).fetchone()
+    assert secret not in metadata["metadata_json"]
+    recovered = store._conn.execute(
+        "SELECT t.status, t.lease_token, t.lease_expires_at, t.result_json, "
+        "t.last_error, o.event, o.payload_json FROM tasks t "
+        "LEFT JOIN smtp_outbox o ON o.task_id = t.id "
+        "WHERE t.source_message_id = 'legacy-cookie-pending'"
+    ).fetchone()
+    assert recovered["status"] == "failed"
+    assert recovered["lease_token"] is None
+    assert recovered["lease_expires_at"] is None
+    assert recovered["result_json"] is None
+    assert recovered["last_error"] is None
+    assert recovered["event"] == "legacy-cookie-recovery"
+    assert secret not in recovered["payload_json"]
+    assert recovered["payload_json"] == json.dumps(
+        {
+            "body": "旧版 Cookie 任务无法安全恢复，请重新发送 Cookie 命令。",
+            "subject_status": "Cookie 需重新发送",
+            "to_addr": "user@example.test",
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    store.close()
+    for artifact in (state_path, state_path.with_name(state_path.name + "-wal")):
+        if artifact.exists():
+            assert secret.encode() not in artifact.read_bytes()
+
+
+def test_legacy_migration_retries_when_physical_cleanup_fails(tmp_path, monkeypatch):
+    state_path = tmp_path / "legacy-retry.sqlite"
+    make_legacy_store_file(state_path)
+    original_cleanup = MailStateStore._secure_migrate_cleanup
+    calls = []
+
+    def fail_once(store):
+        calls.append(True)
+        if len(calls) == 1:
+            raise RuntimeError("simulated cleanup failure")
+        return original_cleanup(store)
+
+    monkeypatch.setattr(MailStateStore, "_secure_migrate_cleanup", fail_once)
+    with pytest.raises(RuntimeError, match="simulated cleanup failure"):
+        MailStateStore(state_path)
+
+    with sqlite3.connect(state_path) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+
+    store = MailStateStore(state_path)
+    assert calls == [True, True]
+    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    recipients = store._conn.execute(
+        "SELECT o.payload_json FROM smtp_outbox o "
+        "JOIN tasks t ON t.id = o.task_id "
+        "WHERE t.platform = 'cookie' ORDER BY o.id"
+    ).fetchall()
+    assert recipients
+    assert all('"to_addr": "user@example.test"' in row["payload_json"] for row in recipients)
+    store.close()
+
+
+def test_busy_wal_checkpoint_result_is_rejected():
+    class BusyCursor:
+        def fetchone(self):
+            return (1, 3, 3)
+
+    class BusyConnection:
+        def execute(self, statement):
+            assert statement == "PRAGMA wal_checkpoint(TRUNCATE)"
+            return BusyCursor()
+
+    class BusyStore:
+        _conn = BusyConnection()
+
+    with pytest.raises(RuntimeError, match="checkpoint is busy"):
+        MailStateStore._checkpoint_wal(BusyStore())
 
 
 def test_duplicate_intake_and_urls_are_idempotent(tmp_path):
@@ -27,6 +278,22 @@ def test_duplicate_intake_and_urls_are_idempotent(tmp_path):
     assert first["task_ids"] == second["task_ids"]
     assert second["created_task_ids"] == []
     assert store.get_mailbox_position("INBOX")["last_uid"] == 11
+    store.close()
+
+
+def test_intake_marker_precedes_seen_ack_and_rollback_drain(tmp_path):
+    store = make_store(tmp_path)
+    accepted = store.accept_message("INBOX", 7, 11, "m1", [])
+    assert accepted["intake_complete"] is False
+    assert store.pending_seen("INBOX") == []
+    assert store.pending_intake("INBOX", 7)[0]["uid"] == 11
+    assert store.unfinished_work_counts()["intake"] == 1
+
+    assert store.mark_intake_complete("m1") is True
+    assert store.pending_seen("INBOX")[0]["source_message_id"] == "m1"
+    assert store.unfinished_work_counts()["intake"] == 1
+    assert store.ack_message("m1") is True
+    assert store.unfinished_work_counts()["intake"] == 0
     store.close()
 
 
@@ -58,6 +325,20 @@ def test_task_lease_heartbeat_completion_and_expiry_recovery(tmp_path):
     store.close()
 
 
+def test_capacity_release_does_not_charge_a_task_attempt(tmp_path):
+    store = make_store(tmp_path)
+    task = store.enqueue_task("m1", "https://example.test/a")
+    claimed = store.claim_tasks(now=100)[0]
+    released = store.release_task(
+        task["id"], claimed["lease_token"], next_attempt_at=101, now=100
+    )
+    assert released["status"] == "pending"
+    assert released["attempts"] == 0
+    assert store.claim_tasks(now=100) == []
+    assert store.claim_tasks(now=101)[0]["attempts"] == 1
+    store.close()
+
+
 def test_complete_task_can_atomically_enqueue_notification(tmp_path):
     store = make_store(tmp_path)
     task = store.enqueue_task("m1", "https://example.test/a", platform="douyin")
@@ -74,6 +355,27 @@ def test_complete_task_can_atomically_enqueue_notification(tmp_path):
     outbox = store._conn.execute("SELECT status, payload_json FROM smtp_outbox").fetchone()
     assert outbox["status"] == "pending"
     assert "user@example.test" in outbox["payload_json"]
+    store.close()
+
+
+def test_notice_and_outbox_insert_roll_back_together(tmp_path, monkeypatch):
+    store = make_store(tmp_path)
+
+    def fail_outbox(*args, **kwargs):
+        raise RuntimeError("notice outbox fault")
+
+    monkeypatch.setattr(store, "_insert_outbox_locked", fail_outbox)
+    with pytest.raises(RuntimeError, match="notice outbox fault"):
+        store.enqueue_notice(
+            "m-notice",
+            "no-url",
+            {"sender": "user@example.test"},
+            {"to_addr": "user@example.test", "body": "no URL"},
+        )
+
+    assert store._conn.execute("SELECT COUNT(*) FROM source_messages").fetchone()[0] == 0
+    assert store._conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    assert store._conn.execute("SELECT COUNT(*) FROM smtp_outbox").fetchone()[0] == 0
     store.close()
 
 

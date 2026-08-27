@@ -98,15 +98,25 @@ class EmailBot:
         self._project_dir = Path(__file__).parent
         self._seen_ids: set[str] = set()  # dedup across poll cycles
         self._pending_retries: dict[str, dict] = {}
+        self._pending_retry_lock = threading.RLock()
+        self._legacy_cleanup_pending: set[str] = set()
         self._pending_retry_file = Path(config.bot.transient_pending_file)
         self._failed_links_file = Path(config.bot.transient_failed_file)
         self._durable_mail_enabled = bool(getattr(config.bot, "durable_mail_enabled", True))
         self._state: MailStateStore | None = None
+        state_db_path = Path(
+            getattr(config.bot, "state_db", str(self._project_dir / "state" / "mail_state.sqlite3"))
+        )
         if self._durable_mail_enabled:
             self._state = MailStateStore(
-                getattr(config.bot, "state_db", str(self._project_dir / "state" / "mail_state.sqlite3")),
+                state_db_path,
                 default_lease_seconds=getattr(config.bot, "lease_seconds", 300),
             )
+        elif state_db_path.exists():
+            # A legacy rollback must not silently abandon Seen mail or pending
+            # durable notifications. Drain the durable queues first, then
+            # restart with the legacy flag.
+            self._assert_legacy_rollback_safe(state_db_path, self._pending_retry_file)
         self._stop_event = threading.Event()
         self._runtime_threads: list[threading.Thread] = []
         self._platform_locks = {
@@ -128,6 +138,8 @@ class EmailBot:
         self._load_pending_retries()
         if self._state is not None:
             self._migrate_legacy_retries()
+            self._cleanup_terminal_legacy_mirrors()
+            self._retry_legacy_cleanup()
 
         # Optional .env auto-reload (for Docker: web_login writes cookie → bot picks it up)
         self._env_path = self._project_dir / ".env"
@@ -138,6 +150,37 @@ class EmailBot:
             except OSError:
                 self._env_mtime = 0.0
             logger.debug(".env auto-reload enabled")
+
+    @staticmethod
+    def _assert_legacy_rollback_safe(
+        state_db_path: Path, pending_retry_path: Path | None = None
+    ) -> None:
+        with MailStateStore(state_db_path) as rollback_state:
+            unfinished = rollback_state.unfinished_work_counts()
+            terminal_legacy_keys = rollback_state.terminal_legacy_retry_keys()
+        if any(unfinished.values()):
+            raise RuntimeError(
+                "cannot disable durable mail while SQLite work remains: "
+                f"{unfinished}; drain intake/Seen/tasks/outbox before rollback"
+            )
+        if terminal_legacy_keys and pending_retry_path is not None:
+            try:
+                pending = json.loads(pending_retry_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                pending = {}
+            if isinstance(pending, dict) and terminal_legacy_keys.intersection(
+                str(key) for key in pending
+            ):
+                raise RuntimeError(
+                    "cannot disable durable mail while terminal tasks remain in "
+                    "the legacy retry file"
+                )
+
+    def _cleanup_terminal_legacy_mirrors(self) -> None:
+        if self._state is None:
+            return
+        for key in self._state.terminal_legacy_retry_keys():
+            self._remove_legacy_retry({"legacy_retry_key": key})
 
     def run(self) -> None:
         cfg = self.config.email
@@ -215,6 +258,7 @@ class EmailBot:
                     recovered = self._state.recover_expired()
                     if recovered["tasks"] or recovered["outbox"]:
                         logger.warning("Recovered expired mail leases: %s", recovered)
+                    self._retry_legacy_cleanup()
                 self._backup_cleanup.run_if_due()
                 if self._state is None:
                     self._process_pending_retries(self.config.email, self.config.bot)
@@ -263,11 +307,10 @@ class EmailBot:
         # that bounded capacity becomes available.
         acquired = lock.acquire(blocking=False) if lock else True
         if not acquired:
-            self._state.fail_task(
+            self._state.release_task(
                 task_id,
                 token,
-                "platform worker capacity busy",
-                retry_at=time.time() + 1,
+                next_attempt_at=time.time() + 1,
             )
             return
 
@@ -498,7 +541,7 @@ class EmailBot:
             },
             error,
         )
-        self._state.fail_task(
+        failed = self._state.fail_task(
             int(task["id"]),
             token,
             error,
@@ -509,6 +552,11 @@ class EmailBot:
             },
             outbox_event="partial-failed" if result and result.get("success") else "failed",
         )
+        if failed is not None:
+            # The durable terminal failure and its notification are now safe;
+            # remove the mirrored legacy retry so a later rollback cannot
+            # execute the same link a second time.
+            self._remove_legacy_retry(payload)
 
     def _heartbeat_task(self, task_id: int, token: str, stop: threading.Event) -> None:
         assert self._state is not None
@@ -616,14 +664,29 @@ class EmailBot:
             except Exception:
                 logger.exception("SMTP outbox heartbeat failed for %d", outbox_id)
 
-    def _remove_legacy_retry(self, payload: dict) -> None:
+    def _retry_legacy_cleanup(self) -> None:
+        for key in list(self._legacy_cleanup_pending):
+            self._remove_legacy_retry({"legacy_retry_key": key})
+
+    def _remove_legacy_retry(self, payload: dict) -> bool:
         key = payload.get("legacy_retry_key")
-        if not key or key not in self._pending_retries:
-            return
-        # The task completion transaction already made the notification
-        # durable. It is now safe to remove the legacy retry entry.
-        self._pending_retries.pop(key, None)
-        self._save_pending_retries()
+        if not key:
+            return False
+        with self._pending_retry_lock:
+            if key not in self._pending_retries:
+                self._legacy_cleanup_pending.discard(key)
+                return False
+            # The task completion transaction already made the notification
+            # durable. Remove the mirrored retry only if the atomic JSON
+            # replacement succeeds; otherwise restore it for maintenance.
+            original = self._pending_retries.pop(key)
+            if self._save_pending_retries():
+                self._legacy_cleanup_pending.discard(key)
+                return True
+            self._pending_retries[key] = original
+            self._legacy_cleanup_pending.add(key)
+            logger.error("Could not persist removal of legacy retry %s; will retry", key)
+            return False
 
     # ── Poll cycle ────────────────────────────────────────────────
 
@@ -682,6 +745,9 @@ class EmailBot:
         try:
             mail.select(mailbox)
             uidvalidity = self._imap_uidvalidity(mail)
+            if uidvalidity is None:
+                logger.error("IMAP UIDVALIDITY is unavailable; refusing sequence-based intake")
+                return
             position = self._state.get_mailbox_position(mailbox)
             reset = position is None or position["uidvalidity"] != uidvalidity
             start_uid = 1 if reset else int(position["last_uid"]) + 1
@@ -695,6 +761,12 @@ class EmailBot:
             self._retry_pending_seen(mail, mailbox, uidvalidity)
 
             uids: set[int] = set()
+            # Re-fetch sources whose routing marker is still incomplete even
+            # if an external client changed their Seen flag after a crash.
+            uids.update(
+                int(item["uid"])
+                for item in self._state.pending_intake(mailbox, uidvalidity)
+            )
             # Reconcile the durable high-water mark and still honor the
             # service's normal UNSEEN poll contract. The union also catches a
             # message whose Seen flag was changed outside this bot.
@@ -702,13 +774,19 @@ class EmailBot:
                 status, data = mail.uid("search", None, criteria)
                 if status != "OK":
                     logger.warning("IMAP UID SEARCH failed for %s", criteria)
-                    continue
-                uid_bytes = data[0] if data else b""
-                uids.update(
-                    int(value)
-                    for value in uid_bytes.split()
-                    if value.isdigit()
-                )
+                    return
+                uid_bytes = data[0] if data and data[0] else b""
+                for value in uid_bytes.split():
+                    if not value.isdigit():
+                        continue
+                    parsed_uid = int(value)
+                    # Some servers return the current last UID for an empty
+                    # range such as ``UID 1000:*``. Never let that regress
+                    # the durable high-water mark; UNSEEN remains independent
+                    # and still catches historical flag changes.
+                    if criteria.startswith("UID ") and parsed_uid < start_uid:
+                        continue
+                    uids.add(parsed_uid)
             uids = sorted(uids)
             for uid in uids:
                 fetched = self._imap_fetch_uid(mail, uid)
@@ -728,35 +806,37 @@ class EmailBot:
             self._safe_logout(mail)
 
     @staticmethod
-    def _imap_uidvalidity(mail) -> int:
+    def _imap_uidvalidity(mail) -> int | None:
         try:
             _status, values = mail.response("UIDVALIDITY")
             if values:
                 value = values[-1]
                 if isinstance(value, bytes):
                     value = value.split()[-1]
-                return int(value)
+                parsed = int(value)
+                return parsed if parsed > 0 else None
         except (AttributeError, TypeError, ValueError, imaplib.IMAP4.error):
             pass
-        # A missing response is unusual but still safer than sequence-number
-        # state: force a reconciliation epoch that is stable for this poll.
-        return 0
+        return None
 
     @staticmethod
     def _imap_fetch_uid(mail, uid: int):
         try:
             status, data = mail.uid("fetch", str(uid), "(UID BODY.PEEK[])")
         except (AttributeError, imaplib.IMAP4.error, OSError):
-            try:
-                status, data = mail.fetch(str(uid), "(RFC822)")
-            except Exception:
-                return None
+            return None
         if status != "OK" or not data:
             return None
         for part in data:
-            if isinstance(part, tuple) and len(part) > 1 and isinstance(part[1], bytes):
+            if (
+                isinstance(part, tuple)
+                and len(part) > 1
+                and isinstance(part[1], bytes)
+                and _uid_matches_fetch_metadata(part[0], uid)
+                and _looks_like_rfc822(part[1])
+            ):
                 return part[1]
-        return data[0] if isinstance(data[0], bytes) else None
+        return None
 
     def _retry_pending_seen(self, mail, mailbox: str, uidvalidity: int) -> None:
         assert self._state is not None
@@ -764,7 +844,7 @@ class EmailBot:
             if int(item["uidvalidity"]) != uidvalidity:
                 continue
             try:
-                ok = _mark_seen(mail, str(item["uid"]).encode("ascii"))
+                ok = _mark_seen_uid(mail, int(item["uid"]))
             except Exception:
                 ok = False
             if ok:
@@ -827,49 +907,45 @@ class EmailBot:
             logger.exception("Durable intake failed for UID %d", uid)
             return False
 
+        routing_pending = not accepted["intake_complete"]
         if accepted["duplicate"]:
             logger.debug("UID %d was already durably accepted", uid)
-            if command:
+        if routing_pending:
+            if urls:
+                logger.info(
+                    "Durably accepted mail UID %d with %s task",
+                    uid,
+                    platform or "unknown",
+                )
+            elif command:
                 self._ensure_command_task(source_id, metadata, body, command)
-        elif urls:
-            logger.info("Durably accepted mail UID %d with %s task", uid, platform or "unknown")
-        elif command:
-            self._ensure_command_task(source_id, metadata, body, command)
-        elif sender != cfg.email and sender_allowed and route_eligible:
-            # Preserve existing user-facing behavior for mail that was
-            # accepted but had no routable URL.
-            self._ensure_task_for_notice(
-                source_id,
-                metadata,
-                "no-url",
-                {
-                    "to_addr": sender,
-                    "body": "未在邮件中找到支持的视频链接，请发送抖音或 B 站分享链接。",
-                    "subject_status": "未找到链接",
-                },
-            )
+            elif sender != cfg.email and sender_allowed and route_eligible:
+                # Preserve existing user-facing behavior for mail that was
+                # accepted but had no routable URL.
+                self._ensure_task_for_notice(
+                    source_id,
+                    metadata,
+                    "no-url",
+                    {
+                        "to_addr": sender,
+                        "body": "未在邮件中找到支持的视频链接，请发送抖音或 B 站分享链接。",
+                        "subject_status": "未找到链接",
+                    },
+                )
 
-        if (
-            accepted["duplicate"]
-            and not urls
-            and sender != cfg.email
-            and sender_allowed
-            and route_eligible
-            and not command
-        ):
-            self._ensure_task_for_notice(
-                source_id,
-                metadata,
-                "no-url",
-                {
-                    "to_addr": sender,
-                    "body": "未在邮件中找到支持的视频链接，请发送抖音或 B 站分享链接。",
-                    "subject_status": "未找到链接",
-                },
-            )
+            # A source stays pending until URL routing or the safe notice has
+            # been persisted. This closes the crash window between source
+            # intake and creation of command/no-URL work.
+            try:
+                if not self._state.mark_intake_complete(source_id):
+                    logger.warning("Could not finalize durable intake for UID %d", uid)
+                    return False
+            except Exception:
+                logger.exception("Could not finalize durable intake for UID %d", uid)
+                return False
 
         try:
-            if _mark_seen(mail, str(uid).encode("ascii")):
+            if _mark_seen_uid(mail, uid):
                 self._state.ack_message(source_id)
         except Exception:
             logger.warning("Durable intake committed but IMAP \\Seen ACK failed for UID %d", uid)
@@ -879,41 +955,36 @@ class EmailBot:
         self, source_id: str, metadata: dict, body: str, command: str
     ) -> int:
         assert self._state is not None
-        task = self._state.enqueue_task(
-            source_id,
-            f"urn:mail-command:{command}",
-            payload={**metadata, "body": body, "command": command},
-            platform="cookie",
+        notice_url = f"urn:mail-notice:{command}"
+        existing = self._state.get_task(source_id, notice_url)
+        if existing is not None:
+            # A duplicate UID after a crash may reach this path again. The
+            # notice/outbox transaction is idempotent, so do not re-run a
+            # cookie side effect or send a second notification.
+            return int(existing["id"])
+        # Cookie input is deliberately processed in memory: durable state
+        # must not become a second plaintext cookie store. Only the resulting
+        # safe notification is persisted in the SMTP outbox.
+        notification, _safe_payload = self._process_cookie_command(
+            {"payload": {**metadata, "body": body, "command": command}}
         )
-        return int(task["id"])
+        return self._ensure_task_for_notice(
+            source_id,
+            metadata,
+            command,
+            notification,
+        )
 
     def _ensure_task_for_notice(
         self, source_id: str, metadata: dict, event: str, notification: dict
     ) -> int:
         assert self._state is not None
-        task = self._state.enqueue_task(
+        task = self._state.enqueue_notice(
             source_id,
-            f"urn:mail-notice:{event}",
-            payload={**metadata, "notification": notification, "event": event},
-            platform="notice",
+            event,
+            {**metadata, "notification": notification, "event": event},
+            notification,
         )
-        claimed = self._state.claim_tasks(
-            1,
-            lease_seconds=getattr(self.config.bot, "lease_seconds", 300),
-            filter={"id": task["id"]},
-        )
-        if claimed:
-            self._state.complete_task(
-                int(task["id"]),
-                claimed[0]["lease_token"],
-                result={"notice": event},
-                notification=notification,
-                outbox_event=event,
-            )
-        else:
-            # A duplicate notice may already be complete. INSERT OR IGNORE
-            # keeps its existing durable notification intact.
-            self._state.enqueue_outbox(int(task["id"]), event, notification)
         return int(task["id"])
 
     def _process_email(self, mail, msg_id: bytes, cfg, bot_cfg) -> None:
@@ -1119,31 +1190,35 @@ class EmailBot:
         return f"{sender}\n{url}"
 
     def _load_pending_retries(self) -> None:
-        try:
-            if not self._pending_retry_file.exists():
-                return
-            data = json.loads(self._pending_retry_file.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                self._pending_retries = {
-                    str(key): value
-                    for key, value in data.items()
-                    if isinstance(value, dict)
-                }
-                logger.info("Loaded %d pending retry link(s)", len(self._pending_retries))
-        except Exception as exc:
-            logger.warning("Failed to load pending retry file %s: %s", self._pending_retry_file, exc)
+        with self._pending_retry_lock:
+            try:
+                if not self._pending_retry_file.exists():
+                    return
+                data = json.loads(self._pending_retry_file.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    self._pending_retries = {
+                        str(key): value
+                        for key, value in data.items()
+                        if isinstance(value, dict)
+                    }
+                    logger.info("Loaded %d pending retry link(s)", len(self._pending_retries))
+            except Exception as exc:
+                logger.warning("Failed to load pending retry file %s: %s", self._pending_retry_file, exc)
 
-    def _save_pending_retries(self) -> None:
-        try:
-            self._pending_retry_file.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = self._pending_retry_file.with_suffix(self._pending_retry_file.suffix + ".tmp")
-            tmp_path.write_text(
-                json.dumps(self._pending_retries, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
-            tmp_path.replace(self._pending_retry_file)
-        except OSError as exc:
-            logger.error("Failed to save pending retry file %s: %s", self._pending_retry_file, exc)
+    def _save_pending_retries(self) -> bool:
+        with self._pending_retry_lock:
+            try:
+                self._pending_retry_file.parent.mkdir(parents=True, exist_ok=True)
+                tmp_path = self._pending_retry_file.with_suffix(self._pending_retry_file.suffix + ".tmp")
+                tmp_path.write_text(
+                    json.dumps(self._pending_retries, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                tmp_path.replace(self._pending_retry_file)
+                return True
+            except OSError as exc:
+                logger.error("Failed to save pending retry file %s: %s", self._pending_retry_file, exc)
+                return False
 
     def _enqueue_retry(
         self,
@@ -1499,6 +1574,52 @@ def _get_body_text(msg) -> str:
         charset = msg.get_content_charset() or "utf-8"
         return payload.decode(charset, errors="replace")
     return ""
+
+
+def _looks_like_rfc822(raw: bytes) -> bool:
+    """Reject IMAP protocol metadata accidentally returned as message data."""
+    if not isinstance(raw, bytes):
+        return False
+    header_block = raw.split(b"\r\n\r\n", 1)[0]
+    if header_block == raw:
+        header_block = raw.split(b"\n\n", 1)[0]
+    if not header_block or len(header_block) == len(raw) and b"\n" not in raw:
+        return False
+    return any(
+        re.match(rb"^[A-Za-z0-9-]+:", line) is not None
+        for line in header_block.splitlines()
+    )
+
+
+def _uid_matches_fetch_metadata(metadata, requested_uid: int) -> bool:
+    if isinstance(metadata, str):
+        metadata = metadata.encode("ascii", errors="ignore")
+    if not isinstance(metadata, bytes):
+        return False
+    match = re.search(rb"\bUID\s+([0-9]+)\b", metadata, flags=re.IGNORECASE)
+    if match is None:
+        return False
+    try:
+        return int(match.group(1)) == requested_uid
+    except (TypeError, ValueError):
+        return False
+
+
+def _mark_seen_uid(mail, uid: int) -> bool:
+    """Mark an IMAP message by UID; never fall back to sequence numbers."""
+    uid_str = str(uid)
+    try:
+        result = mail.uid("store", uid_str, "+FLAGS", "\\Seen")
+        if (
+            isinstance(result, tuple)
+            and len(result) == 2
+            and result[0] in ("OK", b"OK")
+        ):
+            return True
+    except Exception:
+        pass
+    logger.warning("Failed to mark UID as seen: %s", uid_str)
+    return False
 
 
 def _mark_seen(mail, msg_id: bytes) -> bool:

@@ -103,18 +103,26 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   private CA is allowed only through an explicit CA-bundle setting.
 - `_safe_logout()` closes the socket directly; do not restore blocking IMAP
   protocol logout after a broken connection.
-- Allowlist-, keyword-, and cooldown-skipped mail is initially left unseen but
-  already present in `_seen_ids`; the next poll normally marks it seen. A restart
-  before then can evaluate it again.
+- In the legacy path, allowlist- and keyword-skipped mail is initially left
+  unseen but already present in `_seen_ids`; the next poll normally marks it
+  seen. A restart before then can evaluate it again. Durable intake records
+  these routes as complete and ACKs them; cooldown is represented by queued
+  work rather than an intake skip.
+- If a UIDVALIDITY change strands an incomplete source from an older mailbox
+  generation, the source is retained and rollback remains blocked; do not
+  auto-ack or discard it. An operator must restore/reconcile the mailbox or
+  explicitly resolve the source before switching to the legacy path.
 - Durable mail processing is enabled by default. The IMAP coordinator uses
   `UID SEARCH`/`UID FETCH`, persists `(mailbox, UIDVALIDITY, UID)` in SQLite,
-  and marks `\\Seen` only after the intake transaction commits.
+  and marks `\\Seen` only after source routing is marked complete.
 - Download tasks and SMTP notifications run in bounded daemon workers with
   SQLite leases and heartbeats. Expired leases are recovered by an independent
   maintenance scheduler; the outbox reuses a stable Message-ID.
 - The old JSON retry queue remains as a rollback source and is imported
   idempotently at startup. `BOT_DURABLE_MAIL_ENABLED=0` selects the legacy
-  polling/retry path while SQLite and the JSON source remain untouched.
+  polling/retry path only after SQLite intake, pending `\\Seen` acknowledgements,
+  tasks, and outbox work are drained; startup refuses this mode when unfinished
+  durable work remains.
 - Firefox cookie extraction remains process-serialized; Douyin and Bilibili
   worker capacity is independently bounded by bot configuration.
 
@@ -207,6 +215,11 @@ transient retry queue and exhausted-link file paths. The Docker bot sets them
 to `/app/state/pending_retries.json` and `/app/state/failed_links.txt`.
 `BOT_STATE_DB` defaults to `/app/state/mail_state.sqlite3` in Docker; it must
 remain on the bot's persistent `state` volume and never on the NAS media mount.
+The state database is a `0600` runtime artifact. Cookie-command bodies are
+processed in memory and are not written to the database. On upgrade from the
+pre-v2 state schema, any legacy `platform=cookie` task is redacted and moved to
+terminal failure so the user must resend it safely; migration enables SQLite
+secure-delete and VACUUM/checkpoints the database/WAL before workers start.
 
 The checked-in config points downloads directly at
 `/srv/nas_data/douyin_downloads`. Docker overrides that host path with
