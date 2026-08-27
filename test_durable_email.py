@@ -1,4 +1,5 @@
 import sqlite3
+from email import message_from_bytes
 from email.message import EmailMessage
 from types import SimpleNamespace
 
@@ -8,7 +9,7 @@ from f2_bootstrap import bootstrap_f2
 
 
 bootstrap_f2()
-from email_bot import EmailBot, _mark_seen_uid
+from email_bot import EmailBot, _decode_str, _get_body_text, _mark_seen_uid
 from url_extractor import UrlExtractor
 from mail_state import MailStateStore
 
@@ -51,6 +52,36 @@ class FakeImap:
         return FakeSocket()
 
 
+class MultiUidImap(FakeImap):
+    def __init__(self, raws):
+        super().__init__(None)
+        self.raws = raws
+
+    def uid(self, command, *args):
+        if command == "search":
+            criteria = args[1]
+            if criteria.startswith("UID "):
+                start = int(criteria.split()[1].split(":", 1)[0])
+                uids = [uid for uid in self.raws if uid >= start]
+            else:
+                uids = list(self.raws)
+            return "OK", [" ".join(str(uid) for uid in uids).encode()]
+        if command == "fetch":
+            uid = int(args[0])
+            return "OK", [
+                (f"{uid} (UID {uid} BODY[] {{0}})".encode(), self.raws[uid])
+            ]
+        if command == "store":
+            self.stored.append((args[0], args[2]))
+            return "OK", [b"1"]
+        raise AssertionError(command)
+
+
+class LegacyImap(FakeImap):
+    def fetch(self, _msg_id, _query):
+        return "OK", [(b"9 (RFC822 {0})", self.raw)]
+
+
 def make_config(tmp_path):
     return SimpleNamespace(
         email=SimpleNamespace(email="bot@example.test", poll_interval=30),
@@ -80,13 +111,17 @@ def make_config(tmp_path):
     )
 
 
-def make_raw_mail(url="https://www.douyin.com/video/123"):
+def make_raw_mail(
+    url="https://www.douyin.com/video/123",
+    subject="下载",
+    message_id="<mail-9@example.test>",
+):
     msg = EmailMessage()
     msg["From"] = "user@example.test"
     msg["To"] = "bot@example.test"
-    msg["Subject"] = "下载"
-    msg["Message-ID"] = "<mail-9@example.test>"
-    msg.set_content(url)
+    msg["Subject"] = subject
+    msg["Message-ID"] = message_id
+    msg.set_content(url or "ordinary mail")
     return msg.as_bytes()
 
 
@@ -143,6 +178,143 @@ def make_bot(tmp_path):
     bot._platform_locks = {"douyin": __import__("threading").BoundedSemaphore(1)}
     bot._remove_legacy_retry = lambda _payload: None
     return bot
+
+
+def test_mail_text_decoding_handles_unknown_charset_and_multipart_subject():
+    raw = (
+        b"From: user@example.test\r\n"
+        b"Subject: =?unknown-8bit?b?5L2g?= =?utf-8?b?5aW9?=\r\n"
+        b"MIME-Version: 1.0\r\n"
+        b"Content-Type: text/plain; charset=x-unknown\r\n"
+        b"Content-Transfer-Encoding: 8bit\r\n"
+        b"\r\n\xe4\xbd\xa0\xe5\xa5\xbd"
+    )
+    msg = message_from_bytes(raw)
+
+    assert _decode_str(msg["Subject"]) == "你好"
+    assert _get_body_text(msg) == "你好"
+
+
+def test_legacy_email_routes_body_link_without_subject_keyword(tmp_path):
+    bot = make_bot(tmp_path)
+    bot._state.close()
+    bot._state = None
+    bot._seen_ids = set()
+    mail = LegacyImap(make_raw_mail(subject="随便看看"))
+    downloaded = []
+    replies = []
+    bot._download_url = lambda url: downloaded.append(url) or {
+        "success": True,
+        "filepath": "/tmp/video.mp4",
+        "title": "video",
+        "files": ["/tmp/video.mp4"],
+        "file_count": 1,
+    }
+    bot._send_reply = lambda *args, **kwargs: replies.append((args, kwargs))
+
+    bot._process_email(mail, b"9", bot.config.email, bot.config.bot)
+
+    assert downloaded == ["https://www.douyin.com/video/123"]
+    assert len(replies) == 1
+    assert mail.stored == [(b"9", "\\Seen")]
+
+
+def test_durable_email_routes_body_link_without_subject_keyword(tmp_path):
+    bot = make_bot(tmp_path)
+    mail = FakeImap(make_raw_mail(subject="随便看看"))
+    bot._imap_connect = lambda _cfg: mail
+
+    bot._poll_once_durable(bot.config.email, bot.config.bot)
+
+    task = bot._state._conn.execute(
+        "SELECT normalized_url FROM tasks"
+    ).fetchone()
+    assert task["normalized_url"] == "https://www.douyin.com/video/123"
+    assert bot._state._conn.execute("SELECT COUNT(*) FROM smtp_outbox").fetchone()[0] == 0
+    bot._state.close()
+
+
+def test_no_link_email_is_seen_without_smtp_notice_legacy_or_durable(tmp_path):
+    bot = make_bot(tmp_path)
+    bot._state.close()
+    bot._state = None
+    bot._seen_ids = set()
+    mail = LegacyImap(make_raw_mail(url=None, subject="普通通知"))
+    replies = []
+    bot._send_reply = lambda *args, **kwargs: replies.append((args, kwargs))
+
+    bot._process_email(mail, b"9", bot.config.email, bot.config.bot)
+
+    assert replies == []
+    assert mail.stored == [(b"9", "\\Seen")]
+
+    durable = make_bot(tmp_path / "durable")
+    durable_mail = FakeImap(make_raw_mail(url=None, subject="普通通知"))
+    durable._imap_connect = lambda _cfg: durable_mail
+    durable._poll_once_durable(durable.config.email, durable.config.bot)
+
+    assert durable_mail.stored == [("9", "\\Seen")]
+    assert durable._state._conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    assert durable._state._conn.execute("SELECT COUNT(*) FROM smtp_outbox").fetchone()[0] == 0
+    bot._state = None
+    durable._state.close()
+
+
+def test_durable_routing_exception_is_quarantined_and_next_uid_continues(tmp_path, monkeypatch):
+    bot = make_bot(tmp_path)
+    raw_bad = make_raw_mail(
+        url="secret body", subject="bad subject", message_id="<bad@example.test>"
+    )
+    raw_good = make_raw_mail(
+        subject="普通主题", message_id="<good@example.test>"
+    )
+    mail = MultiUidImap({9: raw_bad, 10: raw_good})
+    bot._imap_connect = lambda _cfg: mail
+
+    def extract(text):
+        if "secret body" in text:
+            raise ValueError("secret subject/body detail")
+        return "https://www.douyin.com/video/123"
+
+    monkeypatch.setattr(bot.extractor, "extract", extract)
+    bot._poll_once_durable(bot.config.email, bot.config.bot)
+
+    quarantined = bot._state._conn.execute(
+        "SELECT metadata_json, intake_complete, seen_at FROM source_messages "
+        "WHERE source_message_id = ?",
+        ("INBOX:77:9",),
+    ).fetchone()
+    assert quarantined["intake_complete"] == 1
+    assert quarantined["seen_at"] is not None
+    assert quarantined["metadata_json"] == (
+        '{"intake_error": "ValueError", "raw_sha256": "'
+        + __import__("hashlib").sha256(raw_bad).hexdigest()
+        + '", "uid": 9, "uidvalidity": 77}'
+    )
+    assert "secret subject/body detail" not in quarantined["metadata_json"]
+    assert mail.stored == [("9", "\\Seen"), ("10", "\\Seen")]
+    assert bot._state._conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+    bot._state.close()
+
+
+def test_repeated_durable_poll_does_not_duplicate_tasks_or_outbox(tmp_path):
+    bot = make_bot(tmp_path)
+    mail = FakeImap(make_raw_mail())
+    bot._imap_connect = lambda _cfg: mail
+
+    bot._poll_once_durable(bot.config.email, bot.config.bot)
+    counts_before = [
+        bot._state._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in ("tasks", "smtp_outbox")
+    ]
+    bot._poll_once_durable(bot.config.email, bot.config.bot)
+    counts_after = [
+        bot._state._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        for table in ("tasks", "smtp_outbox")
+    ]
+
+    assert counts_before == counts_after == [1, 0]
+    bot._state.close()
 
 
 def test_uid_intake_commits_before_seen_and_creates_one_task(tmp_path):
@@ -465,35 +637,28 @@ def test_seen_ack_rejects_malformed_uid_store_result(response):
     assert _mark_seen_uid(MalformedStore(), 9) is False
 
 
-def test_route_failure_keeps_source_unacknowledged_and_recoverable(tmp_path):
+def test_route_failure_is_quarantined_and_acknowledged(tmp_path):
     bot = make_bot(tmp_path)
     mail = FakeImap(make_raw_cookie_mail())
+    bot._imap_connect = lambda _cfg: mail
     bot._ensure_command_task = lambda *_args: (_ for _ in ()).throw(
         RuntimeError("simulated crash before notice")
     )
 
-    with pytest.raises(RuntimeError, match="simulated crash"):
-        bot._durably_accept_email(
-            mail,
-            "INBOX",
-            77,
-            12,
-            "INBOX:77:12",
-            mail.raw,
-            bot.config.email,
-            bot.config.bot,
-        )
+    bot._poll_once_durable(bot.config.email, bot.config.bot)
 
     source = bot._state._conn.execute(
-        "SELECT intake_complete, seen_at FROM source_messages "
+        "SELECT metadata_json, intake_complete, seen_at FROM source_messages "
         "WHERE source_message_id = ?",
-        ("INBOX:77:12",),
+        ("INBOX:77:9",),
     ).fetchone()
-    assert dict(source) == {"intake_complete": 0, "seen_at": None}
+    assert source["intake_complete"] == 1
+    assert source["seen_at"] is not None
+    assert "RuntimeError" in source["metadata_json"]
+    assert "simulated crash before notice" not in source["metadata_json"]
     assert bot._state.pending_seen("INBOX") == []
-    assert bot._state.pending_intake("INBOX", 77)[0]["uid"] == 12
-    assert bot._state.unfinished_work_counts()["intake"] == 1
-    assert mail.stored == []
+    assert bot._state.pending_intake("INBOX", 77) == []
+    assert mail.stored == [("9", "\\Seen")]
     bot._state.close()
 
 

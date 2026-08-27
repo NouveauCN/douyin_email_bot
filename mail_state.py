@@ -511,6 +511,24 @@ class MailStateStore:
             )
             return self._conn.execute("SELECT changes()").fetchone()[0] == 1
 
+    def replace_source_metadata(
+        self,
+        source_message_id: str,
+        metadata: dict[str, Any],
+        *,
+        now: float | None = None,
+    ) -> bool:
+        """Replace source metadata, e.g. when quarantining a failed intake."""
+        timestamp = self._now(now)
+        with self._lock, self._transaction():
+            self._ensure_open()
+            cursor = self._conn.execute(
+                "UPDATE source_messages SET metadata_json = ?, updated_at = ? "
+                "WHERE source_message_id = ?",
+                (self._json(metadata), timestamp, source_message_id),
+            )
+            return cursor.rowcount == 1
+
     def set_mailbox_position(
         self, mailbox: str, uidvalidity: int, last_uid: int, *, now: float | None = None
     ) -> dict[str, Any]:

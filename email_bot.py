@@ -6,6 +6,7 @@ Also supports cookie management commands via email:
 """
 
 import email
+import hashlib
 import imaplib
 import json
 import logging
@@ -797,9 +798,24 @@ class EmailBot:
                     logger.warning("Could not fetch IMAP UID %d; stopping reconciliation", uid)
                     break
                 source_id = f"{mailbox}:{uidvalidity}:{uid}"
-                accepted = self._durably_accept_email(
-                    mail, mailbox, uidvalidity, uid, source_id, fetched, cfg, bot_cfg
-                )
+                try:
+                    accepted = self._durably_accept_email(
+                        mail, mailbox, uidvalidity, uid, source_id, fetched, cfg, bot_cfg
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        "Durable routing failed for UID %d; quarantining message",
+                        uid,
+                    )
+                    accepted = self._quarantine_durable_email(
+                        mail,
+                        mailbox,
+                        uidvalidity,
+                        uid,
+                        source_id,
+                        fetched,
+                        exc,
+                    )
                 if not accepted:
                     break
         finally:
@@ -863,35 +879,51 @@ class EmailBot:
     ) -> bool:
         """Commit source identity and route work before attempting IMAP STORE."""
         assert self._state is not None
-        msg = email.message_from_bytes(raw)
-        sender = _extract_addr(msg.get("From", ""))
-        subject = _decode_str(msg.get("Subject", ""))
-        if not sender:
-            sender = "unknown-sender"
-        body = _get_body_text(msg)
-        metadata = {
-            "sender": sender,
-            "subject": subject,
-            "message_id": msg.get("Message-ID", ""),
-            "raw_sha256": __import__("hashlib").sha256(raw).hexdigest(),
-        }
-
+        raw_sha256 = hashlib.sha256(raw).hexdigest()
         urls: list[str] = []
         platform = None
         command = None
-        keyword = getattr(bot_cfg, "subject_keyword", "下载")
-        route_eligible = not keyword or keyword in subject
-        sender_allowed = not bot_cfg.allowed_senders or sender in bot_cfg.allowed_senders
-        if sender != cfg.email and sender_allowed:
-            if bot_cfg.commands.cookie_update and bot_cfg.commands.cookie_update in subject:
-                command = "cookie_update"
-            elif bot_cfg.commands.cookie_auto and bot_cfg.commands.cookie_auto in subject:
-                command = "cookie_auto"
-            elif route_eligible:
-                url = self.extractor.extract(subject + " " + body)
-                if url:
-                    urls = [url]
-                    platform = detect_platform(url)
+        routing_error = None
+        try:
+            msg = email.message_from_bytes(raw)
+            sender = _extract_addr(msg.get("From", ""))
+            subject = _decode_str(msg.get("Subject", ""))
+            if not sender:
+                sender = "unknown-sender"
+            body = _get_body_text(msg)
+            metadata = {
+                "sender": sender,
+                "subject": subject,
+                "message_id": msg.get("Message-ID", ""),
+                "raw_sha256": raw_sha256,
+            }
+
+            sender_allowed = not bot_cfg.allowed_senders or sender in bot_cfg.allowed_senders
+            if sender != cfg.email and sender_allowed:
+                if bot_cfg.commands.cookie_update and bot_cfg.commands.cookie_update in subject:
+                    command = "cookie_update"
+                elif bot_cfg.commands.cookie_auto and bot_cfg.commands.cookie_auto in subject:
+                    command = "cookie_auto"
+                else:
+                    url = self.extractor.extract(subject + " " + body)
+                    if url:
+                        urls = [url]
+                        platform = detect_platform(url)
+        except Exception as exc:
+            routing_error = type(exc).__name__
+            logger.warning(
+                "Safely isolating durable mail UID %d after %s during parsing/routing",
+                uid,
+                routing_error,
+            )
+            sender = None
+            body = ""
+            metadata = {
+                "uid": uid,
+                "uidvalidity": uidvalidity,
+                "raw_sha256": raw_sha256,
+                "intake_error": routing_error,
+            }
 
         try:
             accepted = self._state.accept_message(
@@ -900,7 +932,9 @@ class EmailBot:
                 uid,
                 source_id,
                 urls,
-                metadata={**metadata, "platform": platform},
+                metadata=metadata
+                if routing_error
+                else {**metadata, "platform": platform},
                 platform=platform,
             )
         except Exception:
@@ -911,7 +945,12 @@ class EmailBot:
         if accepted["duplicate"]:
             logger.debug("UID %d was already durably accepted", uid)
         if routing_pending:
-            if urls:
+            if routing_error:
+                # A fetched message must not block the UID reconciliation
+                # loop merely because its content could not be routed. Keep
+                # only the safe quarantine metadata above.
+                pass
+            elif urls:
                 logger.info(
                     "Durably accepted mail UID %d with %s task",
                     uid,
@@ -919,23 +958,9 @@ class EmailBot:
                 )
             elif command:
                 self._ensure_command_task(source_id, metadata, body, command)
-            elif sender != cfg.email and sender_allowed and route_eligible:
-                # Preserve existing user-facing behavior for mail that was
-                # accepted but had no routable URL.
-                self._ensure_task_for_notice(
-                    source_id,
-                    metadata,
-                    "no-url",
-                    {
-                        "to_addr": sender,
-                        "body": "未在邮件中找到支持的视频链接，请发送抖音或 B 站分享链接。",
-                        "subject_status": "未找到链接",
-                    },
-                )
 
-            # A source stays pending until URL routing or the safe notice has
-            # been persisted. This closes the crash window between source
-            # intake and creation of command/no-URL work.
+            # A source stays pending until URL/command routing (or the safe
+            # empty/quarantine intake) has been persisted.
             try:
                 if not self._state.mark_intake_complete(source_id):
                     logger.warning("Could not finalize durable intake for UID %d", uid)
@@ -950,6 +975,49 @@ class EmailBot:
         except Exception:
             logger.warning("Durable intake committed but IMAP \\Seen ACK failed for UID %d", uid)
         return True
+
+    def _quarantine_durable_email(
+        self,
+        mail,
+        mailbox: str,
+        uidvalidity: int,
+        uid: int,
+        source_id: str,
+        raw: bytes,
+        error: BaseException,
+    ) -> bool:
+        """Persist safe error metadata, acknowledge, and isolate one mail."""
+        assert self._state is not None
+        metadata = {
+            "uid": uid,
+            "uidvalidity": uidvalidity,
+            "raw_sha256": hashlib.sha256(raw).hexdigest(),
+            "intake_error": type(error).__name__,
+        }
+        try:
+            accepted = self._state.accept_message(
+                mailbox,
+                uidvalidity,
+                uid,
+                source_id,
+                [],
+                metadata=metadata,
+            )
+            if not self._state.replace_source_metadata(source_id, metadata):
+                logger.error("Could not persist quarantine metadata for UID %d", uid)
+                return False
+            if (
+                not accepted["intake_complete"]
+                and not self._state.mark_intake_complete(source_id)
+            ):
+                logger.error("Could not finalize quarantined intake for UID %d", uid)
+                return False
+            if _mark_seen_uid(mail, uid):
+                self._state.ack_message(source_id)
+            return True
+        except Exception:
+            logger.exception("Could not quarantine malformed email UID %d", uid)
+            return False
 
     def _ensure_command_task(
         self, source_id: str, metadata: dict, body: str, command: str
@@ -1035,20 +1103,9 @@ class EmailBot:
             return
 
         # ── Normal: download ───────────────────────────────────────
-        keyword = bot_cfg.subject_keyword
-        if keyword and keyword not in subject:
-            logger.debug("Skipping — subject missing keyword '%s': %s", keyword, subject)
-            return
-
         url = self.extractor.extract(subject + " " + body)
         if url is None:
-            logger.info("No supported URL found from %s (subject: %s)", sender, subject)
-            self._send_reply(
-                cfg,
-                sender,
-                "未在邮件中找到支持的视频链接，请发送抖音或 B 站分享链接。",
-                subject_status="未找到链接",
-            )
+            logger.debug("No supported URL found from %s (subject: %s)", sender, subject)
             _mark_seen(mail, msg_id)
             return
 
@@ -1550,10 +1607,18 @@ def _decode_str(header: str) -> str:
     result = []
     for text, charset in parts:
         if isinstance(text, bytes):
-            result.append(text.decode(charset or "utf-8", errors="replace"))
+            result.append(_decode_bytes(text, charset))
         else:
             result.append(text)
     return "".join(result)
+
+
+def _decode_bytes(value: bytes, charset: str | None = None) -> str:
+    """Decode mail text safely, falling back for unknown charset labels."""
+    try:
+        return value.decode(charset or "utf-8", errors="replace")
+    except (LookupError, TypeError, ValueError):
+        return value.decode("utf-8", errors="replace")
 
 
 def _get_body_text(msg) -> str:
@@ -1566,13 +1631,13 @@ def _get_body_text(msg) -> str:
                 payload = part.get_payload(decode=True)
                 if payload:
                     charset = part.get_content_charset() or "utf-8"
-                    parts.append(payload.decode(charset, errors="replace"))
+                    parts.append(_decode_bytes(payload, charset))
         return "\n".join(parts)
 
     payload = msg.get_payload(decode=True)
     if payload:
         charset = msg.get_content_charset() or "utf-8"
-        return payload.decode(charset, errors="replace")
+        return _decode_bytes(payload, charset)
     return ""
 
 

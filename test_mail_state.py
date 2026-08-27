@@ -281,6 +281,32 @@ def test_duplicate_intake_and_urls_are_idempotent(tmp_path):
     store.close()
 
 
+def test_source_metadata_can_be_replaced_for_quarantine(tmp_path):
+    store = make_store(tmp_path)
+    store.accept_message(
+        "INBOX",
+        7,
+        11,
+        "m1",
+        [],
+        metadata={"sender": "user@example.test", "subject": "private subject"},
+    )
+
+    assert store.replace_source_metadata(
+        "m1",
+        {"uid": 11, "raw_sha256": "hash", "intake_error": "ValueError"},
+    ) is True
+    row = store._conn.execute(
+        "SELECT metadata_json FROM source_messages WHERE source_message_id = ?",
+        ("m1",),
+    ).fetchone()
+    assert row["metadata_json"] == (
+        '{"intake_error": "ValueError", "raw_sha256": "hash", "uid": 11}'
+    )
+    assert store.replace_source_metadata("missing", {}) is False
+    store.close()
+
+
 def test_intake_marker_precedes_seen_ack_and_rollback_drain(tmp_path):
     store = make_store(tmp_path)
     accepted = store.accept_message("INBOX", 7, 11, "m1", [])
