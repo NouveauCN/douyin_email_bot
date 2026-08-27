@@ -1,6 +1,6 @@
 # Security and Upgrade Roadmap
 
-Last reviewed: 2026-08-26
+Last reviewed: 2026-08-27
 
 This document records the planned follow-up work after the repository-wide
 audit merged in PR #14. Each phase should be delivered as a separate pull
@@ -8,6 +8,11 @@ request so security, dependency, deployment, and structural changes can be
 validated and rolled back independently.
 
 ## Delivery Order
+
+Durable mail intake and delivery must precede any low-latency event optimization.
+IMAP IDLE, if adopted, is only a wake-up hint: it must not replace periodic UID
+reconciliation or the existing polling fallback. External mail webhooks and
+message queues remain deferred until the local workflow needs them.
 
 ### Phase 1: Web Security Boundary (P0)
 
@@ -177,7 +182,9 @@ Also add:
 - `/healthz` and `/readyz` for both Flask services;
 - a bot heartbeat that proves the polling loop is progressing;
 - Docker Compose health checks and startup grace periods;
-- graceful shutdown and bounded request/process timeouts.
+- graceful shutdown that stops intake, drains bounded workers within a deadline,
+  and leaves leased tasks recoverable after restart;
+- bounded request and subprocess timeouts.
 
 Acceptance criteria:
 
@@ -186,13 +193,69 @@ Acceptance criteria:
 - Host and container readers observe the same updated secret.
 - Container health reflects application readiness, not only process existence.
 
-### Phase 5: Production Serving and Maintainability (P1/P2)
+### Phase 5: Durable Mail Processing and Delivery (P1)
+
+Make mail intake reliable before optimizing its trigger latency. Keep the
+30-second polling loop as the default while this phase is being introduced.
+
+- Persist mailbox identity and processing position as `(mailbox, UIDVALIDITY,
+  UID)`; treat the current in-memory `_seen_ids` and sequence numbers only as
+  legacy behavior during migration. Reconcile safely after UIDVALIDITY changes.
+- Add a SQLite task-state store under the bot's persistent `state` volume, not
+  the NAS media mount. Use unique idempotency constraints that distinguish a
+  source message from each normalized URL or media item it creates.
+- Decouple IMAP receipt from media download and SMTP delivery through bounded
+  workers. A slow or failed Douyin/Bilibili download must not block intake,
+  retries, or maintenance tasks.
+- Add expiring worker leases and heartbeats so interrupted tasks become
+  recoverable after process or container restart. Keep Firefox cookie access
+  serialized and apply explicit per-platform concurrency limits.
+- Add a durable SMTP outbox with send state, retry status, and recovery after
+  interruption. Do not delete a retry record until the corresponding durable
+  notification state is safe.
+- Run transient retry processing, media-backup cleanup, and other maintenance
+  work from independent schedulers rather than coupling them to one IMAP poll
+  iteration.
+- Add fault-injection coverage for disconnects, UIDVALIDITY changes, duplicate
+  delivery, crashes between state transitions, lease expiry, `\Seen` failures,
+  and SMTP failures or ambiguous responses.
+- Explicitly defer external mail webhooks and external message queues; first
+  stabilize the local SQLite-based workflow.
+
+Acceptance criteria:
+
+- A long-running download does not prevent new mail from being durably accepted
+  into the task store.
+- Process and worker restarts recover all leased work without silent loss, and
+  duplicate IMAP events do not create duplicate download jobs or notifications.
+- `\Seen` is applied only after durable intake succeeds; failed SMTP delivery
+  remains recoverable through the outbox.
+- Retry and cleanup tasks run on their own schedules even when no new mail
+  arrives, and the state database survives bot container replacement.
+- Mocked integration and fault-injection tests cover the failure transitions
+  above without live email, browser, or media downloads.
+
+Rollback point: retain the existing polling intake behind a feature flag while
+the SQLite state store is additive and its migration is reversible. Do not
+remove the existing retry files until recovery and rollback have been tested.
+
+Optional follow-up:
+
+- Add IMAP IDLE as a configurable wake-up layer after the durable workflow is
+  stable. Check server capability, periodically leave and re-enter IDLE,
+  reconnect with exponential backoff, and always perform periodic UID
+  reconciliation. Fall back to polling when IDLE is unsupported or unhealthy.
+- Adopt this only if a measured mail-trigger latency target justifies the
+  additional long-connection complexity; otherwise retain 30-second polling.
+
+### Phase 6: Production Serving and Maintainability (P1/P2)
 
 - Replace Flask's development server with a production WSGI server.
 - Initially use one worker because file-browser dedup state and the Firefox
   browser lock are process-local; add threads only after focused concurrency
   tests.
-- Move long FFmpeg work to a bounded background executor or task queue.
+- Reuse the internal bounded worker and task-state model for long FFmpeg work;
+  do not introduce an external webhook or message queue in this phase.
 - Add CI for Python 3.12, tests, compilation, diff checks, Compose validation,
   image build smoke tests, linting, and dependency/security scans.
 - After the security and deployment work is stable, split inline templates and
@@ -213,6 +276,18 @@ Acceptance criteria:
    private CA through `DOUYIN_SHORT_LINK_CA_BUNDLE`.
 4. Decided: install the authoritative `uv.lock` directly with a pinned uv
    version in the image; do not commit a second exported requirements artifact.
+5. Mail acknowledgement: decide whether `\Seen` means durable intake or full
+   business completion; the recommended contract is durable intake, with final
+   success or failure represented by the SMTP outbox.
+6. Mail identity and recovery: define the UIDVALIDITY reset procedure, SQLite
+   path and backup policy, task idempotency keys, lease duration, retry limits,
+   and the migration/rollback behavior for the existing JSON retry files.
+7. Capacity and delivery: set global and per-platform worker limits, define
+   cookie-extraction serialization, and decide how SMTP ambiguous responses or
+   duplicate notifications are handled.
+8. Latency target: measure whether the service needs sub-30-second or roughly
+   P95-under-5-second intake latency. Enable IMAP IDLE only if that target
+   justifies its long-connection and recovery complexity.
 
 ## Verification Baseline for Every Phase
 
