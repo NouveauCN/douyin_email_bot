@@ -18,6 +18,8 @@ email:
   #       legacy .env file. See .env.example for bootstrap variables:
   #         EMAIL_ADDRESS=your_bot@qq.com
   #         EMAIL_PASSWORD=your_authorization_code
+  # Set EMAIL_SEND_REPLIES=false temporarily to process downloads silently.
+  send_replies: true
 
 # Douyin download settings
 douyin:

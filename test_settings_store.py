@@ -178,7 +178,7 @@ def test_every_registered_setting_has_safe_help_metadata_and_type(tmp_path):
     store = SettingsStore(tmp_path / "settings.sqlite3")
     snapshot = store.snapshot()
 
-    assert len(SETTING_REGISTRY) == 43
+    assert len(SETTING_REGISTRY) == 44
     assert set(snapshot) == set(SETTING_REGISTRY)
     for key, definition in SETTING_REGISTRY.items():
         field = snapshot[key]

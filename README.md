@@ -110,6 +110,11 @@ Docker 部署时，失败清单和自动重试队列保存在 bot 的 `state` na
 下载与回复由有界 worker 异步处理；SMTP 失败、进程重启或租约过期都会在
 后续调度中恢复。旧 JSON 队列会保留为回滚源。迁移工具默认只检查不写入：
 
+临时验收时可在 `.env` 设置 `EMAIL_SEND_REPLIES=0`；它不会停止收件、下载、
+重试或失败清单投影，只会暂停新 SMTP 回信，已有 outbox 也会保留。用于真实
+邮箱入口的 `SENDER_ADDRESS` / `SENDER_PASSWORD` 仅应由显式 E2E 驱动读取，
+不要写入生产 managed settings。
+
 ```bash
 uv run python migrate_mail_state.py --pending ./pending_retries.json
 uv run python migrate_mail_state.py --pending ./pending_retries.json --apply
@@ -219,6 +224,7 @@ Bot 会通过 `douyin.cookie` 的 hot reload 立即读取，Cookie 内容不会�
 | `email.smtp_port` | int | `587` | SMTP STARTTLS 端口 |
 | `email.email` | str | `""` | **必填**（managed settings 或 `.env` `EMAIL_ADDRESS`），机器人邮箱地址 |
 | `email.password` | str | `""` | **必填**（managed settings 或 `.env` `EMAIL_PASSWORD`），QQ 邮箱授权码 |
+| `email.send_replies` | bool | `true` | 是否发送下载结果回信；设为 `false`/`EMAIL_SEND_REPLIES=0` 时仍处理下载但静默跳过 SMTP |
 | `email.poll_interval` | int | `30` | 收件箱轮询间隔（秒） |
 | `email.smtp_timeout` | int | `30` | SMTP 连接与发送超时（秒）；由 managed settings/YAML 控制，只有显式外部环境变量注入时锁定 |
 | `douyin.cookie` | str | `""` | **必填**（managed settings 或 `.env` `DOUYIN_COOKIE`），抖音登录 cookie |

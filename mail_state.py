@@ -565,7 +565,7 @@ class MailStateStore:
             self._ensure_open()
             rows = self._conn.execute(
                 "SELECT id, payload_json FROM tasks "
-                "WHERE status IN ('succeeded', 'failed')"
+                "WHERE status IN ('succeeded', 'partially_succeeded', 'failed')"
             ).fetchall()
             keys: set[str] = set()
             for row in rows:
@@ -1307,6 +1307,7 @@ class MailStateStore:
         consumer: str | None = None,
         limit: int = 100,
         include_consumed: bool = False,
+        after_id: int | None = None,
     ) -> list[dict[str, Any]]:
         """Read immutable events, optionally filtered by a consumer cursor."""
         if limit < 1:
@@ -1322,6 +1323,9 @@ class MailStateStore:
                 )
                 params.append(consumer)
             query += " WHERE 1=1"
+            if after_id is not None:
+                query += " AND e.id > ?"
+                params.append(int(after_id))
             if consumer is not None and not include_consumed:
                 query += " AND c.event_id IS NULL"
             query += " ORDER BY e.id LIMIT ?"
@@ -1350,6 +1354,19 @@ class MailStateStore:
                 (event_id, consumer, timestamp),
             )
             return cursor.rowcount == 1
+
+    def task_event_consumed(self, event_id: int, consumer: str) -> bool:
+        """Return whether one consumer has acknowledged an event."""
+        consumer = str(consumer).strip()
+        if not consumer:
+            raise ValueError("consumer must not be empty")
+        with self._lock:
+            self._ensure_open()
+            return self._conn.execute(
+                "SELECT 1 FROM task_event_consumptions "
+                "WHERE event_id = ? AND consumer = ?",
+                (event_id, consumer),
+            ).fetchone() is not None
 
     def project_task_event(
         self,

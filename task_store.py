@@ -238,9 +238,13 @@ class TaskStore:
         consumer: str | None = None,
         limit: int = 100,
         include_consumed: bool = False,
+        after_id: int | None = None,
     ) -> list[dict[str, Any]]:
         return self.state.list_task_events(
-            consumer=consumer, limit=limit, include_consumed=include_consumed
+            consumer=consumer,
+            limit=limit,
+            include_consumed=include_consumed,
+            after_id=after_id,
         )
 
     def consume_event(

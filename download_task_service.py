@@ -185,6 +185,7 @@ class DownloadTaskService:
         clock: Callable[[], float] = time.time,
         before_execute: Callable[[TaskSnapshot], None] | None = None,
         after_execute: Callable[[TaskSnapshot, DownloadResult], None] | None = None,
+        on_execute_finished: TaskCallback | None = None,
     ) -> None:
         if worker_count < 1 or max_attempts < 1:
             raise ValueError("worker_count and max_attempts must be positive")
@@ -203,6 +204,7 @@ class DownloadTaskService:
         self.clock = clock
         self.before_execute = before_execute
         self.after_execute = after_execute
+        self.on_execute_finished = on_execute_finished
         self._stop = threading.Event()
         self._quiesced = threading.Event()
         self._claim_gate = threading.Lock()
@@ -430,6 +432,11 @@ class DownloadTaskService:
             if updated is not None:
                 self._notify(updated)
         finally:
+            if self.on_execute_finished is not None:
+                try:
+                    self.on_execute_finished(task)
+                except Exception:
+                    logger.exception("Task cleanup callback failed for task %d", task.task_id)
             heartbeat_stop.set()
             heartbeat.join(timeout=2)
             if slot is not None:

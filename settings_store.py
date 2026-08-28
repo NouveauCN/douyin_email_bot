@@ -90,6 +90,11 @@ _SETTING_HELP: dict[str, dict[str, str | None]] = {
         "unit": "秒",
         "example": "30",
     },
+    "email.send_replies": {
+        "label": "发送下载回信",
+        "description": "关闭后仍会接收邮件并处理下载，但不会创建或投递 SMTP 回信。",
+        "example": "true",
+    },
     "douyin.download_path": {
         "label": "抖音下载目录",
         "description": "抖音视频和图片保存的根目录，由部署环境管理。",
@@ -300,6 +305,7 @@ def _defs() -> tuple[SettingDefinition, ...]:
         ("email.password", "EMAIL_PASSWORD", "str", True, True, "restart"),
         ("email.poll_interval", "EMAIL_POLL_INTERVAL", "int", False, True, "restart"),
         ("email.smtp_timeout", "SMTP_TIMEOUT", "int", False, True, "restart"),
+        ("email.send_replies", "EMAIL_SEND_REPLIES", "bool", False, True, "restart"),
         ("douyin.download_path", "DOUYIN_DOWNLOAD_PATH", "path", False, False, "restart"),
         ("douyin.cookie", "DOUYIN_COOKIE", "str", True, True, "hot"),
         ("douyin.naming", "DOUYIN_NAMING", "str", False, True, "restart"),
@@ -347,6 +353,7 @@ DEFAULT_VALUES: dict[str, Any] = {
     "email.smtp_server": "smtp.qq.com", "email.smtp_port": 587,
     "email.email": "", "email.password": "", "email.poll_interval": 30,
     "email.smtp_timeout": 30, "douyin.download_path": "./downloads",
+    "email.send_replies": True,
     "douyin.cookie": "", "douyin.naming": "{create}_{aweme_id}",
     "douyin.folderize": True, "douyin.timeout": 30, "douyin.max_retries": 3,
     "douyin.max_tasks": 5, "bilibili.download_path": "./downloads/bilibili",

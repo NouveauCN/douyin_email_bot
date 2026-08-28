@@ -100,6 +100,11 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   `get_cookie.py`; the mail adapter must not refresh Firefox implicitly.
 - Persist transient network/timeout failures in the configured retry queue;
   exhausted links go to the configured failure file.
+- Durable terminal failure projection is idempotent by `task_id`. During
+  upgrades, only an already-consumed event may reuse an exact matching
+  unkeyed legacy failure row (same sender, platform, URL, and error), so
+  replay does not duplicate an old record; new terminal rows always include
+  `task_id`.
 - In Docker, keep the retry queue and failure file under the bot's named
   `state` volume (`/app/state`); do not rely on the container writable layer.
 - Cache successful `v.douyin.com` resolutions so later attempts can use the
@@ -125,6 +130,11 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
 - Download tasks and SMTP notifications run in bounded daemon workers with
   SQLite leases and heartbeats. Expired leases are recovered by an independent
   maintenance scheduler; the outbox reuses a stable Message-ID.
+- `EMAIL_SEND_REPLIES=0` is a temporary fail-safe for silent processing: intake,
+  downloads, retries, terminal state, and failure records continue, terminal
+  events are consumed without creating new SMTP outbox rows, and the SMTP
+  worker is not started. Existing outbox rows are preserved for a later run
+  with replies enabled.
 - The old JSON retry queue remains as a rollback source and is imported
   idempotently at startup. `BOT_DURABLE_MAIL_ENABLED=0` selects the legacy
   polling/retry path only after SQLite intake, pending `\\Seen` acknowledgements,
@@ -245,6 +255,10 @@ deliberately supplied, in which case the field is locked in the Settings tab.
 `config_loader.py` is the source of truth for environment-variable mappings.
 Sensitive variables include `EMAIL_ADDRESS`, `EMAIL_PASSWORD`, `DOUYIN_COOKIE`,
 and `BILIBILI_AUTH`; `BILIBILI_AUTH_FILE` may reference sensitive login state.
+`EMAIL_SEND_REPLIES` controls SMTP result notifications and defaults to enabled;
+it does not disable mail intake or downloads. `SENDER_ADDRESS` and
+`SENDER_PASSWORD` are test-driver-only credentials and must not be added to
+production `EmailConfig` or persisted in managed settings.
 Relative configured paths resolve against the directory containing
 `config.yaml`, not the process working directory.
 
