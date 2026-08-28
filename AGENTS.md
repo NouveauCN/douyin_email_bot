@@ -10,7 +10,10 @@ service on port 8080, and a trusted-LAN file browser on port 8081.
 
 ```text
 main.py                 Bot entry point and order-sensitive F2 bootstrap
-email_bot.py            IMAP loop, routing, retries, SMTP, cookie refresh
+email_bot.py            IMAP intake adapter, SMTP projector, lifecycle control
+download_types.py       Public task/result/source contracts
+task_store.py           Generic task facade over the durable SQLite store
+download_task_service.py Registry, stateless executor, leases, retry workers
 mail_state.py           SQLite mailbox position, task leases, and SMTP outbox
 settings_store.py       SQLite managed runtime configuration and revisions
 migrate_mail_state.py   Dry-run/apply migration for legacy JSON retries
@@ -35,7 +38,8 @@ docker-compose.yml      bot, web_login, and file_browser services
 Main flow:
 
 ```text
-IMAP -> EmailBot -> UrlExtractor -> platform downloader -> SMTP reply
+IMAP -> EmailBot -> UrlExtractor -> DownloadTaskService -> platform adapter
+                                              -> task event -> email outbox -> SMTP reply
 ```
 
 ## Safety And Boundaries
@@ -89,10 +93,11 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
 
 - Poll IMAP over SSL for `UNSEEN`, skip the bot's own mail, and deduplicate IMAP
   IDs in memory.
-- Apply the optional sender allowlist before cookie commands. Cookie commands
-  run before the normal subject-keyword requirement.
+- Apply the optional sender allowlist before normal download routing. Cookie
+  updates are handled by Web Login or the CLI, never by an email body.
 - Cooldown is per sender and is set after a successful download.
-- Retry cookie-like Douyin failures once after Firefox extraction succeeds.
+- Douyin download failures must point operators to Web Login or
+  `get_cookie.py`; the mail adapter must not refresh Firefox implicitly.
 - Persist transient network/timeout failures in the configured retry queue;
   exhausted links go to the configured failure file.
 - In Docker, keep the retry queue and failure file under the bot's named
@@ -125,6 +130,11 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   polling/retry path only after SQLite intake, pending `\\Seen` acknowledgements,
   tasks, and outbox work are drained; startup refuses this mode when unfinished
   durable work remains.
+- `DownloadTaskService` owns bounded download workers, platform capacity,
+  leases, heartbeats, retries, and durable completion events. `EmailBot` owns
+  IMAP intake and its email-specific event projector/outbox. The legacy path
+  calls the stateless `DownloadExecutor` synchronously and does not start the
+  durable service.
 - Firefox cookie extraction remains process-serialized; Douyin and Bilibili
   worker capacity is independently bounded by bot configuration.
 
@@ -196,12 +206,13 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
 - `.env` update helpers currently write in place rather than atomically. Keep
   their formatting consistent and prefer a shared atomic implementation when
   changing them.
-- Email-triggered extraction honors `cookie_extractor.headless` and `.validate`.
+- Web Login and `get_cookie.py` remain the only cookie acquisition entry points.
 
 ### Browser settings control plane
 
 - `file_browser` exposes a Settings tab for supported email, sender allowlist,
-  keyword, downloader, retry, media, and cookie settings.
+  keyword, downloader, retry, media, and the managed Douyin Cookie secret;
+  email Cookie commands have been removed and are not settings.
 - Managed settings are persisted in the dedicated `runtime_settings` volume at
   `/app/runtime-settings/settings.sqlite3`; it is shared only by `bot`,
   `file_browser`, and `web_login`. `file_browser` must never receive the bot's
@@ -242,11 +253,12 @@ transient retry queue and exhausted-link file paths. The Docker bot sets them
 to `/app/state/pending_retries.json` and `/app/state/failed_links.txt`.
 `BOT_STATE_DB` defaults to `/app/state/mail_state.sqlite3` in Docker; it must
 remain on the bot's persistent `state` volume and never on the NAS media mount.
-The state database is a `0600` runtime artifact. Cookie-command bodies are
-processed in memory and are not written to the database. On upgrade from the
-pre-v2 state schema, any legacy `platform=cookie` task is redacted and moved to
-terminal failure so the user must resend it safely; migration enables SQLite
-secure-delete and VACUUM/checkpoints the database/WAL before workers start.
+The state database is a `0600` runtime artifact. On upgrade from the pre-v2
+state schema, any legacy `platform=cookie` task is redacted and moved to
+terminal failure so the user must use Web Login or the CLI; migration enables
+SQLite secure-delete and VACUUM/checkpoints the database/WAL before workers
+start. Completion events have per-consumer acknowledgements; an unconsumed
+email event blocks legacy rollback until the email projector catches up.
 
 The checked-in config points downloads directly at
 `/srv/nas_data/douyin_downloads`. Docker overrides that host path with

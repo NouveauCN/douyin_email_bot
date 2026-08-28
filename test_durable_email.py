@@ -141,7 +141,6 @@ def make_config(tmp_path):
             heartbeat_seconds=1,
             outbox_retry_attempts=3,
             outbox_retry_delay_seconds=1,
-            commands=SimpleNamespace(cookie_update="更新cookie", cookie_auto="自动获取cookie"),
         ),
         douyin=SimpleNamespace(download_path=str(tmp_path / "downloads"), cookie=""),
         bilibili=SimpleNamespace(),
@@ -760,11 +759,13 @@ def test_seen_ack_rejects_malformed_uid_store_result(response):
 
 def test_route_failure_is_quarantined_and_acknowledged(tmp_path):
     bot = make_bot(tmp_path)
-    mail = FakeImap(make_raw_cookie_mail())
+    mail = FakeImap(make_raw_mail())
     bot._imap_connect = lambda _cfg: mail
-    bot._ensure_command_task = lambda *_args: (_ for _ in ()).throw(
-        RuntimeError("simulated crash before notice")
-    )
+
+    def fail_routing(_text):
+        raise RuntimeError("simulated routing failure")
+
+    bot.extractor.extract = fail_routing
 
     bot._poll_once_durable(bot.config.email, bot.config.bot)
 
@@ -776,7 +777,7 @@ def test_route_failure_is_quarantined_and_acknowledged(tmp_path):
     assert source["intake_complete"] == 1
     assert source["seen_at"] is not None
     assert "RuntimeError" in source["metadata_json"]
-    assert "simulated crash before notice" not in source["metadata_json"]
+    assert "simulated routing failure" not in source["metadata_json"]
     assert bot._state.pending_seen("INBOX") == []
     assert bot._state.pending_intake("INBOX", 77) == []
     assert mail.stored == [("9", "\\Seen")]
@@ -811,57 +812,15 @@ def test_legacy_rollback_rejects_unreadable_or_malformed_retry_file(tmp_path, co
         EmailBot._assert_legacy_rollback_safe(state_path, pending_path)
 
 
-def test_cookie_command_bypasses_subject_keyword_gate(tmp_path):
+def test_cookie_like_email_does_not_create_cookie_task(tmp_path):
     bot = make_bot(tmp_path)
     mail = FakeImap(make_raw_cookie_mail())
     bot._imap_connect = lambda _cfg: mail
 
     bot._poll_once_durable(bot.config.email, bot.config.bot)
 
-    task = bot._state._conn.execute(
-        "SELECT normalized_url FROM tasks"
-    ).fetchone()
-    assert task["normalized_url"] == "urn:mail-notice:cookie_update"
-    bot._state.close()
-
-
-def test_cookie_command_secret_is_not_persisted_in_sqlite(tmp_path):
-    bot = make_bot(tmp_path)
-    secret = "sessionid=" + "s" * 128
-
-    bot._ensure_command_task(
-        "INBOX:77:12",
-        {"sender": "user@example.test", "subject": "更新cookie"},
-        secret,
-        "cookie_update",
-    )
-
-    rows = bot._state._conn.execute(
-        "SELECT payload_json FROM tasks UNION ALL SELECT payload_json FROM smtp_outbox"
-    ).fetchall()
-    assert rows
-    assert all(secret not in row["payload_json"] for row in rows)
-    assert str(len(secret)) in rows[-1]["payload_json"]
-    bot._state.close()
-
-
-def test_duplicate_cookie_command_does_not_repeat_side_effect(tmp_path, monkeypatch):
-    bot = make_bot(tmp_path)
-    calls = []
-    original = bot._process_cookie_command
-
-    def counted(task):
-        calls.append(task)
-        return original(task)
-
-    monkeypatch.setattr(bot, "_process_cookie_command", counted)
-    metadata = {"sender": "user@example.test", "subject": "更新cookie"}
-    secret = "sessionid=" + "s" * 128
-    bot._ensure_command_task("INBOX:77:13", metadata, secret, "cookie_update")
-    bot._ensure_command_task("INBOX:77:13", metadata, secret, "cookie_update")
-
-    assert len(calls) == 1
-    assert bot._state._conn.execute("SELECT COUNT(*) FROM smtp_outbox").fetchone()[0] == 1
+    assert bot._state._conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    assert bot._state._conn.execute("SELECT COUNT(*) FROM smtp_outbox").fetchone()[0] == 0
     bot._state.close()
 
 

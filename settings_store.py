@@ -182,7 +182,7 @@ _SETTING_HELP: dict[str, dict[str, str | None]] = {
     },
     "bot.subject_keyword": {
         "label": "邮件主题关键词",
-        "description": "普通下载邮件主题必须包含的文字；Cookie 命令不受此限制。",
+        "description": "下载邮件主题必须包含的文字。",
         "example": "下载",
     },
     "bot.transient_retry_attempts": {
@@ -259,16 +259,6 @@ _SETTING_HELP: dict[str, dict[str, str | None]] = {
         "unit": "秒",
         "example": "60",
     },
-    "bot.commands.cookie_update": {
-        "label": "更新 Cookie 命令",
-        "description": "邮件主题包含这段文字时，将正文内容保存为新的抖音 Cookie。",
-        "example": "更新cookie",
-    },
-    "bot.commands.cookie_auto": {
-        "label": "自动获取 Cookie 命令",
-        "description": "邮件主题包含这段文字时，使用持久化 Firefox 登录状态自动获取抖音 Cookie。",
-        "example": "自动获取cookie",
-    },
     "media_cleanup.backup_retention_days": {
         "label": "媒体备份保留天数",
         "description": "裁剪成功后原始媒体备份至少保留的天数。",
@@ -340,8 +330,6 @@ def _defs() -> tuple[SettingDefinition, ...]:
         ("bot.heartbeat_seconds", "BOT_HEARTBEAT_SECONDS", "int", False, True, "restart"),
         ("bot.outbox_retry_attempts", "BOT_OUTBOX_RETRY_ATTEMPTS", "int", False, True, "restart"),
         ("bot.outbox_retry_delay_seconds", "BOT_OUTBOX_RETRY_DELAY_SECONDS", "int", False, True, "restart"),
-        ("bot.commands.cookie_update", "BOT_COOKIE_UPDATE_COMMAND", "str", False, True, "restart"),
-        ("bot.commands.cookie_auto", "BOT_COOKIE_AUTO_COMMAND", "str", False, True, "restart"),
         ("media_cleanup.backup_retention_days", "MEDIA_BACKUP_RETENTION_DAYS", "int", False, True, "restart"),
         ("media_cleanup.check_interval_days", "MEDIA_BACKUP_CHECK_INTERVAL_DAYS", "int", False, True, "restart"),
         ("cookie_extractor.profile_dir", "COOKIE_PROFILE_DIR", "path", False, False, "restart"),
@@ -373,7 +361,6 @@ DEFAULT_VALUES: dict[str, Any] = {
     "bot.douyin_worker_count": 1, "bot.bilibili_worker_count": 1,
     "bot.lease_seconds": 300, "bot.heartbeat_seconds": 30,
     "bot.outbox_retry_attempts": 5, "bot.outbox_retry_delay_seconds": 60,
-    "bot.commands.cookie_update": "更新cookie", "bot.commands.cookie_auto": "自动获取cookie",
     "media_cleanup.backup_retention_days": 28, "media_cleanup.check_interval_days": 7,
     "cookie_extractor.profile_dir": "", "cookie_extractor.headless": True,
     "cookie_extractor.validate": True,
@@ -632,7 +619,7 @@ class SettingsStore:
                 raise ValueError("email address and password must both be configured")
         required_strings = {
             "email.imap_server", "email.smtp_server", "bot.subject_keyword",
-            "douyin.naming", "bot.commands.cookie_update", "bot.commands.cookie_auto",
+            "douyin.naming",
         }
         for key in touched & required_strings:
             if not str(effective.get(key, "")).strip():

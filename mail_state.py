@@ -17,11 +17,11 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 DEFAULT_LEASE_SECONDS = 300.0
 logger = logging.getLogger("MailStateStore")
@@ -49,6 +49,7 @@ class MailStateStore:
         self.default_lease_seconds = float(default_lease_seconds)
         self._lock = threading.RLock()
         self._closed = False
+        self._supports_partial_status = True
 
         db_path = Path(self.path)
         if self.path != ":memory:":
@@ -126,17 +127,23 @@ class MailStateStore:
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         source_message_id TEXT NOT NULL
                             REFERENCES source_messages(source_message_id),
+                        source_kind TEXT NOT NULL DEFAULT 'mail',
+                        external_source_id TEXT,
                         normalized_url TEXT NOT NULL,
                         original_url TEXT NOT NULL,
                         platform TEXT,
                         payload_json TEXT NOT NULL DEFAULT '{}',
                         status TEXT NOT NULL DEFAULT 'pending'
-                            CHECK (status IN ('pending', 'leased', 'succeeded', 'failed')),
+                            CHECK (status IN ('pending', 'leased', 'succeeded',
+                                              'partially_succeeded', 'failed')),
                         attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+                        max_attempts INTEGER CHECK (max_attempts IS NULL OR max_attempts > 0),
                         lease_token TEXT,
                         lease_expires_at REAL,
                         next_attempt_at REAL,
                         last_error TEXT,
+                        error_code TEXT,
+                        retry_class TEXT,
                         result_json TEXT,
                         created_at REAL NOT NULL,
                         updated_at REAL NOT NULL,
@@ -166,6 +173,33 @@ class MailStateStore:
                     );
                     CREATE INDEX IF NOT EXISTS outbox_claim_idx
                         ON smtp_outbox(status, next_attempt_at, id);
+
+                    CREATE TABLE IF NOT EXISTS task_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        task_id INTEGER NOT NULL REFERENCES tasks(id),
+                        event_type TEXT NOT NULL,
+                        event_version INTEGER NOT NULL DEFAULT 1,
+                        payload_json TEXT NOT NULL DEFAULT '{}',
+                        created_at REAL NOT NULL,
+                        UNIQUE (task_id, event_type)
+                    );
+                    CREATE INDEX IF NOT EXISTS task_events_pending_idx
+                        ON task_events(id, created_at);
+
+                    CREATE TABLE IF NOT EXISTS task_event_consumptions (
+                        event_id INTEGER NOT NULL REFERENCES task_events(id),
+                        consumer TEXT NOT NULL,
+                        consumed_at REAL NOT NULL,
+                        PRIMARY KEY (event_id, consumer)
+                    );
+
+                    CREATE TABLE IF NOT EXISTS mail_task_bindings (
+                        task_id INTEGER PRIMARY KEY REFERENCES tasks(id),
+                        source_message_id TEXT NOT NULL,
+                        recipient TEXT NOT NULL DEFAULT '',
+                        subject_context TEXT NOT NULL DEFAULT '{}',
+                        UNIQUE (source_message_id, task_id)
+                    );
                     """
                 statement = ""
                 for line in schema.splitlines(keepends=True):
@@ -189,9 +223,55 @@ class MailStateStore:
                         "ALTER TABLE source_messages ADD COLUMN intake_complete "
                         "INTEGER NOT NULL DEFAULT 0"
                     )
-                if version < SCHEMA_VERSION:
+                task_columns = {
+                    row["name"]
+                    for row in self._conn.execute("PRAGMA table_info(tasks)")
+                }
+                if "source_kind" not in task_columns:
+                    self._conn.execute(
+                        "ALTER TABLE tasks ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'mail'"
+                    )
+                if "external_source_id" not in task_columns:
+                    self._conn.execute(
+                        "ALTER TABLE tasks ADD COLUMN external_source_id TEXT"
+                    )
+                if "max_attempts" not in task_columns:
+                    self._conn.execute("ALTER TABLE tasks ADD COLUMN max_attempts INTEGER")
+                if "error_code" not in task_columns:
+                    self._conn.execute("ALTER TABLE tasks ADD COLUMN error_code TEXT")
+                if "retry_class" not in task_columns:
+                    self._conn.execute("ALTER TABLE tasks ADD COLUMN retry_class TEXT")
+                self._conn.execute(
+                    "UPDATE tasks SET source_kind = COALESCE(NULLIF(source_kind, ''), 'mail'), "
+                    "external_source_id = COALESCE(external_source_id, source_message_id)"
+                )
+                self._conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS tasks_source_key_idx "
+                    "ON tasks(source_kind, external_source_id, normalized_url) "
+                    "WHERE external_source_id IS NOT NULL"
+                )
+                task_sql_row = self._conn.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'"
+                ).fetchone()
+                task_sql = str(task_sql_row[0] or "") if task_sql_row else ""
+                self._supports_partial_status = (
+                    "partially_succeeded" in task_sql
+                    or "CHECK (status" not in task_sql
+                )
+                cookie_tasks_exist = self._conn.execute(
+                    "SELECT 1 FROM tasks WHERE platform = 'cookie' LIMIT 1"
+                ).fetchone() is not None
+                if version < SCHEMA_VERSION or cookie_tasks_exist:
+                    # Also sanitize a v3 database left behind by an interrupted
+                    # rollout; cookie tasks must never re-enter a worker.
                     self._migrate_legacy_state_locked()
-                    secure_cleanup_required = True
+                    if cookie_tasks_exist:
+                        # A v3 database can still contain secret pages when a
+                        # previous startup was interrupted after the logical
+                        # redaction. Repeat the physical cleanup in that case.
+                        secure_cleanup_required = True
+                if version < SCHEMA_VERSION:
+                    secure_cleanup_required = secure_cleanup_required or version < 2
             if secure_cleanup_required:
                 # The legacy schema may have stored cookie plaintext in the
                 # main DB or WAL. Checkpoint, securely rebuild, and truncate
@@ -199,6 +279,10 @@ class MailStateStore:
                 self._secure_migrate_cleanup()
                 # Only mark the migration complete after all physical cleanup
                 # steps succeed. A failed cleanup must be retried next start.
+                self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            elif version < SCHEMA_VERSION:
+                # No secret cleanup was needed, but the schema version still
+                # has to advance after all transactional migrations succeed.
                 self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def close(self) -> None:
@@ -303,8 +387,8 @@ class MailStateStore:
             safe_notice = self._json(
                 {
                     "to_addr": sender,
-                    "body": "旧版 Cookie 任务无法安全恢复，请重新发送 Cookie 命令。",
-                    "subject_status": "Cookie 需重新发送",
+                    "body": "旧版 Cookie 任务无法安全恢复，请通过 Web Login 或 uv run python get_cookie.py 更新 Cookie。",
+                    "subject_status": "Cookie 需通过 Web Login 更新",
                 }
             )
             self._conn.execute(
@@ -629,6 +713,7 @@ class MailStateStore:
         *,
         metadata: dict[str, Any] | None = None,
         platform: str | None = None,
+        max_attempts: int | None = None,
         advance_position: bool = True,
         now: float | None = None,
     ) -> dict[str, Any]:
@@ -686,10 +771,16 @@ class MailStateStore:
                     metadata,
                     timestamp,
                     platform,
+                    source_kind="mail",
+                    external_source_id=source_message_id,
+                    max_attempts=max_attempts,
                 )
                 task_ids.append(task["id"])
                 if task["created"]:
                     created_task_ids.append(task["id"])
+                self._insert_mail_binding_locked(
+                    task["id"], source_message_id, metadata or {}, timestamp
+                )
             source = self._conn.execute(
                 "SELECT intake_complete FROM source_messages "
                 "WHERE source_message_id = ?",
@@ -713,17 +804,26 @@ class MailStateStore:
         payload: Any,
         timestamp: float,
         platform: str | None = None,
+        *,
+        source_kind: str = "mail",
+        external_source_id: str | None = None,
+        max_attempts: int | None = None,
     ) -> dict[str, Any]:
         cursor = self._conn.execute(
             "INSERT INTO tasks "
-            "(source_message_id, normalized_url, original_url, platform, payload_json, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(source_message_id, normalized_url) DO NOTHING",
+            "(source_message_id, source_kind, external_source_id, normalized_url, original_url, "
+            "platform, payload_json, max_attempts, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(source_message_id, normalized_url) DO NOTHING",
             (
                 source_message_id,
+                source_kind,
+                external_source_id or source_message_id,
                 normalized_url,
                 original_url,
                 platform,
                 self._json(payload),
+                max_attempts,
                 timestamp,
                 timestamp,
             ),
@@ -735,6 +835,25 @@ class MailStateStore:
         assert row is not None
         return {"id": row["id"], "created": cursor.rowcount == 1}
 
+    def _insert_mail_binding_locked(
+        self,
+        task_id: int,
+        source_message_id: str,
+        metadata: Mapping[str, Any] | dict[str, Any],
+        timestamp: float,
+    ) -> None:
+        sender = str(metadata.get("sender", "") or "")
+        subject = str(metadata.get("subject", "") or "")
+        self._conn.execute(
+            "INSERT INTO mail_task_bindings "
+            "(task_id, source_message_id, recipient, subject_context) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(task_id) DO UPDATE SET "
+            "recipient = CASE WHEN excluded.recipient <> '' THEN excluded.recipient ELSE recipient END, "
+            "subject_context = CASE WHEN excluded.subject_context <> '{}' "
+            "THEN excluded.subject_context ELSE subject_context END",
+            (task_id, source_message_id, sender, self._json({"subject": subject, "updated_at": timestamp})),
+        )
+
     def enqueue_task(
         self,
         source_message_id: str,
@@ -743,6 +862,9 @@ class MailStateStore:
         original_url: str | None = None,
         payload: Any = None,
         platform: str | None = None,
+        source_kind: str = "mail",
+        external_source_id: str | None = None,
+        max_attempts: int | None = None,
         now: float | None = None,
     ) -> dict[str, Any]:
         """Insert or return a task keyed by source message and normalized URL."""
@@ -768,6 +890,9 @@ class MailStateStore:
                 payload,
                 timestamp,
                 platform,
+                source_kind=source_kind,
+                external_source_id=external_source_id or source_message_id,
+                max_attempts=max_attempts,
             )
             row = self._conn.execute("SELECT * FROM tasks WHERE source_message_id = ? AND normalized_url = ?", (source_message_id, normalized)).fetchone()
             return self._row(row)  # type: ignore[return-value]
@@ -783,6 +908,27 @@ class MailStateStore:
                 (source_message_id, normalized),
             ).fetchone()
             return self._row(row)
+
+    def get_task_by_id(self, task_id: int) -> dict[str, Any] | None:
+        """Return a task by its stable database id without changing state."""
+        with self._lock:
+            self._ensure_open()
+            return self._row(
+                self._conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            )
+
+    def set_task_result(
+        self, task_id: int, result: Any, *, now: float | None = None
+    ) -> bool:
+        """Persist an intermediate/partial result without changing a lease."""
+        timestamp = self._now(now)
+        with self._lock, self._transaction():
+            self._ensure_open()
+            cursor = self._conn.execute(
+                "UPDATE tasks SET result_json = ?, updated_at = ? WHERE id = ?",
+                (self._json(result), timestamp, task_id),
+            )
+            return cursor.rowcount == 1
 
     def enqueue_notice(
         self,
@@ -942,16 +1088,37 @@ class MailStateStore:
         outbox_payload: Any = None,
         outbox_event: str = "completed",
         outbox_message_id: str | None = None,
+        status: str = "succeeded",
+        error_code: str | None = None,
+        retry_class: str | None = None,
         now: float | None = None,
     ) -> dict[str, Any] | None:
+        if status not in ("succeeded", "partially_succeeded"):
+            raise ValueError("complete_task status must be succeeded or partially_succeeded")
+        physical_status = status
+        if status == "partially_succeeded" and not self._supports_partial_status:
+            # Pre-v3 CHECK constraints only know succeeded/failed.  The result
+            # and immutable event still preserve the richer logical status.
+            physical_status = "succeeded"
         timestamp = self._now(now)
         with self._lock, self._transaction():
             self._ensure_open()
             cursor = self._conn.execute(
-                "UPDATE tasks SET status = 'succeeded', lease_token = NULL, lease_expires_at = NULL, "
+                "UPDATE tasks SET status = ?, lease_token = NULL, lease_expires_at = NULL, "
+                "next_attempt_at = NULL, last_error = NULL, error_code = ?, retry_class = ?, "
                 "result_json = ?, updated_at = ?, completed_at = ? "
                 "WHERE id = ? AND status = 'leased' AND lease_token = ? AND lease_expires_at > ?",
-                (self._json(result), timestamp, timestamp, task_id, lease_token, timestamp),
+                (
+                    physical_status,
+                    error_code,
+                    retry_class,
+                    self._json(result),
+                    timestamp,
+                    timestamp,
+                    task_id,
+                    lease_token,
+                    timestamp,
+                ),
             )
             if cursor.rowcount != 1:
                 return None
@@ -963,6 +1130,17 @@ class MailStateStore:
                     outbox_message_id,
                     timestamp,
                 )
+            self._insert_event_locked(
+                task_id,
+                f"task.{status}",
+                {
+                    "status": status,
+                    "result": result,
+                    "error_code": error_code,
+                    "retry_class": retry_class,
+                },
+                timestamp,
+            )
             return self._row(self._conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone())
 
     def fail_task(
@@ -971,6 +1149,7 @@ class MailStateStore:
         lease_token: str,
         error: str | None = None,
         *,
+        result: Any = None,
         retry_at: float | None = None,
         next_attempt_at: float | None = None,
         retry: bool = False,
@@ -978,6 +1157,8 @@ class MailStateStore:
         outbox_payload: Any = None,
         outbox_event: str = "failed",
         outbox_message_id: str | None = None,
+        error_code: str | None = None,
+        retry_class: str | None = None,
         now: float | None = None,
     ) -> dict[str, Any] | None:
         timestamp = self._now(now)
@@ -989,9 +1170,21 @@ class MailStateStore:
             self._ensure_open()
             cursor = self._conn.execute(
                 "UPDATE tasks SET status = ?, lease_token = NULL, lease_expires_at = NULL, "
-                "next_attempt_at = ?, last_error = ?, updated_at = ? "
+                "next_attempt_at = ?, last_error = ?, error_code = ?, retry_class = ?, updated_at = ? "
+                ", result_json = COALESCE(?, result_json) "
                 "WHERE id = ? AND status = 'leased' AND lease_token = ? AND lease_expires_at > ?",
-                (status, scheduled, error, timestamp, task_id, lease_token, timestamp),
+                (
+                    status,
+                    scheduled,
+                    error,
+                    error_code,
+                    retry_class,
+                    timestamp,
+                    self._json(result) if result is not None else None,
+                    task_id,
+                    lease_token,
+                    timestamp,
+                ),
             )
             if cursor.rowcount != 1:
                 return None
@@ -1003,6 +1196,19 @@ class MailStateStore:
                     outbox_message_id,
                     timestamp,
                 )
+            self._insert_event_locked(
+                task_id,
+                "task.retry_scheduled" if scheduled is not None else "task.failed",
+                {
+                    "status": status,
+                    "error": error,
+                    "error_code": error_code,
+                    "retry_class": retry_class,
+                    "next_attempt_at": scheduled,
+                    "result": result,
+                },
+                timestamp,
+            )
             return self._row(self._conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone())
 
     def release_task(
@@ -1046,6 +1252,200 @@ class MailStateStore:
                 (timestamp, timestamp),
             ).rowcount
             return {"tasks": task_count, "outbox": outbox_count}
+
+    def _insert_event_locked(
+        self,
+        task_id: int,
+        event_type: str,
+        payload: Any,
+        timestamp: float,
+        *,
+        event_version: int = 1,
+    ) -> dict[str, Any]:
+        """Insert one immutable task event, returning the existing event on replay."""
+        self._conn.execute(
+            "INSERT INTO task_events "
+            "(task_id, event_type, event_version, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT(task_id, event_type) DO NOTHING",
+            (task_id, event_type, event_version, self._json(payload), timestamp),
+        )
+        row = self._conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? AND event_type = ?",
+            (task_id, event_type),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("task event insert did not produce a row")
+        result = dict(row)
+        result["payload"] = self._decode(result.pop("payload_json"))
+        return result
+
+    def record_task_event(
+        self,
+        task_id: int,
+        event_type: str,
+        payload: Any = None,
+        *,
+        event_version: int = 1,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Persist an idempotent event for an already stored task."""
+        event_type = str(event_type).strip()
+        if not event_type:
+            raise ValueError("event_type must not be empty")
+        timestamp = self._now(now)
+        with self._lock, self._transaction():
+            self._ensure_open()
+            if self._conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone() is None:
+                raise ValueError(f"unknown task id: {task_id}")
+            return self._insert_event_locked(
+                task_id, event_type, payload, timestamp, event_version=event_version
+            )
+
+    def list_task_events(
+        self,
+        *,
+        consumer: str | None = None,
+        limit: int = 100,
+        include_consumed: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Read immutable events, optionally filtered by a consumer cursor."""
+        if limit < 1:
+            return []
+        with self._lock:
+            self._ensure_open()
+            params: list[Any] = []
+            query = "SELECT e.* FROM task_events e"
+            if consumer is not None and not include_consumed:
+                query += (
+                    " LEFT JOIN task_event_consumptions c "
+                    "ON c.event_id = e.id AND c.consumer = ?"
+                )
+                params.append(consumer)
+            query += " WHERE 1=1"
+            if consumer is not None and not include_consumed:
+                query += " AND c.event_id IS NULL"
+            query += " ORDER BY e.id LIMIT ?"
+            params.append(limit)
+            rows = self._conn.execute(query, params).fetchall()
+            result = []
+            for row in rows:
+                item = dict(row)
+                item["payload"] = self._decode(item.pop("payload_json"))
+                result.append(item)
+            return result
+
+    def consume_task_event(
+        self, event_id: int, consumer: str, *, now: float | None = None
+    ) -> bool:
+        """Ack an event once for one consumer; duplicate acks are harmless."""
+        consumer = str(consumer).strip()
+        if not consumer:
+            raise ValueError("consumer must not be empty")
+        timestamp = self._now(now)
+        with self._lock, self._transaction():
+            self._ensure_open()
+            cursor = self._conn.execute(
+                "INSERT INTO task_event_consumptions(event_id, consumer, consumed_at) "
+                "VALUES (?, ?, ?) ON CONFLICT(event_id, consumer) DO NOTHING",
+                (event_id, consumer, timestamp),
+            )
+            return cursor.rowcount == 1
+
+    def project_task_event(
+        self,
+        event_id: int,
+        consumer: str,
+        *,
+        outbox_event: str | None = None,
+        outbox_payload: Any = None,
+        outbox_message_id: str | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """Atomically materialize an event into an outbox and acknowledge it.
+
+        This closes the crash window between a durable task completion and an
+        entry-specific notification.  Replaying the same event is safe due to
+        both the consumption primary key and the outbox task/event uniqueness.
+        """
+        consumer = str(consumer).strip()
+        if not consumer:
+            raise ValueError("consumer must not be empty")
+        timestamp = self._now(now)
+        with self._lock, self._transaction():
+            self._ensure_open()
+            event = self._conn.execute(
+                "SELECT * FROM task_events WHERE id = ?", (event_id,)
+            ).fetchone()
+            if event is None:
+                raise ValueError(f"unknown task event id: {event_id}")
+            consumed = self._conn.execute(
+                "SELECT 1 FROM task_event_consumptions WHERE event_id = ? AND consumer = ?",
+                (event_id, consumer),
+            ).fetchone()
+            if consumed is not None:
+                return False
+            if outbox_event is not None:
+                self._insert_outbox_locked(
+                    int(event["task_id"]),
+                    outbox_event,
+                    outbox_payload,
+                    outbox_message_id,
+                    timestamp,
+                )
+            self._conn.execute(
+                "INSERT INTO task_event_consumptions(event_id, consumer, consumed_at) "
+                "VALUES (?, ?, ?)",
+                (event_id, consumer, timestamp),
+            )
+            return True
+
+    def unfinished_event_count(self, consumer: str | None = None) -> int:
+        """Count events that a named projector has not durably consumed."""
+        with self._lock:
+            self._ensure_open()
+            if consumer is None:
+                return int(self._conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0])
+            if consumer == "email":
+                # Generic task events do not imply an email notification.  A
+                # mail projector only owns tasks carrying an explicit sender,
+                # which also preserves the legacy rollback facade for old
+                # source-less tasks.
+                rows = self._conn.execute(
+                    "SELECT e.id, t.payload_json FROM task_events e "
+                    "JOIN tasks t ON t.id = e.task_id "
+                    "LEFT JOIN task_event_consumptions c "
+                    "ON c.event_id = e.id AND c.consumer = ? "
+                    "WHERE c.event_id IS NULL",
+                    (consumer,),
+                ).fetchall()
+                count = 0
+                for row in rows:
+                    try:
+                        payload = self._decode(row["payload_json"])
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        payload = {}
+                    if isinstance(payload, dict) and payload.get("sender"):
+                        count += 1
+                return count
+            return int(
+                self._conn.execute(
+                    "SELECT COUNT(*) FROM task_events e "
+                    "LEFT JOIN task_event_consumptions c ON c.event_id = e.id AND c.consumer = ? "
+                    "WHERE c.event_id IS NULL",
+                    (consumer,),
+                ).fetchone()[0]
+            )
+
+    def task_has_outbox(self, task_id: int) -> bool:
+        """Return whether an entry adapter already materialized a notice."""
+        with self._lock:
+            self._ensure_open()
+            return (
+                self._conn.execute(
+                    "SELECT 1 FROM smtp_outbox WHERE task_id = ? LIMIT 1", (task_id,)
+                ).fetchone()
+                is not None
+            )
 
     def heartbeat_outbox(
         self,
