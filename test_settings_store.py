@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from settings_store import SettingsStore, default_database_path, read_dotenv, setting_registry
+from settings_store import SETTING_REGISTRY, SettingsStore, default_database_path, read_dotenv, setting_registry
 
 
 def test_dotenv_is_read_without_polluting_environment(tmp_path, monkeypatch):
@@ -172,3 +172,51 @@ def test_snapshot_reports_all_sources_and_effective_nonsecret_values(tmp_path, m
     assert snapshot["bot.subject_keyword"]["value"] == "managed"
     assert snapshot["bot.worker_count"]["source"] == "default"
     assert snapshot["bot.worker_count"]["value"] == 2
+
+
+def test_every_registered_setting_has_safe_help_metadata_and_type(tmp_path):
+    store = SettingsStore(tmp_path / "settings.sqlite3")
+    snapshot = store.snapshot()
+
+    assert len(SETTING_REGISTRY) == 45
+    assert set(snapshot) == set(SETTING_REGISTRY)
+    for key, definition in SETTING_REGISTRY.items():
+        field = snapshot[key]
+        assert definition.label.strip()
+        assert definition.description.strip()
+        assert field["label"] == definition.label
+        assert field["description"] == definition.description
+        assert field["unit"] == definition.unit
+        assert field["example"] == definition.example
+        assert field["input_hint"] == definition.input_hint
+        assert field["value_type"] == definition.value_type
+
+
+def test_secret_snapshot_redacts_values_without_metadata_leaks(tmp_path):
+    store = SettingsStore(tmp_path / "settings.sqlite3")
+    secret_changes = {
+        key: (
+            "sentinel-secret@example.com"
+            if key == "email.email"
+            else f"sentinel-secret-for-{key}"
+        )
+        for key, definition in SETTING_REGISTRY.items()
+        if definition.secret and definition.editable
+    }
+    store.apply_changes(secret_changes)
+    snapshot = store.snapshot()
+    serialized = repr(snapshot)
+
+    for key, definition in SETTING_REGISTRY.items():
+        if definition.secret:
+            assert snapshot[key]["value"] is None
+
+    for key, secret in secret_changes.items():
+        assert snapshot[key]["secret"] is True
+        assert snapshot[key]["value"] is None
+        assert snapshot[key]["configured"] is True
+        assert secret not in serialized
+        assert secret not in snapshot[key]["label"]
+        assert secret not in snapshot[key]["description"]
+        assert secret not in (snapshot[key]["example"] or "")
+        assert secret not in (snapshot[key]["input_hint"] or "")

@@ -38,6 +38,34 @@ class FileBrowserSettingsTests(unittest.TestCase):
         self.assertIn("email", payload["groups"])
         self.assertIn("douyin", payload["groups"])
         self.assertIsNone(payload["groups"]["email"]["password"]["value"])
+        for group in payload["groups"].values():
+            for field in group.values():
+                self.assertTrue(field["label"])
+                self.assertTrue(field["description"])
+                self.assertIn("unit", field)
+                self.assertIn("example", field)
+                self.assertTrue(field["value_type"])
+        browser = payload["groups"]["file_browser"]
+        self.assertEqual(len(browser), 7)
+        self.assertEqual(browser["settings_database"]["label"], "设置数据库路径")
+        self.assertTrue(all(not field["editable"] for field in browser.values()))
+        self.assertTrue(all(field["apply_mode"] == "readonly" for field in browser.values()))
+
+    def test_settings_snapshot_never_returns_secret_value_or_secret_fragments(self):
+        revision = self.client.get("/api/settings").get_json()["revision"]
+        response = self.client.patch(
+            "/api/settings",
+            json={
+                "base_revision": revision,
+                "changes": [{"key": "douyin.cookie", "action": "set", "value": "super-secret-cookie"}],
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = self.client.get("/api/settings").get_json()
+        serialized = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn("super-secret-cookie", serialized)
+        self.assertIsNone(payload["groups"]["douyin"]["cookie"]["value"])
+        self.assertTrue(payload["groups"]["douyin"]["cookie"]["configured"])
 
     def test_cookie_update_is_immediate_and_blank_secret_is_ignored(self):
         revision = self.client.get("/api/settings").get_json()["revision"]
@@ -132,6 +160,12 @@ class FileBrowserSettingsTests(unittest.TestCase):
         self.assertIn('id="settingsTab"', page)
         self.assertIn('id="settingsGroups"', page)
         self.assertIn("function renderSettings", page)
+        self.assertIn("field.label", page)
+        self.assertIn("field.description", page)
+        self.assertIn("立即生效", page)
+        self.assertIn("保存后自动重启 Bot", page)
+        self.assertIn("只读部署项", page)
+        self.assertIn("option.textContent = item[1]", page)
         self.assertIn("恢复默认", page)
 
 
