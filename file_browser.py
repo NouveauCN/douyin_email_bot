@@ -187,8 +187,85 @@ def _settings_snapshot() -> dict:
     """Read a redacted settings snapshot from config.yaml and the store."""
     snapshot = _SETTINGS_STORE.snapshot(config_path=_CONFIG_PATH)
     groups: dict[str, dict] = {}
+    # settings_store is the canonical source for these labels.  The fallbacks
+    # keep the UI understandable during a rolling upgrade where an older
+    # store has not started returning the presentation metadata yet.
+    fallback_labels = {
+        "email.imap_server": "IMAP 服务器", "email.imap_port": "IMAP 端口",
+        "email.smtp_server": "SMTP 服务器", "email.smtp_port": "SMTP 端口",
+        "email.email": "邮箱地址", "email.password": "邮箱密码/授权码",
+        "email.poll_interval": "轮询间隔", "email.smtp_timeout": "SMTP 超时",
+        "douyin.download_path": "抖音下载目录", "douyin.cookie": "抖音 Cookie",
+        "douyin.naming": "文件命名格式", "douyin.folderize": "按作者分文件夹",
+        "douyin.timeout": "抖音下载超时", "douyin.max_retries": "抖音最大重试次数",
+        "douyin.max_tasks": "抖音并发任务上限", "bilibili.download_path": "哔哩哔哩下载目录",
+        "bilibili.auth": "哔哩哔哩登录凭据", "bilibili.auth_file": "哔哩哔哩凭据文件",
+        "bilibili.timeout": "哔哩哔哩下载超时", "bilibili.batch": "启用批量下载",
+        "bilibili.video_quality": "视频画质代码", "bilibili.yutto_bin": "Yutto 程序路径",
+        "bot.allowed_senders": "发件人白名单", "bot.cooldown_seconds": "发件人冷却时间",
+        "bot.subject_keyword": "邮件主题关键词", "bot.transient_retry_attempts": "临时失败重试次数",
+        "bot.transient_retry_delay_seconds": "重试等待时间", "bot.transient_pending_file": "待重试记录文件",
+        "bot.transient_failed_file": "失败记录文件", "bot.durable_mail_enabled": "启用可靠邮件处理",
+        "bot.state_db": "邮件状态数据库", "bot.worker_count": "总工作线程数",
+        "bot.douyin_worker_count": "抖音工作线程数", "bot.bilibili_worker_count": "哔哩哔哩工作线程数",
+        "bot.lease_seconds": "任务租约时长", "bot.heartbeat_seconds": "工作线程心跳间隔",
+        "bot.outbox_retry_attempts": "通知重试次数", "bot.outbox_retry_delay_seconds": "通知重试等待时间",
+        "bot.commands.cookie_update": "手动更新 Cookie 指令", "bot.commands.cookie_auto": "自动获取 Cookie 指令",
+        "media_cleanup.backup_retention_days": "原文件备份保留天数",
+        "media_cleanup.check_interval_days": "备份清理检查间隔",
+        "cookie_extractor.profile_dir": "Firefox Cookie 配置目录",
+        "cookie_extractor.headless": "无界面获取 Cookie", "cookie_extractor.validate": "验证获取到的 Cookie",
+    }
+    fallback_descriptions = {
+        "email.imap_server": "接收邮件的 IMAP 服务器地址。", "email.imap_port": "IMAP 的 SSL 端口。",
+        "email.smtp_server": "发送回复邮件的 SMTP 服务器地址。", "email.smtp_port": "SMTP 的提交端口。",
+        "email.email": "机器人登录和发送邮件使用的邮箱地址。", "email.password": "邮箱密码或授权码；只写入，不会在页面回显。",
+        "email.poll_interval": "两次检查新邮件之间等待的秒数。", "email.smtp_timeout": "连接 SMTP 服务器的最长等待时间。",
+        "douyin.download_path": "抖音视频和图片保存位置。", "douyin.cookie": "抖音登录 Cookie；留空表示不修改，页面不会显示内容。",
+        "douyin.naming": "下载文件名模板，可使用 create 和 aweme_id。", "douyin.folderize": "是否按作者名称建立子目录。",
+        "douyin.timeout": "抖音单次网络请求的超时时间。", "douyin.max_retries": "抖音下载失败后的最大重试次数。",
+        "douyin.max_tasks": "下载器配置的任务上限；单个链接当前仍固定使用一个任务。",
+        "bilibili.download_path": "哔哩哔哩视频保存位置。", "bilibili.auth": "哔哩哔哩登录信息；只写入，不会在页面回显。",
+        "bilibili.auth_file": "Yutto 登录状态文件路径。", "bilibili.timeout": "哔哩哔哩单次下载允许的最长时间。",
+        "bilibili.batch": "是否允许一次处理链接返回的多个文件。", "bilibili.video_quality": "Yutto 使用的画质编号。",
+        "bilibili.yutto_bin": "Yutto 可执行文件位置。", "bot.allowed_senders": "只处理这些发件人；留空表示不启用白名单。",
+        "bot.cooldown_seconds": "同一发件人成功下载后，后续任务至少等待的时间。", "bot.subject_keyword": "普通下载邮件主题必须包含的文字。",
+        "bot.transient_retry_attempts": "网络等临时错误的重试次数。", "bot.transient_retry_delay_seconds": "两次临时失败重试之间的等待时间。",
+        "bot.transient_pending_file": "临时重试队列的保存文件。", "bot.transient_failed_file": "重试耗尽后的失败链接记录。",
+        "bot.durable_mail_enabled": "使用 SQLite 记录邮件位置和任务，避免重复处理。", "bot.state_db": "邮件任务状态 SQLite 文件位置。",
+        "bot.worker_count": "处理任务的总并发线程数。", "bot.douyin_worker_count": "同时处理抖音任务的线程数。",
+        "bot.bilibili_worker_count": "同时处理哔哩哔哩任务的线程数。", "bot.lease_seconds": "任务租约多久未更新后可被接管。",
+        "bot.heartbeat_seconds": "任务执行期间更新租约的间隔。", "bot.outbox_retry_attempts": "回复邮件发送失败后的重试次数。",
+        "bot.outbox_retry_delay_seconds": "回复邮件两次重试之间的等待时间。", "bot.commands.cookie_update": "邮件主题包含命令词时，将正文保存为新 Cookie。",
+        "bot.commands.cookie_auto": "邮件主题包含命令词时，从 Firefox 登录状态获取 Cookie。",
+        "media_cleanup.backup_retention_days": "裁剪成功后原文件备份保留多久。", "media_cleanup.check_interval_days": "机器人多久检查一次过期备份。",
+        "cookie_extractor.profile_dir": "Firefox 持久化配置目录，用于复用登录状态。", "cookie_extractor.headless": "获取 Cookie 时是否隐藏浏览器窗口。",
+        "cookie_extractor.validate": "获取后是否检查 Cookie 是否仍然可用。",
+    }
+    fallback_units = {key: "秒" for key in (
+        "email.poll_interval", "email.smtp_timeout", "douyin.timeout", "bilibili.timeout",
+        "bot.cooldown_seconds", "bot.transient_retry_delay_seconds", "bot.lease_seconds",
+        "bot.heartbeat_seconds", "bot.outbox_retry_delay_seconds")}
+    fallback_units.update({
+        "email.imap_port": "端口号", "email.smtp_port": "端口号", "douyin.max_retries": "次",
+        "douyin.max_tasks": "个任务", "bot.transient_retry_attempts": "次", "bot.worker_count": "个线程",
+        "bot.douyin_worker_count": "个线程", "bot.bilibili_worker_count": "个线程", "bot.outbox_retry_attempts": "次",
+        "media_cleanup.backup_retention_days": "天", "media_cleanup.check_interval_days": "天"})
+    fallback_examples = {
+        "email.imap_server": "imap.qq.com", "email.imap_port": "993", "email.smtp_server": "smtp.qq.com",
+        "email.smtp_port": "587", "email.poll_interval": "30", "douyin.naming": "{create}_{aweme_id}",
+        "douyin.max_tasks": "5", "bot.allowed_senders": "user@example.com, another@example.com",
+        "bot.subject_keyword": "下载", "bot.cooldown_seconds": "5", "douyin.cookie": "粘贴 Cookie 字符串",
+        "bilibili.video_quality": "127", "media_cleanup.backup_retention_days": "28"}
     for key, field in snapshot.items():
         group, _, name = key.partition(".")
+        field = dict(field)
+        definition = SETTING_REGISTRY.get(key)
+        field["label"] = field.get("label") or fallback_labels.get(key, name)
+        field["description"] = field.get("description") or fallback_descriptions.get(key, "此配置项控制机器人的对应行为。")
+        field["unit"] = field.get("unit") or fallback_units.get(key, "")
+        field["example"] = field.get("example") or fallback_examples.get(key, "")
+        field["value_type"] = field.get("value_type") or (definition.value_type if definition else "str")
         groups.setdefault(group, {})[name] = {
             "key": key,
             **field,
@@ -205,6 +282,15 @@ def _settings_snapshot() -> dict:
         "thumbnail_cache": str(_THUMB_CACHE),
         "settings_database": str(_SETTINGS_STORE.path),
     }
+    browser_metadata = {
+        "allowed_origins": ("允许访问来源", "允许访问 Browser 的网页来源地址；这是部署安全边界，只能由环境变量配置。", "地址列表", "http://192.168.1.10:8081", "str_list"),
+        "max_upload_bytes": ("单文件上传上限", "单个上传文件允许的最大大小。输入框保留精确字节数。", "字节", "2147483648", "int"),
+        "max_upload_files": ("单次上传文件数上限", "一次上传操作最多接受的文件数量。", "个文件", "10", "int"),
+        "media_max_concurrency": ("媒体处理并发数", "Browser 同时处理裁剪或媒体任务的数量。", "个任务", "2", "int"),
+        "comics_path": ("漫画图片目录", "只读漫画图库的来源目录，不参与下载文件的修改操作。", "路径", "/app/comics/pics", "path"),
+        "thumbnail_cache": ("缩略图缓存目录", "Browser 生成缩略图使用的缓存目录。", "路径", "/app/.thumb_cache", "path"),
+        "settings_database": ("设置数据库路径", "保存网页托管配置的 SQLite 文件位置。", "路径", "/app/runtime-settings/settings.sqlite3", "path"),
+    }
     groups["file_browser"] = {
         name: {
             "key": f"file_browser.{name}",
@@ -214,6 +300,11 @@ def _settings_snapshot() -> dict:
             "editable": False,
             "apply_mode": "readonly",
             "secret": False,
+            "label": browser_metadata[name][0],
+            "description": browser_metadata[name][1],
+            "unit": browser_metadata[name][2],
+            "example": browser_metadata[name][3],
+            "value_type": browser_metadata[name][4],
         }
         for name, value in browser_runtime.items()
     }
@@ -1558,9 +1649,13 @@ INDEX_HTML = (
   .settings-status { color:#777; font-size:13px; }
   .settings-group { background:#fff; border-radius:12px; padding:16px 20px; margin-bottom:14px; box-shadow:0 1px 4px rgba(0,0,0,.05); }
   .settings-group h2 { font-size:16px; color:#444; margin-bottom:8px; }
-  .setting-row { display:grid; grid-template-columns:minmax(140px, 1fr) minmax(180px, 2fr) auto; align-items:center; gap:10px; padding:10px 0; border-top:1px solid #f0f0f0; }
-  .setting-name { font-size:13px; word-break:break-all; }
-  .setting-meta { display:block; color:#aaa; font-size:11px; margin-top:3px; }
+  .setting-row { display:grid; grid-template-columns:minmax(180px, 1fr) minmax(180px, 2fr) auto; align-items:center; gap:10px; padding:10px 0; border-top:1px solid #f0f0f0; }
+  .setting-name { font-size:13px; word-break:break-word; }
+  .setting-meta, .setting-key, .setting-description, .setting-hint { display:block; margin-top:3px; }
+  .setting-meta { color:#777; font-size:11px; }
+  .setting-key { color:#bbb; font-size:10px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .setting-description { color:#666; font-size:12px; line-height:1.45; font-weight:400; }
+  .setting-hint { color:#999; font-size:11px; line-height:1.4; }
   .setting-input { width:100%; border:1px solid #ddd; border-radius:6px; padding:8px; font:inherit; }
   .setting-input:disabled { background:#f5f5f5; color:#999; }
   .setting-actions { display:flex; gap:5px; white-space:nowrap; }
@@ -1699,6 +1794,34 @@ var settingLabels = {
   email: '邮箱', douyin: '抖音', bilibili: '哔哩哔哩', bot: '机器人',
   media_cleanup: '媒体清理', cookie_extractor: 'Cookie 获取', file_browser: 'Browser / 部署（只读）'
 };
+var settingSourceLabels = {
+  env: '环境变量（已锁定）', managed: '网页设置', legacy_env: '旧版 .env',
+  yaml: 'config.yaml', default: '内置默认值', runtime: '运行时配置',
+  'docker-fixed': 'Docker 固定部署项'
+};
+var settingApplyLabels = {
+  hot: '立即生效', restart: '保存后自动重启 Bot', readonly: '只读部署项'
+};
+function settingSourceLabel(field) {
+  return settingSourceLabels[field.source] || '未知来源';
+}
+function settingApplyLabel(field) {
+  if (!field.editable) return '只读部署项';
+  return settingApplyLabels[field.apply_mode] || '保存后自动重启 Bot';
+}
+function settingHint(field) {
+  var hints = [];
+  if (field.input_hint) hints.push(field.input_hint);
+  if (field.unit) hints.push('单位：' + field.unit);
+  if (field.example) hints.push('示例：' + field.example);
+  // Keep the input as the exact byte count, while making large limits easier
+  // to understand at a glance.
+  if (field.value_type === 'int' && field.unit === '字节' && Number(field.value) > 0) {
+    var gib = Number(field.value) / (1024 * 1024 * 1024);
+    hints.push('约 ' + (Math.round(gib * 100) / 100) + ' GiB（准确值保留在输入框）');
+  }
+  return hints.join(' · ');
+}
 function settingsStatus(text, color) {
   var node = document.getElementById('settingsStatus');
   node.textContent = text;
@@ -1729,27 +1852,35 @@ function renderSettings(data) {
       row.dataset.key = field.key;
       var label = document.createElement('label');
       label.className = 'setting-name';
-      label.textContent = name;
+      label.textContent = field.label || name;
+      var key = document.createElement('small');
+      key.className = 'setting-key';
+      key.textContent = '配置项：' + field.key;
+      label.appendChild(key);
       var meta = document.createElement('small');
       meta.className = 'setting-meta';
-      meta.textContent = (field.source || 'default') + ' · ' +
-        (field.editable ? '可编辑' : '只读') + ' · ' + (field.apply_mode || 'restart');
+      meta.textContent = settingSourceLabel(field) + ' · ' +
+        (field.editable ? '可编辑' : '只读') + ' · ' + settingApplyLabel(field);
       label.appendChild(meta);
+      var description = document.createElement('small');
+      description.className = 'setting-description';
+      description.textContent = field.description || '此配置项控制机器人的对应行为。';
+      label.appendChild(description);
       row.appendChild(label);
       var input;
-      if (!field.secret && typeof field.value === 'boolean') {
+      if (!field.secret && field.value_type === 'bool') {
         input = document.createElement('select');
-        ['true', 'false'].forEach(function(value) {
+        [['true', '是'], ['false', '否']].forEach(function(item) {
           var option = document.createElement('option');
-          option.value = value; option.textContent = value;
+          option.value = item[0]; option.textContent = item[1];
           input.appendChild(option);
         });
-        input.value = String(field.value);
+        input.value = String(Boolean(field.value));
       } else {
         input = document.createElement('input');
-        input.type = field.secret ? 'password' : (typeof field.value === 'number' ? 'number' : 'text');
+        input.type = field.secret ? 'password' : (field.value_type === 'int' ? 'number' : 'text');
         input.value = settingDisplayValue(field);
-        if (field.secret && field.configured) input.placeholder = '已配置（留空不变）';
+        if (field.secret) input.placeholder = field.configured ? '已配置（输入新值可替换，留空不变）' : '未配置（请输入值）';
       }
       input.className = 'setting-input';
       input.dataset.original = input.value;
@@ -1759,7 +1890,14 @@ function renderSettings(data) {
         if (field.secret && input.value === '') delete settingsChanges[field.key];
         else settingsChanges[field.key] = {key: field.key, action: 'set', value: input.type === 'number' ? Number(input.value) : (input.tagName === 'SELECT' ? input.value === 'true' : input.value)};
       });
-      row.appendChild(input);
+      var inputWrap = document.createElement('div');
+      inputWrap.className = 'setting-input-wrap';
+      inputWrap.appendChild(input);
+      var hint = document.createElement('small');
+      hint.className = 'setting-hint';
+      hint.textContent = settingHint(field);
+      inputWrap.appendChild(hint);
+      row.appendChild(inputWrap);
       var actions = document.createElement('div');
       actions.className = 'setting-actions';
       if (field.editable) {

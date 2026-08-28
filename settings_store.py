@@ -31,6 +31,272 @@ class SettingDefinition:
     secret: bool = False
     editable: bool = True
     apply_mode: str = "restart"
+    label: str = ""
+    description: str = ""
+    unit: str | None = None
+    example: str | None = None
+    input_hint: str | None = None
+
+
+# Help text is kept beside the registry so every field exposed by the API has
+# a human-readable explanation.  Examples for secrets are intentionally
+# instructions rather than values: snapshots are safe to show in a browser.
+_SETTING_HELP: dict[str, dict[str, str | None]] = {
+    "email.imap_server": {
+        "label": "IMAP 服务器",
+        "description": "接收邮件的服务器地址，由邮箱服务商提供。",
+        "unit": "域名",
+        "example": "imap.example.com",
+    },
+    "email.imap_port": {
+        "label": "IMAP 端口",
+        "description": "通过 SSL 接收邮件时使用的网络端口。",
+        "unit": "端口",
+        "example": "993",
+    },
+    "email.smtp_server": {
+        "label": "SMTP 服务器",
+        "description": "发送回复邮件的服务器地址，由邮箱服务商提供。",
+        "unit": "域名",
+        "example": "smtp.example.com",
+    },
+    "email.smtp_port": {
+        "label": "SMTP 端口",
+        "description": "发送邮件时使用的网络端口。",
+        "unit": "端口",
+        "example": "587",
+    },
+    "email.email": {
+        "label": "邮箱地址",
+        "description": "Bot 登录邮箱并发送下载结果回复时使用的地址。",
+        "example": "请输入邮箱地址",
+        "input_hint": "敏感信息不会回显；留空表示保持原值。",
+    },
+    "email.password": {
+        "label": "邮箱授权码",
+        "description": "邮箱客户端授权码，通常不是网页登录密码。",
+        "example": "请输入邮箱授权码",
+        "input_hint": "写入后不会回显；留空表示保持原值。",
+    },
+    "email.poll_interval": {
+        "label": "邮件轮询间隔",
+        "description": "Bot 两次检查新邮件之间等待的时间。",
+        "unit": "秒",
+        "example": "30",
+    },
+    "email.smtp_timeout": {
+        "label": "SMTP 超时时间",
+        "description": "连接或发送回复邮件时允许等待的最长时间。",
+        "unit": "秒",
+        "example": "30",
+    },
+    "douyin.download_path": {
+        "label": "抖音下载目录",
+        "description": "抖音视频和图片保存的根目录，由部署环境管理。",
+        "example": "./downloads",
+    },
+    "douyin.cookie": {
+        "label": "抖音 Cookie",
+        "description": "访问抖音内容时使用的登录 Cookie。",
+        "example": "请输入抖音 Cookie",
+        "input_hint": "写入后不会回显；留空表示保持原值。",
+    },
+    "douyin.naming": {
+        "label": "抖音文件名格式",
+        "description": "下载文件名模板，可使用 create 和 aweme_id 占位符。",
+        "example": "{create}_{aweme_id}",
+    },
+    "douyin.folderize": {
+        "label": "按作者分目录",
+        "description": "开启后，将普通视频按作者分别保存到子目录。",
+        "example": "true",
+    },
+    "douyin.timeout": {
+        "label": "抖音下载超时",
+        "description": "抖音元数据和媒体请求允许等待的最长时间。",
+        "unit": "秒",
+        "example": "30",
+    },
+    "douyin.max_retries": {
+        "label": "抖音最大重试次数",
+        "description": "抖音下载失败后最多重新尝试的次数。",
+        "unit": "次",
+        "example": "3",
+    },
+    "douyin.max_tasks": {
+        "label": "抖音任务上限",
+        "description": "配置的抖音任务并发上限；当前单个下载实际仍固定使用 1 个任务。",
+        "unit": "任务",
+        "example": "5",
+    },
+    "bilibili.download_path": {
+        "label": "哔哩哔哩下载目录",
+        "description": "哔哩哔哩视频和封面保存的根目录，由部署环境管理。",
+        "example": "./downloads/bilibili",
+    },
+    "bilibili.auth": {
+        "label": "哔哩哔哩登录凭据",
+        "description": "yutto 下载哔哩哔哩内容时使用的登录凭据。",
+        "example": "请输入哔哩哔哩登录凭据",
+        "input_hint": "写入后不会回显；留空表示保持原值。",
+    },
+    "bilibili.auth_file": {
+        "label": "哔哩哔哩认证文件",
+        "description": "保存哔哩哔哩登录状态的认证文件路径，由部署环境管理。",
+        "example": "请输入认证文件路径",
+    },
+    "bilibili.timeout": {
+        "label": "哔哩哔哩下载超时",
+        "description": "单个哔哩哔哩下载进程允许运行的最长时间。",
+        "unit": "秒",
+        "example": "3600",
+    },
+    "bilibili.batch": {
+        "label": "哔哩哔哩批量模式",
+        "description": "开启后，系列、番剧或合集链接会尝试下载其中的多个项目。",
+        "example": "false",
+    },
+    "bilibili.video_quality": {
+        "label": "哔哩哔哩视频清晰度",
+        "description": "传给 yutto 的清晰度代码；127 表示优先请求最高可用画质并在不可用时回退。",
+        "unit": "代码",
+        "example": "127",
+    },
+    "bilibili.yutto_bin": {
+        "label": "yutto 程序路径",
+        "description": "下载哔哩哔哩内容所用 yutto 可执行文件的位置，由部署环境管理。",
+        "example": "yutto",
+    },
+    "bot.allowed_senders": {
+        "label": "发件人白名单",
+        "description": "只处理列表中的发件人邮件；留空表示允许所有发件人。",
+        "unit": "邮箱地址列表",
+        "example": "user@example.com, team@example.com",
+        "input_hint": "多个地址用英文逗号分隔。",
+    },
+    "bot.cooldown_seconds": {
+        "label": "发件人冷却时间",
+        "description": "同一发件人成功下载后，其后续任务至少等待这段时间再执行。",
+        "unit": "秒",
+        "example": "5",
+    },
+    "bot.subject_keyword": {
+        "label": "邮件主题关键词",
+        "description": "普通下载邮件主题必须包含的文字；Cookie 命令不受此限制。",
+        "example": "下载",
+    },
+    "bot.transient_retry_attempts": {
+        "label": "临时失败重试次数",
+        "description": "网络等临时错误进入重试队列后最多尝试的次数。",
+        "unit": "次",
+        "example": "3",
+    },
+    "bot.transient_retry_delay_seconds": {
+        "label": "临时失败重试间隔",
+        "description": "临时失败任务两次重试之间等待的时间。",
+        "unit": "秒",
+        "example": "120",
+    },
+    "bot.transient_pending_file": {
+        "label": "待重试记录文件",
+        "description": "保存临时失败待重试任务的文件路径，由部署环境管理。",
+        "example": "./pending_retries.json",
+    },
+    "bot.transient_failed_file": {
+        "label": "失败记录文件",
+        "description": "保存重试耗尽链接的文件路径，由部署环境管理。",
+        "example": "./failed_links.txt",
+    },
+    "bot.durable_mail_enabled": {
+        "label": "持久化邮件处理",
+        "description": "开启后使用 SQLite 记录邮件、任务租约和发送队列。",
+        "example": "true",
+    },
+    "bot.state_db": {
+        "label": "邮件状态数据库",
+        "description": "保存邮件处理状态和任务租约的 SQLite 路径，由部署环境管理。",
+        "example": "./state/mail_state.sqlite3",
+    },
+    "bot.worker_count": {
+        "label": "总工作线程数",
+        "description": "同时处理下载和邮件通知任务的工作线程数量。",
+        "unit": "线程",
+        "example": "2",
+    },
+    "bot.douyin_worker_count": {
+        "label": "抖音工作线程数",
+        "description": "同时执行抖音下载任务的工作线程数量。",
+        "unit": "线程",
+        "example": "1",
+    },
+    "bot.bilibili_worker_count": {
+        "label": "哔哩哔哩工作线程数",
+        "description": "同时执行哔哩哔哩下载任务的工作线程数量。",
+        "unit": "线程",
+        "example": "1",
+    },
+    "bot.lease_seconds": {
+        "label": "任务租约时长",
+        "description": "工作线程领取任务后保留该任务的最长时间，超时可被恢复。",
+        "unit": "秒",
+        "example": "300",
+    },
+    "bot.heartbeat_seconds": {
+        "label": "任务心跳间隔",
+        "description": "工作线程续期任务租约的间隔；必须不超过 lease_seconds 的三分之一。",
+        "unit": "秒",
+        "example": "30",
+    },
+    "bot.outbox_retry_attempts": {
+        "label": "邮件发送重试次数",
+        "description": "回复邮件发送失败后最多重新尝试的次数。",
+        "unit": "次",
+        "example": "5",
+    },
+    "bot.outbox_retry_delay_seconds": {
+        "label": "邮件发送重试间隔",
+        "description": "回复邮件两次发送尝试之间等待的时间。",
+        "unit": "秒",
+        "example": "60",
+    },
+    "bot.commands.cookie_update": {
+        "label": "更新 Cookie 命令",
+        "description": "邮件主题包含这段文字时，将正文内容保存为新的抖音 Cookie。",
+        "example": "更新cookie",
+    },
+    "bot.commands.cookie_auto": {
+        "label": "自动获取 Cookie 命令",
+        "description": "邮件主题包含这段文字时，使用持久化 Firefox 登录状态自动获取抖音 Cookie。",
+        "example": "自动获取cookie",
+    },
+    "media_cleanup.backup_retention_days": {
+        "label": "媒体备份保留天数",
+        "description": "裁剪成功后原始媒体备份至少保留的天数。",
+        "unit": "天",
+        "example": "28",
+    },
+    "media_cleanup.check_interval_days": {
+        "label": "媒体备份检查间隔",
+        "description": "Bot 检查并清理到期媒体备份的间隔。",
+        "unit": "天",
+        "example": "7",
+    },
+    "cookie_extractor.profile_dir": {
+        "label": "Firefox 配置目录",
+        "description": "保存 Firefox 登录会话和 Cookie 的持久化配置目录，由部署环境管理。",
+        "example": "./firefox-profile",
+    },
+    "cookie_extractor.headless": {
+        "label": "无头获取 Cookie",
+        "description": "开启后自动获取 Cookie 时不显示浏览器窗口。",
+        "example": "true",
+    },
+    "cookie_extractor.validate": {
+        "label": "验证获取的 Cookie",
+        "description": "开启后保存 Cookie 前访问抖音进行有效性校验。",
+        "example": "true",
+    },
+}
 
 
 def _defs() -> tuple[SettingDefinition, ...]:
@@ -82,7 +348,7 @@ def _defs() -> tuple[SettingDefinition, ...]:
         ("cookie_extractor.headless", "COOKIE_HEADLESS", "bool", False, True, "restart"),
         ("cookie_extractor.validate", "COOKIE_VALIDATE", "bool", False, True, "restart"),
     ]
-    return tuple(SettingDefinition(*row) for row in rows)
+    return tuple(SettingDefinition(*row, **_SETTING_HELP[row[0]]) for row in rows)
 
 
 SETTING_REGISTRY: dict[str, SettingDefinition] = {item.key: item for item in _defs()}
@@ -630,5 +896,11 @@ class SettingsStore:
                 "editable": definition.editable and not (definition.env and os.getenv(definition.env) is not None),
                 "apply_mode": definition.apply_mode,
                 "secret": definition.secret,
+                "value_type": definition.value_type,
+                "label": definition.label,
+                "description": definition.description,
+                "unit": definition.unit,
+                "example": definition.example,
+                "input_hint": definition.input_hint,
             }
         return result
