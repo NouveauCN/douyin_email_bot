@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -23,6 +24,7 @@ from urllib.parse import SplitResult, urlsplit, urlunsplit
 SCHEMA_VERSION = 2
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 DEFAULT_LEASE_SECONDS = 300.0
+logger = logging.getLogger("MailStateStore")
 
 
 class MailStateStore:
@@ -454,12 +456,12 @@ class MailStateStore:
                 "WHERE uid > 0 AND (intake_complete = 0 OR seen_at IS NULL)"
             ).fetchone()[0]
             task_count = self._conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status IN ('pending', 'leased')"
+                "SELECT COUNT(*) FROM tasks "
+                "WHERE status IN ('pending', 'leased')"
             ).fetchone()[0]
             outbox_count = self._conn.execute(
                 "SELECT COUNT(*) FROM smtp_outbox "
-                "WHERE status IN ('pending', 'leased') "
-                "OR (status = 'failed' AND next_attempt_at IS NOT NULL)"
+                "WHERE status IN ('pending', 'leased', 'failed')"
             ).fetchone()[0]
             return {
                 "intake": int(intake_count),
@@ -467,22 +469,58 @@ class MailStateStore:
                 "outbox": int(outbox_count),
             }
 
-    def terminal_legacy_retry_keys(self) -> set[str]:
-        """Return legacy JSON keys already terminal in durable state."""
+    def terminal_legacy_retry_keys(self, *, strict: bool = False) -> set[str]:
+        """Return legacy JSON keys already terminal in durable state.
+
+        Rollback uses ``strict=True`` because silently ignoring corrupt
+        terminal payloads could allow the legacy path to duplicate or abandon
+        work. Routine cleanup remains tolerant so one damaged record does not
+        prevent unrelated terminal mirrors from being removed.
+        """
         with self._lock:
             self._ensure_open()
             rows = self._conn.execute(
-                "SELECT payload_json FROM tasks "
+                "SELECT id, payload_json FROM tasks "
                 "WHERE status IN ('succeeded', 'failed')"
             ).fetchall()
             keys: set[str] = set()
             for row in rows:
                 try:
                     payload = self._decode(row["payload_json"])
-                except (TypeError, ValueError, json.JSONDecodeError):
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    if strict:
+                        raise RuntimeError(
+                            f"terminal task payload for task {row['id']} is invalid JSON"
+                        ) from exc
+                    logger.warning(
+                        "Ignoring invalid terminal task payload for task %s",
+                        row["id"],
+                    )
                     continue
-                if isinstance(payload, dict) and payload.get("legacy_retry_key"):
-                    keys.add(str(payload["legacy_retry_key"]))
+                if not isinstance(payload, dict):
+                    if strict:
+                        raise RuntimeError(
+                            f"terminal task payload for task {row['id']} must be an object"
+                        )
+                    logger.warning(
+                        "Ignoring non-object terminal task payload for task %s",
+                        row["id"],
+                    )
+                    continue
+                if "legacy_retry_key" not in payload:
+                    continue
+                key = payload["legacy_retry_key"]
+                if not isinstance(key, str) or not key.strip():
+                    if strict:
+                        raise RuntimeError(
+                            f"terminal task {row['id']} has an invalid legacy_retry_key"
+                        )
+                    logger.warning(
+                        "Ignoring invalid legacy_retry_key in terminal task %s",
+                        row["id"],
+                    )
+                    continue
+                keys.add(key)
             return keys
 
     def mark_intake_complete(

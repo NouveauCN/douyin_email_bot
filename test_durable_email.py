@@ -195,7 +195,7 @@ def test_mail_text_decoding_handles_unknown_charset_and_multipart_subject():
     assert _get_body_text(msg) == "你好"
 
 
-def test_legacy_email_routes_body_link_without_subject_keyword(tmp_path):
+def test_legacy_email_skips_body_link_without_subject_keyword(tmp_path):
     bot = make_bot(tmp_path)
     bot._state.close()
     bot._state = None
@@ -214,22 +214,20 @@ def test_legacy_email_routes_body_link_without_subject_keyword(tmp_path):
 
     bot._process_email(mail, b"9", bot.config.email, bot.config.bot)
 
-    assert downloaded == ["https://www.douyin.com/video/123"]
-    assert len(replies) == 1
-    assert mail.stored == [(b"9", "\\Seen")]
+    assert downloaded == []
+    assert replies == []
+    # Legacy keyword skips remain unseen and are retried on the next poll.
+    assert mail.stored == []
 
 
-def test_durable_email_routes_body_link_without_subject_keyword(tmp_path):
+def test_durable_email_skips_body_link_without_subject_keyword(tmp_path):
     bot = make_bot(tmp_path)
     mail = FakeImap(make_raw_mail(subject="随便看看"))
     bot._imap_connect = lambda _cfg: mail
 
     bot._poll_once_durable(bot.config.email, bot.config.bot)
 
-    task = bot._state._conn.execute(
-        "SELECT normalized_url FROM tasks"
-    ).fetchone()
-    assert task["normalized_url"] == "https://www.douyin.com/video/123"
+    assert bot._state._conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
     assert bot._state._conn.execute("SELECT COUNT(*) FROM smtp_outbox").fetchone()[0] == 0
     bot._state.close()
 
@@ -263,10 +261,10 @@ def test_no_link_email_is_seen_without_smtp_notice_legacy_or_durable(tmp_path):
 def test_durable_routing_exception_is_quarantined_and_next_uid_continues(tmp_path, monkeypatch):
     bot = make_bot(tmp_path)
     raw_bad = make_raw_mail(
-        url="secret body", subject="bad subject", message_id="<bad@example.test>"
+        url="secret body", subject="下载 bad subject", message_id="<bad@example.test>"
     )
     raw_good = make_raw_mail(
-        subject="普通主题", message_id="<good@example.test>"
+        subject="下载主题", message_id="<good@example.test>"
     )
     mail = MultiUidImap({9: raw_bad, 10: raw_good})
     bot._imap_connect = lambda _cfg: mail
@@ -677,6 +675,31 @@ def test_legacy_rollback_is_rejected_until_durable_work_is_drained(tmp_path):
     state.close()
 
     EmailBot._assert_legacy_rollback_safe(state_path)
+
+
+@pytest.mark.parametrize("contents", ["not json", "[]", '{"bad": {}}'])
+def test_legacy_rollback_rejects_unreadable_or_malformed_retry_file(tmp_path, contents):
+    state_path = tmp_path / "state.sqlite"
+    MailStateStore(state_path).close()
+    pending_path = tmp_path / "pending.json"
+    pending_path.write_text(contents, encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="legacy retry file"):
+        EmailBot._assert_legacy_rollback_safe(state_path, pending_path)
+
+
+def test_cookie_command_bypasses_subject_keyword_gate(tmp_path):
+    bot = make_bot(tmp_path)
+    mail = FakeImap(make_raw_cookie_mail())
+    bot._imap_connect = lambda _cfg: mail
+
+    bot._poll_once_durable(bot.config.email, bot.config.bot)
+
+    task = bot._state._conn.execute(
+        "SELECT normalized_url FROM tasks"
+    ).fetchone()
+    assert task["normalized_url"] == "urn:mail-notice:cookie_update"
+    bot._state.close()
 
 
 def test_cookie_command_secret_is_not_persisted_in_sqlite(tmp_path):

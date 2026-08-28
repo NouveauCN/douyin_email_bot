@@ -156,20 +156,55 @@ class EmailBot:
     def _assert_legacy_rollback_safe(
         state_db_path: Path, pending_retry_path: Path | None = None
     ) -> None:
+        # An unreadable retry mirror cannot be treated as empty: doing so could
+        # abandon work that the legacy path would otherwise process. Validate
+        # it before inspecting terminal durable records.
+        pending: object | None = None
+        if pending_retry_path is not None and pending_retry_path.exists():
+            try:
+                pending = json.loads(pending_retry_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                logger.error(
+                    "Cannot validate legacy retry file %s during rollback: %s",
+                    pending_retry_path,
+                    exc,
+                )
+                raise RuntimeError(
+                    f"cannot disable durable mail: legacy retry file "
+                    f"{pending_retry_path} is unreadable or malformed"
+                ) from exc
+            if not isinstance(pending, dict):
+                logger.error(
+                    "Legacy retry file %s must contain an object, got %s",
+                    pending_retry_path,
+                    type(pending).__name__,
+                )
+                raise RuntimeError(
+                    f"cannot disable durable mail: legacy retry file "
+                    f"{pending_retry_path} is malformed (expected an object)"
+                )
+            for key, item in pending.items():
+                if not isinstance(item, dict) or not str(item.get("url") or "").strip():
+                    logger.error(
+                        "Legacy retry file %s contains malformed entry %r",
+                        pending_retry_path,
+                        key,
+                    )
+                    raise RuntimeError(
+                        f"cannot disable durable mail: legacy retry file "
+                        f"{pending_retry_path} contains a malformed entry"
+                    )
+
         with MailStateStore(state_db_path) as rollback_state:
             unfinished = rollback_state.unfinished_work_counts()
-            terminal_legacy_keys = rollback_state.terminal_legacy_retry_keys()
+            terminal_legacy_keys = rollback_state.terminal_legacy_retry_keys(strict=True)
         if any(unfinished.values()):
             raise RuntimeError(
                 "cannot disable durable mail while SQLite work remains: "
                 f"{unfinished}; drain intake/Seen/tasks/outbox before rollback"
             )
-        if terminal_legacy_keys and pending_retry_path is not None:
-            try:
-                pending = json.loads(pending_retry_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                pending = {}
-            if isinstance(pending, dict) and terminal_legacy_keys.intersection(
+        if terminal_legacy_keys and isinstance(pending, dict):
+            if terminal_legacy_keys.intersection(
                 str(key) for key in pending
             ):
                 raise RuntimeError(
@@ -904,11 +939,21 @@ class EmailBot:
                     command = "cookie_update"
                 elif bot_cfg.commands.cookie_auto and bot_cfg.commands.cookie_auto in subject:
                     command = "cookie_auto"
-                else:
+                elif (
+                    not getattr(bot_cfg, "subject_keyword", "")
+                    or getattr(bot_cfg, "subject_keyword", "") in subject
+                ):
                     url = self.extractor.extract(subject + " " + body)
                     if url:
                         urls = [url]
                         platform = detect_platform(url)
+                else:
+                    logger.debug(
+                        "Skipping durable download email without subject keyword "
+                        "from %s: %s",
+                        sender,
+                        subject,
+                    )
         except Exception as exc:
             routing_error = type(exc).__name__
             logger.warning(
@@ -1107,6 +1152,17 @@ class EmailBot:
         if url is None:
             logger.debug("No supported URL found from %s (subject: %s)", sender, subject)
             _mark_seen(mail, msg_id)
+            return
+
+        # Keep keyword-skipped legacy mail unseen for the next poll, while
+        # retaining the existing no-URL behavior above.
+        subject_keyword = getattr(bot_cfg, "subject_keyword", "") or ""
+        if subject_keyword and subject_keyword not in subject:
+            logger.debug(
+                "Skipping download email without subject keyword from %s: %s",
+                sender,
+                subject,
+            )
             return
 
         platform = detect_platform(url)

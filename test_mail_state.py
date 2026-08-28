@@ -469,6 +469,51 @@ def test_outbox_heartbeat_prevents_expiry_during_slow_smtp(tmp_path):
     store.close()
 
 
+def test_terminal_failed_task_and_sent_outbox_do_not_block_rollback(tmp_path):
+    store = make_store(tmp_path)
+    task = store.enqueue_task("m1", "https://example.test/a")
+    claimed_task = store.claim_tasks(now=100)[0]
+    store.fail_task(task["id"], claimed_task["lease_token"], "permanent", now=101)
+    assert store.unfinished_work_counts()["tasks"] == 0
+
+    task2 = store.enqueue_task("m2", "https://example.test/b")
+    claimed_task2 = store.claim_tasks(now=100)[0]
+    store.complete_task(task2["id"], claimed_task2["lease_token"], result={"ok": True}, now=101)
+    outbox = store.enqueue_outbox(task2["id"], "failed")
+    claimed_outbox = store.claim_outbox(now=100)[0]
+    store.mark_outbox_sent(outbox["id"], claimed_outbox["lease_token"], now=101)
+    assert store.unfinished_work_counts() == {"intake": 0, "tasks": 0, "outbox": 0}
+    store.close()
+
+
+def test_undelivered_failed_outbox_blocks_rollback(tmp_path):
+    store = make_store(tmp_path)
+    task = store.enqueue_task("m1", "https://example.test/a")
+    outbox = store.enqueue_outbox(task["id"], "failed")
+    claimed_outbox = store.claim_outbox(now=100)[0]
+    store.mark_outbox_failed(
+        outbox["id"], claimed_outbox["lease_token"], "permanent", now=101
+    )
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "payload_json", ['{', '[]', '{"legacy_retry_key": 123}']
+)
+def test_strict_terminal_legacy_keys_reject_corrupt_payloads(tmp_path, payload_json):
+    store = make_store(tmp_path)
+    task = store.enqueue_task("m1", "https://example.test/a")
+    claimed = store.claim_tasks(now=100)[0]
+    store.complete_task(task["id"], claimed["lease_token"], result={"ok": True}, now=101)
+    store._conn.execute(
+        "UPDATE tasks SET payload_json = ? WHERE id = ?", (payload_json, task["id"])
+    )
+
+    with pytest.raises(RuntimeError, match="terminal task"):
+        store.terminal_legacy_retry_keys(strict=True)
+    store.close()
+
+
 def test_invalid_json_payload_rolls_back_outbox_insert(tmp_path):
     store = make_store(tmp_path)
     task = store.enqueue_task("m1", "https://example.test/a")
