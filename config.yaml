@@ -6,6 +6,7 @@ email:
   # SMTP server for sending replies
   smtp_server: "smtp.qq.com"
   smtp_port: 587
+  smtp_timeout: 30
   # Poll inbox interval (seconds)
   poll_interval: 30
   # NOTE: email address and password are loaded from .env file.
@@ -61,6 +62,17 @@ bot:
   # Project-relative files for queued retries and final failed links.
   transient_pending_file: "./pending_retries.json"
   transient_failed_file: "./failed_links.txt"
+  # Durable intake/task state. Keep this on the bot's persistent state volume.
+  durable_mail_enabled: true
+  state_db: "./state/mail_state.sqlite3"
+  # Start conservatively: one Douyin and one Bilibili job at a time.
+  worker_count: 2
+  douyin_worker_count: 1
+  bilibili_worker_count: 1
+  lease_seconds: 300
+  heartbeat_seconds: 30
+  outbox_retry_attempts: 5
+  outbox_retry_delay_seconds: 60
   # Special command keywords in email subject
   commands:
     # "更新cookie" — paste new DOUYIN_COOKIE in email body

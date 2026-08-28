@@ -196,6 +196,40 @@ Acceptance criteria:
 
 ### Phase 5: Durable Mail Processing and Delivery (P1)
 
+Implementation status: **Completed in PR #37; PR remains open and unmerged**
+(2026-08-27).
+
+Sol Senior final high-risk review: **FINAL PASS** (2026-08-27).
+
+- Added a WAL-backed `sqlite3` state store under the bot state volume with
+  mailbox UID/UIDVALIDITY generations, source and normalized-URL idempotency,
+  task leases/heartbeats, recovery, and an atomic task-result/SMTP-outbox
+  transition.
+- IMAP intake now uses UID search/fetch and acknowledges `\\Seen` only after
+  source routing is marked complete. Failed flag updates remain pending and
+  are retried during the next reconciliation; incomplete routing is never
+  acknowledged.
+- Bounded download workers and a separate SMTP outbox worker decouple slow
+  media work and delivery from the 30-second polling coordinator. Douyin and
+  Bilibili capacity are independently limited, and Firefox cookie refresh is
+  serialized.
+- Legacy JSON retries remain intact as a rollback source and are imported
+  idempotently. `migrate_mail_state.py` is dry-run by default; after SQLite
+  intake, tasks, outbox, and pending `\\Seen` acknowledgements drain, set
+  `BOT_DURABLE_MAIL_ENABLED=0` to use the legacy path. Startup refuses rollback
+  while durable work remains. Cookie command bodies are processed in memory
+  and are not persisted in SQLite; pre-v2 cookie tasks are redacted and
+  terminally failed so they must be resent. The migration securely rebuilds
+  SQLite and checkpoints/truncates its WAL; external database backups still
+  require the normal secret-rotation policy.
+- A terminal durable failure removes its mirrored legacy JSON retry only after
+  the failed task and notification are durably recorded, preventing duplicate
+  execution if the operator later rolls back.
+- Lease recovery, UIDVALIDITY changes, duplicate intake, outbox idempotency,
+  SMTP retry, `\\Seen` failure, and legacy migration are covered by mocked
+  fault-injection tests. External webhooks, queues, and IMAP IDLE remain
+  deferred.
+
 Make mail intake reliable before optimizing its trigger latency. Keep the
 30-second polling loop as the default while this phase is being introduced.
 
@@ -277,15 +311,22 @@ Optional follow-up:
    private CA through `DOUYIN_SHORT_LINK_CA_BUNDLE`.
 4. Decided: install the authoritative `uv.lock` directly with a pinned uv
    version in the image; do not commit a second exported requirements artifact.
-5. Mail acknowledgement: decide whether `\Seen` means durable intake or full
-   business completion; the recommended contract is durable intake, with final
-   success or failure represented by the SMTP outbox.
-6. Mail identity and recovery: define the UIDVALIDITY reset procedure, SQLite
-   path and backup policy, task idempotency keys, lease duration, retry limits,
-   and the migration/rollback behavior for the existing JSON retry files.
-7. Capacity and delivery: set global and per-platform worker limits, define
-   cookie-extraction serialization, and decide how SMTP ambiguous responses or
-   duplicate notifications are handled.
+5. Decided in P5: `\Seen` means durable intake, not business completion. The
+   final success or failure notification is represented by the SMTP outbox.
+6. Decided in P5: state is stored at `/app/state/mail_state.sqlite3`; a
+   UIDVALIDITY change starts and archives a new mailbox generation. The first
+   run or a new UID generation performs full UID reconciliation; normal polls
+   use the high-water range plus `UNSEEN`. Tasks are unique by source message
+   and normalized URL, use 300-second leases with 30-second heartbeats, and
+   legacy JSON migration is idempotent and reversible. Rollback is refused
+   while intake, pending `\\Seen` acknowledgements, durable tasks, or outbox
+   work remains; an incomplete source stranded by a UIDVALIDITY change is
+   retained for operator reconciliation rather than auto-acknowledged.
+7. Decided in P5: two global worker slots are available, with one each for
+   Douyin and Bilibili; sender cooldowns and Firefox cookie access are
+   serialized. SMTP uses a stable Message-ID, explicit timeout, bounded retry,
+   and may duplicate delivery after an ambiguous remote response; after retry
+   exhaustion the outbox enters terminal `failed` state.
 8. Latency target: measure whether the service needs sub-30-second or roughly
    P95-under-5-second intake latency. Enable IMAP IDLE only if that target
    justifies its long-connection and recovery complexity.

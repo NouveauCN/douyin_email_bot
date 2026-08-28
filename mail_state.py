@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
 import sqlite3
 import threading
 import time
@@ -19,9 +21,10 @@ from typing import Any, Iterator
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 DEFAULT_LEASE_SECONDS = 300.0
+logger = logging.getLogger("MailStateStore")
 
 
 class MailStateStore:
@@ -57,6 +60,13 @@ class MailStateStore:
             check_same_thread=False,
         )
         self._conn.row_factory = sqlite3.Row
+        if self.path != ":memory:":
+            try:
+                os.chmod(self.path, 0o600)
+            except OSError:
+                # The database remains usable on filesystems that do not
+                # expose POSIX modes; Docker's state volume is still scoped.
+                pass
         self.initialize()
 
     def initialize(self) -> None:
@@ -69,6 +79,8 @@ class MailStateStore:
             self._conn.execute("PRAGMA journal_mode = WAL")
             self._conn.execute("PRAGMA foreign_keys = ON")
             self._conn.execute("PRAGMA synchronous = FULL")
+            self._conn.execute("PRAGMA secure_delete = ON")
+            secure_cleanup_required = False
             with self._transaction():
                 version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
                 if version > SCHEMA_VERSION:
@@ -100,10 +112,15 @@ class MailStateStore:
                         uidvalidity INTEGER NOT NULL,
                         uid INTEGER NOT NULL CHECK (uid >= 0),
                         metadata_json TEXT NOT NULL DEFAULT '{}',
+                        intake_complete INTEGER NOT NULL DEFAULT 1
+                            CHECK (intake_complete IN (0, 1)),
                         seen_at REAL,
                         created_at REAL NOT NULL,
                         updated_at REAL NOT NULL
                     );
+                    CREATE UNIQUE INDEX IF NOT EXISTS source_locator_idx
+                        ON source_messages(mailbox, uidvalidity, uid)
+                        WHERE uid > 0;
 
                     CREATE TABLE IF NOT EXISTS tasks (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -164,8 +181,25 @@ class MailStateStore:
                 }
                 if "seen_at" not in source_columns:
                     self._conn.execute("ALTER TABLE source_messages ADD COLUMN seen_at REAL")
+                if "intake_complete" not in source_columns:
+                    # Historical sources need conservative recovery. Only
+                    # sources with a persisted route or a prior Seen ACK can
+                    # be treated as complete.
+                    self._conn.execute(
+                        "ALTER TABLE source_messages ADD COLUMN intake_complete "
+                        "INTEGER NOT NULL DEFAULT 0"
+                    )
                 if version < SCHEMA_VERSION:
-                    self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                    self._migrate_legacy_state_locked()
+                    secure_cleanup_required = True
+            if secure_cleanup_required:
+                # The legacy schema may have stored cookie plaintext in the
+                # main DB or WAL. Checkpoint, securely rebuild, and truncate
+                # before exposing the upgraded store to workers.
+                self._secure_migrate_cleanup()
+                # Only mark the migration complete after all physical cleanup
+                # steps succeed. A failed cleanup must be retried next start.
+                self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def close(self) -> None:
         with self._lock:
@@ -194,6 +228,112 @@ class MailStateStore:
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError("mail state store is closed")
+
+    def _migrate_legacy_state_locked(self) -> None:
+        """Make pre-v2 sources and cookie tasks safe to resume."""
+        self._conn.execute(
+            "UPDATE source_messages SET intake_complete = CASE "
+            "WHEN uid = 0 OR seen_at IS NOT NULL OR EXISTS ("
+            "SELECT 1 FROM tasks WHERE tasks.source_message_id = source_messages.source_message_id"
+            ") THEN 1 ELSE 0 END"
+        )
+        rows = self._conn.execute(
+            "SELECT id, source_message_id, payload_json, status "
+            "FROM tasks WHERE platform = 'cookie'"
+        ).fetchall()
+        for row in rows:
+            timestamp = self._now(None)
+            try:
+                payload = self._decode(row["payload_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            sender = str(payload.get("sender", "") or "")
+            source = self._conn.execute(
+                "SELECT metadata_json FROM source_messages "
+                "WHERE source_message_id = ?",
+                (row["source_message_id"],),
+            ).fetchone()
+            if not sender and source is not None:
+                try:
+                    source_metadata = self._decode(source["metadata_json"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    source_metadata = {}
+                if isinstance(source_metadata, dict):
+                    sender = str(source_metadata.get("sender", "") or "")
+            if not sender:
+                outbox = self._conn.execute(
+                    "SELECT payload_json FROM smtp_outbox WHERE task_id = ? "
+                    "ORDER BY id LIMIT 1",
+                    (row["id"],),
+                ).fetchone()
+                if outbox is not None:
+                    try:
+                        outbox_payload = self._decode(outbox["payload_json"])
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        outbox_payload = {}
+                    if isinstance(outbox_payload, dict):
+                        sender = str(outbox_payload.get("to_addr", "") or "")
+            status = row["status"]
+            if status in ("pending", "leased"):
+                self._conn.execute(
+                    "UPDATE tasks SET status = 'failed', payload_json = ?, "
+                    "result_json = NULL, next_attempt_at = NULL, lease_token = NULL, "
+                    "lease_expires_at = NULL, last_error = NULL, completed_at = COALESCE(completed_at, ?), "
+                    "updated_at = ? WHERE id = ?",
+                    (
+                        self._json({}),
+                        timestamp,
+                        timestamp,
+                        row["id"],
+                    ),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE tasks SET payload_json = ?, result_json = NULL, "
+                    "last_error = NULL, updated_at = ? WHERE id = ?",
+                    (self._json({}), timestamp, row["id"]),
+                )
+            self._conn.execute(
+                "UPDATE source_messages SET metadata_json = ? "
+                "WHERE source_message_id = ?",
+                (self._json({"sender": sender}), row["source_message_id"]),
+            )
+            safe_notice = self._json(
+                {
+                    "to_addr": sender,
+                    "body": "旧版 Cookie 任务无法安全恢复，请重新发送 Cookie 命令。",
+                    "subject_status": "Cookie 需重新发送",
+                }
+            )
+            self._conn.execute(
+                "UPDATE smtp_outbox SET payload_json = ?, last_error = NULL, updated_at = ? "
+                "WHERE task_id = ?",
+                (safe_notice, timestamp, row["id"]),
+            )
+            if self._conn.execute(
+                "SELECT 1 FROM smtp_outbox WHERE task_id = ? LIMIT 1", (row["id"],)
+            ).fetchone() is None:
+                self._insert_outbox_locked(
+                    row["id"],
+                    "legacy-cookie-recovery",
+                    json.loads(safe_notice),
+                    None,
+                    timestamp,
+                )
+
+    def _secure_migrate_cleanup(self) -> None:
+        """Physically remove pre-v2 secret pages before completing migration."""
+        self._checkpoint_wal()
+        self._conn.execute("VACUUM")
+        self._checkpoint_wal()
+
+    def _checkpoint_wal(self) -> None:
+        result = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if not result or int(result[0]) != 0:
+            busy = result[0] if result else "unknown"
+            raise RuntimeError(f"SQLite WAL checkpoint is busy: {busy}")
 
     @staticmethod
     def normalize_url(url: str) -> str:
@@ -286,11 +426,116 @@ class MailStateStore:
             self._ensure_open()
             rows = self._conn.execute(
                 "SELECT source_message_id, mailbox, uidvalidity, uid "
-                "FROM source_messages WHERE mailbox = ? AND seen_at IS NULL "
+                "FROM source_messages WHERE mailbox = ? AND uid > 0 "
+                "AND intake_complete = 1 AND seen_at IS NULL "
                 "ORDER BY uidvalidity, uid",
                 (mailbox,),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def pending_intake(
+        self, mailbox: str, uidvalidity: int
+    ) -> list[dict[str, Any]]:
+        """Return source UIDs whose routing transaction was interrupted."""
+        with self._lock:
+            self._ensure_open()
+            rows = self._conn.execute(
+                "SELECT source_message_id, mailbox, uidvalidity, uid "
+                "FROM source_messages WHERE mailbox = ? AND uidvalidity = ? "
+                "AND uid > 0 AND intake_complete = 0 ORDER BY uid",
+                (mailbox, uidvalidity),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def unfinished_work_counts(self) -> dict[str, int]:
+        """Return work that must drain before switching to the legacy bot."""
+        with self._lock:
+            self._ensure_open()
+            intake_count = self._conn.execute(
+                "SELECT COUNT(*) FROM source_messages "
+                "WHERE uid > 0 AND (intake_complete = 0 OR seen_at IS NULL)"
+            ).fetchone()[0]
+            task_count = self._conn.execute(
+                "SELECT COUNT(*) FROM tasks "
+                "WHERE status IN ('pending', 'leased')"
+            ).fetchone()[0]
+            outbox_count = self._conn.execute(
+                "SELECT COUNT(*) FROM smtp_outbox "
+                "WHERE status IN ('pending', 'leased', 'failed')"
+            ).fetchone()[0]
+            return {
+                "intake": int(intake_count),
+                "tasks": int(task_count),
+                "outbox": int(outbox_count),
+            }
+
+    def terminal_legacy_retry_keys(self, *, strict: bool = False) -> set[str]:
+        """Return legacy JSON keys already terminal in durable state.
+
+        Rollback uses ``strict=True`` because silently ignoring corrupt
+        terminal payloads could allow the legacy path to duplicate or abandon
+        work. Routine cleanup remains tolerant so one damaged record does not
+        prevent unrelated terminal mirrors from being removed.
+        """
+        with self._lock:
+            self._ensure_open()
+            rows = self._conn.execute(
+                "SELECT id, payload_json FROM tasks "
+                "WHERE status IN ('succeeded', 'failed')"
+            ).fetchall()
+            keys: set[str] = set()
+            for row in rows:
+                try:
+                    payload = self._decode(row["payload_json"])
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    if strict:
+                        raise RuntimeError(
+                            f"terminal task payload for task {row['id']} is invalid JSON"
+                        ) from exc
+                    logger.warning(
+                        "Ignoring invalid terminal task payload for task %s",
+                        row["id"],
+                    )
+                    continue
+                if not isinstance(payload, dict):
+                    if strict:
+                        raise RuntimeError(
+                            f"terminal task payload for task {row['id']} must be an object"
+                        )
+                    logger.warning(
+                        "Ignoring non-object terminal task payload for task %s",
+                        row["id"],
+                    )
+                    continue
+                if "legacy_retry_key" not in payload:
+                    continue
+                key = payload["legacy_retry_key"]
+                if not isinstance(key, str) or not key.strip():
+                    if strict:
+                        raise RuntimeError(
+                            f"terminal task {row['id']} has an invalid legacy_retry_key"
+                        )
+                    logger.warning(
+                        "Ignoring invalid legacy_retry_key in terminal task %s",
+                        row["id"],
+                    )
+                    continue
+                keys.add(key)
+            return keys
+
+    def mark_intake_complete(
+        self, source_message_id: str, *, now: float | None = None
+    ) -> bool:
+        """Mark routing durable before allowing the source mail to be ACKed."""
+        timestamp = self._now(now)
+        with self._lock, self._transaction():
+            self._ensure_open()
+            cursor = self._conn.execute(
+                "UPDATE source_messages SET intake_complete = 1, updated_at = ? "
+                "WHERE source_message_id = ?",
+                (timestamp, source_message_id),
+            )
+            return cursor.rowcount == 1
 
     def ack_message(self, source_message_id: str, *, now: float | None = None) -> bool:
         """Record a successful IMAP ``\\Seen`` operation."""
@@ -303,6 +548,24 @@ class MailStateStore:
                 (timestamp, timestamp, source_message_id),
             )
             return self._conn.execute("SELECT changes()").fetchone()[0] == 1
+
+    def replace_source_metadata(
+        self,
+        source_message_id: str,
+        metadata: dict[str, Any],
+        *,
+        now: float | None = None,
+    ) -> bool:
+        """Replace source metadata, e.g. when quarantining a failed intake."""
+        timestamp = self._now(now)
+        with self._lock, self._transaction():
+            self._ensure_open()
+            cursor = self._conn.execute(
+                "UPDATE source_messages SET metadata_json = ?, updated_at = ? "
+                "WHERE source_message_id = ?",
+                (self._json(metadata), timestamp, source_message_id),
+            )
+            return cursor.rowcount == 1
 
     def set_mailbox_position(
         self, mailbox: str, uidvalidity: int, last_uid: int, *, now: float | None = None
@@ -366,9 +629,15 @@ class MailStateStore:
         *,
         metadata: dict[str, Any] | None = None,
         platform: str | None = None,
+        advance_position: bool = True,
         now: float | None = None,
     ) -> dict[str, Any]:
-        """Durably accept one source message and create URL tasks idempotently."""
+        """Durably accept one source and create URL tasks idempotently.
+
+        Mailbox sources start with ``intake_complete = 0``. The caller marks
+        routing complete after any command or safe notice is persisted, then
+        it may acknowledge the corresponding IMAP UID.
+        """
         if uid < 0:
             raise ValueError("uid must be non-negative")
         source_message_id = str(source_message_id).strip()
@@ -385,15 +654,17 @@ class MailStateStore:
 
         with self._lock, self._transaction():
             self._ensure_open()
-            self._set_mailbox_position_locked(mailbox, uidvalidity, uid, timestamp)
+            if advance_position:
+                self._set_mailbox_position_locked(mailbox, uidvalidity, uid, timestamp)
             existing = self._conn.execute(
                 "SELECT source_message_id FROM source_messages WHERE source_message_id = ?",
                 (source_message_id,),
             ).fetchone()
             self._conn.execute(
                 "INSERT INTO source_messages "
-                "(source_message_id, mailbox, uidvalidity, uid, metadata_json, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "(source_message_id, mailbox, uidvalidity, uid, metadata_json, "
+                "intake_complete, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 0, ?, ?) "
                 "ON CONFLICT(source_message_id) DO UPDATE SET updated_at = excluded.updated_at",
                 (
                     source_message_id,
@@ -419,9 +690,16 @@ class MailStateStore:
                 task_ids.append(task["id"])
                 if task["created"]:
                     created_task_ids.append(task["id"])
+            source = self._conn.execute(
+                "SELECT intake_complete FROM source_messages "
+                "WHERE source_message_id = ?",
+                (source_message_id,),
+            ).fetchone()
+            assert source is not None
             return {
                 "source_message_id": source_message_id,
                 "duplicate": existing is not None,
+                "intake_complete": bool(source["intake_complete"]),
                 "task_ids": task_ids,
                 "created_task_ids": created_task_ids,
                 "position": self.get_mailbox_position(mailbox),
@@ -477,8 +755,10 @@ class MailStateStore:
             self._ensure_open()
             self._conn.execute(
                 "INSERT INTO source_messages "
-                "(source_message_id, mailbox, uidvalidity, uid, metadata_json, created_at, updated_at) "
-                "VALUES (?, '', 0, 0, '{}', ?, ?) ON CONFLICT(source_message_id) DO NOTHING",
+                "(source_message_id, mailbox, uidvalidity, uid, metadata_json, "
+                "intake_complete, created_at, updated_at) "
+                "VALUES (?, '', 0, 0, '{}', 1, ?, ?) "
+                "ON CONFLICT(source_message_id) DO NOTHING",
                 (source_message_id, timestamp, timestamp),
             )
             self._insert_task_locked(
@@ -491,6 +771,85 @@ class MailStateStore:
             )
             row = self._conn.execute("SELECT * FROM tasks WHERE source_message_id = ? AND normalized_url = ?", (source_message_id, normalized)).fetchone()
             return self._row(row)  # type: ignore[return-value]
+
+    def get_task(self, source_message_id: str, url: str) -> dict[str, Any] | None:
+        """Return one idempotent task without changing its state."""
+        normalized = self.normalize_url(url)
+        with self._lock:
+            self._ensure_open()
+            row = self._conn.execute(
+                "SELECT * FROM tasks WHERE source_message_id = ? "
+                "AND normalized_url = ?",
+                (source_message_id, normalized),
+            ).fetchone()
+            return self._row(row)
+
+    def enqueue_notice(
+        self,
+        source_message_id: str,
+        event: str,
+        payload: Any,
+        notification: Any,
+        *,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Atomically persist a safe notice task and its SMTP outbox item."""
+        source_message_id = str(source_message_id).strip()
+        event = str(event).strip()
+        if not source_message_id:
+            raise ValueError("source_message_id must not be empty")
+        if not event:
+            raise ValueError("event must not be empty")
+        timestamp = self._now(now)
+        normalized = self.normalize_url(f"urn:mail-notice:{event}")
+        with self._lock, self._transaction():
+            self._ensure_open()
+            self._conn.execute(
+                "INSERT INTO source_messages "
+                "(source_message_id, mailbox, uidvalidity, uid, metadata_json, "
+                "intake_complete, created_at, updated_at) "
+                "VALUES (?, '', 0, 0, '{}', 1, ?, ?) "
+                "ON CONFLICT(source_message_id) DO NOTHING",
+                (source_message_id, timestamp, timestamp),
+            )
+            task = self._insert_task_locked(
+                source_message_id,
+                normalized,
+                f"urn:mail-notice:{event}",
+                payload,
+                timestamp,
+                "notice",
+            )
+            self._conn.execute(
+                "UPDATE tasks SET status = 'succeeded', result_json = ?, "
+                "updated_at = ?, completed_at = COALESCE(completed_at, ?) "
+                "WHERE id = ? AND status = 'pending'",
+                (self._json({"notice": event}), timestamp, timestamp, task["id"]),
+            )
+            self._insert_outbox_locked(
+                task["id"], event, notification, None, timestamp
+            )
+            row = self._conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task["id"],)
+            ).fetchone()
+            return self._row(row)  # type: ignore[return-value]
+
+    def redact_task_payload(
+        self,
+        task_id: int,
+        payload: Any,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        """Replace a completed task payload, useful for removing secret input."""
+        timestamp = self._now(now)
+        with self._lock, self._transaction():
+            self._ensure_open()
+            cursor = self._conn.execute(
+                "UPDATE tasks SET payload_json = ?, updated_at = ? WHERE id = ?",
+                (self._json(payload), timestamp, task_id),
+            )
+            return cursor.rowcount == 1
 
     def claim_tasks(
         self,
@@ -615,6 +974,10 @@ class MailStateStore:
         retry_at: float | None = None,
         next_attempt_at: float | None = None,
         retry: bool = False,
+        notification: Any = None,
+        outbox_payload: Any = None,
+        outbox_event: str = "failed",
+        outbox_message_id: str | None = None,
         now: float | None = None,
     ) -> dict[str, Any] | None:
         timestamp = self._now(now)
@@ -624,13 +987,49 @@ class MailStateStore:
         status = "pending" if scheduled is not None else "failed"
         with self._lock, self._transaction():
             self._ensure_open()
-            self._conn.execute(
+            cursor = self._conn.execute(
                 "UPDATE tasks SET status = ?, lease_token = NULL, lease_expires_at = NULL, "
                 "next_attempt_at = ?, last_error = ?, updated_at = ? "
                 "WHERE id = ? AND status = 'leased' AND lease_token = ? AND lease_expires_at > ?",
                 (status, scheduled, error, timestamp, task_id, lease_token, timestamp),
             )
-            return self._row(self._conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()) if self._conn.execute("SELECT changes()").fetchone()[0] else None
+            if cursor.rowcount != 1:
+                return None
+            if notification is not None or outbox_payload is not None:
+                self._insert_outbox_locked(
+                    task_id,
+                    outbox_event,
+                    outbox_payload if outbox_payload is not None else notification,
+                    outbox_message_id,
+                    timestamp,
+                )
+            return self._row(self._conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone())
+
+    def release_task(
+        self,
+        task_id: int,
+        lease_token: str,
+        *,
+        next_attempt_at: float | None = None,
+        now: float | None = None,
+    ) -> dict[str, Any] | None:
+        """Return a claimed task to the queue without charging an attempt.
+
+        Workers use this when a local capacity semaphore is busy. It is
+        distinct from ``fail_task`` because no external work was attempted.
+        """
+        timestamp = self._now(now)
+        with self._lock, self._transaction():
+            self._ensure_open()
+            cursor = self._conn.execute(
+                "UPDATE tasks SET status = 'pending', attempts = MAX(attempts - 1, 0), "
+                "lease_token = NULL, lease_expires_at = NULL, next_attempt_at = ?, "
+                "updated_at = ? WHERE id = ? AND status = 'leased' AND lease_token = ?",
+                (next_attempt_at, timestamp, task_id, lease_token),
+            )
+            if cursor.rowcount != 1:
+                return None
+            return self._row(self._conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone())
 
     def recover_expired(self, *, now: float | None = None) -> dict[str, int]:
         timestamp = self._now(now)
@@ -647,6 +1046,33 @@ class MailStateStore:
                 (timestamp, timestamp),
             ).rowcount
             return {"tasks": task_count, "outbox": outbox_count}
+
+    def heartbeat_outbox(
+        self,
+        outbox_id: int,
+        lease_token: str,
+        *,
+        lease_seconds: float | None = None,
+        now: float | None = None,
+    ) -> dict[str, Any] | None:
+        """Extend an SMTP outbox lease while a provider call is in flight."""
+        lease = self.default_lease_seconds if lease_seconds is None else float(lease_seconds)
+        if lease <= 0:
+            raise ValueError("lease_seconds must be positive")
+        timestamp = self._now(now)
+        with self._lock, self._transaction():
+            self._ensure_open()
+            cursor = self._conn.execute(
+                "UPDATE smtp_outbox SET lease_expires_at = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'leased' AND lease_token = ? "
+                "AND lease_expires_at > ?",
+                (timestamp + lease, timestamp, outbox_id, lease_token, timestamp),
+            )
+            if cursor.rowcount != 1:
+                return None
+            return self._row(
+                self._conn.execute("SELECT * FROM smtp_outbox WHERE id = ?", (outbox_id,)).fetchone()
+            )
 
     def enqueue_outbox(
         self,
