@@ -21,8 +21,6 @@ colorama_init(autoreset=True)
 # email bot/downloader imports below.
 bootstrap_f2()
 
-from dotenv import load_dotenv  # noqa: E402
-
 from config_loader import load_config  # noqa: E402
 from email_bot import EmailBot  # noqa: E402
 
@@ -80,13 +78,6 @@ def main() -> None:
     setup_logging()
 
     log = logging.getLogger("main")
-
-    # Load .env file
-    env_path = Path(__file__).parent / ".env"
-    if env_path.exists():
-        load_dotenv(env_path)
-    else:
-        log.warning(".env file not found — copy .env.example to .env and fill in your secrets")
 
     # Load config.yaml
     config_path = Path(__file__).parent / "config.yaml"

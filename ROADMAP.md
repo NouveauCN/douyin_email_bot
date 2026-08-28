@@ -1,6 +1,6 @@
 # Security and Upgrade Roadmap
 
-Last reviewed: 2026-08-27
+Last reviewed: 2026-08-28
 
 This document records the planned follow-up work after the repository-wide
 audit merged in PR #14. Each phase should be delivered as a separate pull
@@ -164,9 +164,10 @@ Acceptance criteria:
 
 ### Phase 4: Secret Persistence and Health Checks (P1)
 
-Move mutable secrets from the current single-file `.env` bind mount to a
-dedicated host directory or secrets volume shared only by `bot` and
-`web_login`. Then replace the three duplicated `.env` writers with one helper
+Move mutable secrets from the current single-file `.env` bind mount into the
+managed settings database specified in Phase 6. The database is shared with
+`file_browser` only for the Settings tab's controlled read/write API; it must
+never expose secret values. Replace duplicated `.env` writers with one helper
 that provides:
 
 - inter-process file locking;
@@ -177,6 +178,8 @@ that provides:
 
 Do not introduce `os.replace()` while `.env` itself is still a bind-mount
 target; replacing a mounted file is not portable across container runtimes.
+The legacy `.env` remains a compatibility/bootstrap input and is not the normal
+mutable settings store.
 
 Also add:
 
@@ -283,7 +286,51 @@ Optional follow-up:
 - Adopt this only if a measured mail-trigger latency target justifies the
   additional long-connection complexity; otherwise retain 30-second polling.
 
-### Phase 6: Production Serving and Maintainability (P1/P2)
+### Phase 6: Browser Runtime Settings Control Plane (P1)
+
+Expose supported runtime configuration through a Settings tab in the trusted
+LAN file browser while keeping deployment boundaries and secrets explicit.
+
+- Persist managed settings and revision metadata in an independent
+  `runtime_settings` named volume at `/app/runtime-settings/settings.sqlite3`.
+  Mount it only into `bot`, `file_browser`, and `web_login`; never share the bot
+  mail-state volume or Docker socket with `file_browser`.
+- Keep `config.yaml` read-only and retain `.env` for bootstrap, legacy reads, and
+  Compose interpolation. Resolve supported values as
+  `environment > managed settings > legacy .env > config.yaml > defaults`.
+  Compose must not inject default `BOT_WORKER_COUNT`, per-platform worker,
+  lease/heartbeat, or SMTP outbox environment values; managed settings/YAML
+  control those fields unless an external process explicitly injects an
+  environment override, which locks the field in the UI.
+- Display sources and editability in the browser. Secret fields are write-only:
+  responses and logs report only whether a value is configured.
+- Hot-reload Cookie-only changes. For other changes, stop intake and new claims,
+  drain active workers for at most 300 seconds, then exit; Docker
+  `restart: unless-stopped` automatically starts the bot with the new revision.
+  Lease expiry recovers interrupted long Bilibili jobs.
+- Preserve the existing loopback + explicit trusted-LAN + Tailscale Serve
+  boundary and Origin/Referer checks. Settings writes must use the same
+  no-store and CSRF-style protections as other mutating browser routes. Require
+  an explicit `FILE_BROWSER_ALLOWED_ORIGINS` allowlist for Settings PATCH;
+  missing configuration returns `403`, even for same-origin requests.
+
+Acceptance criteria:
+
+- A browser user can inspect and update all supported email, allowlist,
+  downloader, retry, media, and cookie settings without editing files.
+- Environment-locked and deployment-only fields are visibly read-only; no
+  credential, Cookie, or Bilibili auth value appears in HTML, JSON, logs, or
+  error text.
+- Settings PATCH is unavailable until exact localhost/LAN origins are configured
+  (and any Tailscale Serve origin is explicitly appended); wildcard origins are
+  rejected.
+- Cookie-only saves do not restart the bot; all other saves converge to the
+  requested revision automatically, including after a drain timeout or bot
+  crash, without manual container intervention.
+- The file browser has access to neither `/app/state` nor Docker control APIs,
+  and the three services can restart while preserving managed settings.
+
+### Phase 7: Production Serving and Maintainability (P1/P2)
 
 - Replace Flask's development server with a production WSGI server.
 - Initially use one worker because file-browser dedup state and the Firefox
@@ -305,8 +352,9 @@ Optional follow-up:
    Tailscale ACLs/Grants plus Tailscale Serve and the explicitly configured
    trusted home-LAN address; application-managed sessions are required if that
    boundary is widened.
-2. Secret lifecycle: keep cookie hot-reload, or require a bot restart after
-   updating the dedicated secrets directory.
+2. Decided in Phase 6: Cookie-only managed-setting updates hot-reload; other
+   settings request an automatic bot drain and Docker restart of at most 300
+   seconds. Secrets remain write-only in the browser UI.
 3. Decided: reject broken TLS by default; support only an explicitly configured
    private CA through `DOUYIN_SHORT_LINK_CA_BUNDLE`.
 4. Decided: install the authoritative `uv.lock` directly with a pinned uv

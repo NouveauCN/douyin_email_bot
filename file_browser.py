@@ -25,7 +25,6 @@ from urllib.parse import quote, urlsplit
 
 from PIL import Image
 
-from dotenv import load_dotenv
 from flask import (
     Flask,
     abort,
@@ -40,10 +39,6 @@ from flask import (
 # ── Bootstrap ────────────────────────────────────────────────────────
 _PROJECT_DIR = Path(__file__).parent
 
-_env_path = _PROJECT_DIR / ".env"
-if _env_path.exists():
-    load_dotenv(_env_path)
-
 from config_loader import load_config  # noqa: E402
 from media_processor import (  # noqa: E402
     IMAGE_EXTENSIONS as _CROP_IMAGE_EXTENSIONS,
@@ -51,8 +46,12 @@ from media_processor import (  # noqa: E402
     ProcessResult,
     process_media,
 )
+from settings_store import SETTING_REGISTRY, SettingsStore  # noqa: E402
 
 _config = load_config(_PROJECT_DIR / "config.yaml")
+_CONFIG_PATH = _PROJECT_DIR / "config.yaml"
+_SETTINGS_STORE = SettingsStore(config_path=_CONFIG_PATH)
+_LAST_RESTART_REQUEST_ID: str | None = None
 _DOWNLOAD_DIR = Path(_config.douyin.download_path)
 _COMICS_DIR = Path(os.environ.get("COMICS_PICS_PATH", "/app/comics/pics"))
 _THUMB_CACHE = Path("/app/.thumb_cache")
@@ -151,6 +150,21 @@ def _validate_mutating_request_source():
         return None
 
     source = _source_origin()
+    if request.method == "PATCH" and request.path == "/api/settings":
+        # Settings can mutate credentials and therefore require an explicit
+        # deployment allowlist.  The legacy default-host behavior remains in
+        # place for the file browser's existing mutation endpoints.
+        if _USE_DEFAULT_ORIGIN:
+            abort(403, "Settings require FILE_BROWSER_ALLOWED_ORIGINS")
+        request_origin = _request_origin()
+        if (
+            request_origin is None
+            or request_origin not in _ALLOWED_ORIGINS
+            or source is None
+            or source not in _ALLOWED_ORIGINS
+        ):
+            abort(403, "Origin or Referer validation failed")
+        return None
     allowed = (
         ((_request_origin(),) if _request_origin() else ())
         if _USE_DEFAULT_ORIGIN
@@ -167,6 +181,163 @@ def _media_busy_response():
 
 def _try_acquire_media_slot() -> bool:
     return _MEDIA_SEMAPHORE.acquire(blocking=False)
+
+
+def _settings_snapshot() -> dict:
+    """Read a redacted settings snapshot from config.yaml and the store."""
+    snapshot = _SETTINGS_STORE.snapshot(config_path=_CONFIG_PATH)
+    groups: dict[str, dict] = {}
+    for key, field in snapshot.items():
+        group, _, name = key.partition(".")
+        groups.setdefault(group, {})[name] = {
+            "key": key,
+            **field,
+        }
+    # Deployment-owned file-browser settings are visible for diagnosis but
+    # deliberately absent from SETTING_REGISTRY, so PATCH can never mutate
+    # network boundaries, mounts, or resource limits.
+    browser_runtime = {
+        "allowed_origins": list(_ALLOWED_ORIGINS),
+        "max_upload_bytes": _MAX_UPLOAD_BYTES,
+        "max_upload_files": _MAX_UPLOAD_FILES,
+        "media_max_concurrency": _MEDIA_MAX_CONCURRENCY,
+        "comics_path": str(_COMICS_DIR),
+        "thumbnail_cache": str(_THUMB_CACHE),
+        "settings_database": str(_SETTINGS_STORE.path),
+    }
+    groups["file_browser"] = {
+        name: {
+            "key": f"file_browser.{name}",
+            "value": value,
+            "configured": value not in (None, "", [], ()),
+            "source": "docker-fixed" if os.getenv("RUNTIME_SETTINGS_DB") else "runtime",
+            "editable": False,
+            "apply_mode": "readonly",
+            "secret": False,
+        }
+        for name, value in browser_runtime.items()
+    }
+    heartbeat = _SETTINGS_STORE.heartbeat_status("bot")
+    safe_heartbeat = None
+    if heartbeat:
+        safe_heartbeat = {
+            key: heartbeat[key]
+            for key in ("component", "boot_id", "revision", "seen_at", "status")
+            if key in heartbeat
+        }
+    restart = None
+    if _LAST_RESTART_REQUEST_ID:
+        restart = _SETTINGS_STORE.restart_status(_LAST_RESTART_REQUEST_ID)
+        if restart:
+            restart = {
+                key: restart[key]
+                for key in (
+                    "request_id", "revision", "status", "created_at", "updated_at",
+                    "active_count",
+                )
+                if key in restart
+            }
+    return {
+        "revision": _SETTINGS_STORE.get_revision(),
+        "groups": groups,
+        "bot": safe_heartbeat,
+        "restart": restart,
+    }
+
+
+def _settings_response(payload, status=200):
+    response = make_response(payload, status)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
+def _settings_changes(data: dict) -> list[dict]:
+    changes = data.get("changes")
+    if not isinstance(changes, list):
+        raise ValueError("changes must be a list")
+    clean = []
+    for change in changes:
+        if not isinstance(change, dict):
+            raise ValueError("each change must be an object")
+        key = change.get("key")
+        action = change.get("action", "set")
+        definition = SETTING_REGISTRY.get(key)
+        if definition is None:
+            raise ValueError(f"unknown setting: {key}")
+        # A blank password/cookie field means "leave it unchanged".  The UI
+        # offers an explicit clear action for users who really want that.
+        if action == "set" and definition.secret and change.get("value") == "":
+            continue
+        clean.append(change)
+    return clean
+
+
+@app.route("/api/settings", methods=["GET"])
+def api_settings():
+    return _settings_response(_settings_snapshot())
+
+
+@app.route("/api/settings", methods=["PATCH"])
+def api_settings_update():
+    content_length = request.content_length
+    if content_length is not None and content_length > 1024 * 1024:
+        return _settings_response({"success": False, "error": "设置请求过大"}, 413)
+    raw_body = request.get_data(cache=True)
+    if len(raw_body) > 1024 * 1024:
+        return _settings_response({"success": False, "error": "设置请求过大"}, 413)
+    data = request.get_json(silent=True) or {}
+    try:
+        if "base_revision" not in data:
+            raise ValueError("base_revision is required")
+        base_revision = data.get("base_revision")
+        if isinstance(base_revision, bool) or not isinstance(base_revision, int):
+            raise ValueError("base_revision must be an integer")
+        changes = _settings_changes(data)
+        result = _SETTINGS_STORE.apply_and_maybe_restart(
+            changes, base_revision=base_revision, request_restart=True
+        )
+        revision = result["revision"]
+        apply_mode = result.get("apply_mode", "none")
+    except PermissionError as exc:
+        return _settings_response({"success": False, "error": str(exc)}, 403)
+    except RuntimeError as exc:
+        if "conflict" in str(exc).lower():
+            return _settings_response({"success": False, "error": "配置已被其他请求更新，请刷新后重试"}, 409)
+        log.warning("Settings update failed: %s", exc)
+        return _settings_response({"success": False, "error": "配置更新失败"}, 400)
+    except (TypeError, ValueError) as exc:
+        return _settings_response({"success": False, "error": str(exc)}, 400)
+
+    payload = {"success": True, "revision": revision}
+    if apply_mode == "restart":
+        request_id = result.get("request_id")
+        if not request_id:
+            # Compatibility with stores that apply and enqueue separately.
+            request_id = _SETTINGS_STORE.request_restart(revision)
+        global _LAST_RESTART_REQUEST_ID
+        _LAST_RESTART_REQUEST_ID = request_id
+        payload.update({"restart": True, "request_id": request_id})
+        return _settings_response(payload, 202)
+    payload["restart"] = False
+    return _settings_response(payload)
+
+
+@app.route("/api/settings/restart/<request_id>", methods=["GET"])
+def api_settings_restart(request_id):
+    status = _SETTINGS_STORE.restart_status(request_id)
+    if status is None:
+        return _settings_response({"success": False, "error": "重启请求不存在"}, 404)
+    # Do not relay arbitrary worker error text: it could contain a secret.
+    safe = {
+        key: status[key]
+        for key in (
+            "request_id", "revision", "status", "created_at", "updated_at",
+            "active_count",
+        )
+        if key in status
+    }
+    return _settings_response({"success": True, **safe})
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -1379,12 +1550,44 @@ INDEX_HTML = (
   .upload-submit:disabled { cursor: wait; opacity: 0.55; }
   .upload-status { font-size: 12px; color: #999; word-break: break-all; }
   .comics-empty-state { color: #999; padding: 24px 20px; text-align: center; }
+  .top-tabs { display:flex; gap:8px; margin:0 0 22px; }
+  .top-tab { border:1px solid #ddd; border-radius:8px; padding:8px 18px; background:#fff; color:#777; cursor:pointer; font-size:13px; }
+  .top-tab.active { background:#fe2c55; border-color:#fe2c55; color:#fff; }
+  .tab-panel.hidden { display:none; }
+  .settings-toolbar { display:flex; align-items:center; gap:10px; margin-bottom:16px; flex-wrap:wrap; }
+  .settings-status { color:#777; font-size:13px; }
+  .settings-group { background:#fff; border-radius:12px; padding:16px 20px; margin-bottom:14px; box-shadow:0 1px 4px rgba(0,0,0,.05); }
+  .settings-group h2 { font-size:16px; color:#444; margin-bottom:8px; }
+  .setting-row { display:grid; grid-template-columns:minmax(140px, 1fr) minmax(180px, 2fr) auto; align-items:center; gap:10px; padding:10px 0; border-top:1px solid #f0f0f0; }
+  .setting-name { font-size:13px; word-break:break-all; }
+  .setting-meta { display:block; color:#aaa; font-size:11px; margin-top:3px; }
+  .setting-input { width:100%; border:1px solid #ddd; border-radius:6px; padding:8px; font:inherit; }
+  .setting-input:disabled { background:#f5f5f5; color:#999; }
+  .setting-actions { display:flex; gap:5px; white-space:nowrap; }
+  .setting-action { border:0; border-radius:6px; padding:7px 9px; color:#666; cursor:pointer; background:#eee; font-size:12px; }
+  @media (max-width:640px) { .setting-row { grid-template-columns:1fr; } .setting-actions { justify-content:flex-end; } }
 </style>
 </head>
 <body>
 <div class="container">
   <h1>📦 下载浏览</h1>
   <p class="subtitle">Douyin Email Bot — LAN File Browser</p>
+
+  <nav class="top-tabs" aria-label="主导航">
+    <button class="top-tab active" id="browseTab" type="button">📦 浏览</button>
+    <button class="top-tab" id="settingsTab" type="button">⚙️ 设置</button>
+  </nav>
+
+  <section id="settingsPanel" class="tab-panel hidden" aria-label="系统设置">
+    <div class="settings-toolbar">
+      <button class="btn" id="settingsSave" type="button">保存设置</button>
+      <button class="setting-action" id="settingsReload" type="button">重新读取</button>
+      <span class="settings-status" id="settingsStatus">尚未读取设置</span>
+    </div>
+    <div id="settingsGroups"></div>
+  </section>
+
+  <section id="browsePanel" class="tab-panel">
 
   <form id="uploadForm" class="upload-form" action="{{ url_for('api_upload') }}"
         method="post" enctype="multipart/form-data">
@@ -1485,9 +1688,140 @@ INDEX_HTML = (
     <p style="font-size:13px;margin-top:8px">发送抖音链接到邮箱，机器人会自动下载</p>
   </div>
   {% endif %}
+  </section>
 </div>
 
 <script>
+var settingsRevision = null;
+var settingsChanges = {};
+var settingsData = null;
+var settingLabels = {
+  email: '邮箱', douyin: '抖音', bilibili: '哔哩哔哩', bot: '机器人',
+  media_cleanup: '媒体清理', cookie_extractor: 'Cookie 获取', file_browser: 'Browser / 部署（只读）'
+};
+function settingsStatus(text, color) {
+  var node = document.getElementById('settingsStatus');
+  node.textContent = text;
+  if (color) node.style.color = color;
+}
+function settingDisplayValue(field) {
+  if (field.secret) return '';
+  if (Array.isArray(field.value)) return field.value.join(', ');
+  if (field.value === null || field.value === undefined) return '';
+  return String(field.value);
+}
+function renderSettings(data) {
+  settingsData = data;
+  settingsRevision = data.revision;
+  settingsChanges = {};
+  var root = document.getElementById('settingsGroups');
+  root.innerHTML = '';
+  Object.keys(data.groups || {}).forEach(function(group) {
+    var section = document.createElement('section');
+    section.className = 'settings-group';
+    var title = document.createElement('h2');
+    title.textContent = settingLabels[group] || group;
+    section.appendChild(title);
+    Object.keys(data.groups[group]).forEach(function(name) {
+      var field = data.groups[group][name];
+      var row = document.createElement('div');
+      row.className = 'setting-row';
+      row.dataset.key = field.key;
+      var label = document.createElement('label');
+      label.className = 'setting-name';
+      label.textContent = name;
+      var meta = document.createElement('small');
+      meta.className = 'setting-meta';
+      meta.textContent = (field.source || 'default') + ' · ' +
+        (field.editable ? '可编辑' : '只读') + ' · ' + (field.apply_mode || 'restart');
+      label.appendChild(meta);
+      row.appendChild(label);
+      var input;
+      if (!field.secret && typeof field.value === 'boolean') {
+        input = document.createElement('select');
+        ['true', 'false'].forEach(function(value) {
+          var option = document.createElement('option');
+          option.value = value; option.textContent = value;
+          input.appendChild(option);
+        });
+        input.value = String(field.value);
+      } else {
+        input = document.createElement('input');
+        input.type = field.secret ? 'password' : (typeof field.value === 'number' ? 'number' : 'text');
+        input.value = settingDisplayValue(field);
+        if (field.secret && field.configured) input.placeholder = '已配置（留空不变）';
+      }
+      input.className = 'setting-input';
+      input.dataset.original = input.value;
+      input.disabled = !field.editable;
+      input.addEventListener('input', function() {
+        if (!field.editable) return;
+        if (field.secret && input.value === '') delete settingsChanges[field.key];
+        else settingsChanges[field.key] = {key: field.key, action: 'set', value: input.type === 'number' ? Number(input.value) : (input.tagName === 'SELECT' ? input.value === 'true' : input.value)};
+      });
+      row.appendChild(input);
+      var actions = document.createElement('div');
+      actions.className = 'setting-actions';
+      if (field.editable) {
+        var reset = document.createElement('button');
+        reset.type = 'button'; reset.className = 'setting-action'; reset.textContent = '恢复默认';
+        reset.onclick = function() { settingsChanges[field.key] = {key: field.key, action: 'reset'}; input.value = ''; };
+        actions.appendChild(reset);
+        if (field.secret) {
+          var clear = document.createElement('button');
+          clear.type = 'button'; clear.className = 'setting-action'; clear.textContent = '清空';
+          clear.onclick = function() { settingsChanges[field.key] = {key: field.key, action: 'clear'}; input.value = ''; };
+          actions.appendChild(clear);
+        }
+      }
+      row.appendChild(actions);
+      section.appendChild(row);
+    });
+    root.appendChild(section);
+  });
+  var bot = data.bot;
+  settingsStatus('配置版本 ' + settingsRevision + (bot ? ' · Bot ' + (bot.status || 'unknown') : ' · Bot 尚未上报状态'));
+}
+function loadSettings() {
+  settingsStatus('读取中…');
+  fetch('/api/settings', {cache: 'no-store'}).then(function(response) {
+    return response.json().then(function(data) { if (!response.ok) throw new Error(data.error || '读取失败'); return data; });
+  }).then(renderSettings).catch(function(error) { settingsStatus('读取失败：' + error.message, '#c0392b'); });
+}
+function pollRestart(requestId) {
+  fetch('/api/settings/restart/' + encodeURIComponent(requestId), {cache: 'no-store'}).then(function(response) { return response.json(); }).then(function(data) {
+    if (!data.success) { settingsStatus(data.error || '重启状态读取失败', '#c0392b'); return; }
+    var activeText = data.active_count ? '，等待 ' + data.active_count + ' 个进行中任务' : '';
+    settingsStatus('Bot 重启中：' + data.status + activeText);
+    if (data.status === 'applied') { settingsStatus('Bot 已重启并应用配置', '#278a4b'); loadSettings(); return; }
+    if (data.status === 'failed') { settingsStatus('Bot 重启失败', '#c0392b'); return; }
+    window.setTimeout(function() { pollRestart(requestId); }, 1000);
+  }).catch(function() { window.setTimeout(function() { pollRestart(requestId); }, 2000); });
+}
+function saveSettings() {
+  if (settingsRevision === null) { loadSettings(); return; }
+  var changes = Object.keys(settingsChanges).map(function(key) { return settingsChanges[key]; });
+  if (!changes.length) { settingsStatus('没有需要保存的修改'); return; }
+  settingsStatus('保存中…');
+  fetch('/api/settings', {method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({base_revision: settingsRevision, changes: changes})})
+    .then(function(response) { return response.json().then(function(data) { return {ok: response.ok, status: response.status, data: data}; }); })
+    .then(function(result) {
+      if (!result.ok) { settingsStatus(result.data.error || '保存失败', '#c0392b'); if (result.status === 409) loadSettings(); return; }
+      if (result.data.restart && result.data.request_id) { settingsStatus('已保存，等待 Bot 自动重启…'); pollRestart(result.data.request_id); }
+      else { settingsStatus('已保存并立即生效', '#278a4b'); loadSettings(); }
+    }).catch(function(error) { settingsStatus('保存失败：' + error.message, '#c0392b'); });
+}
+document.getElementById('browseTab').onclick = function() {
+  document.getElementById('browseTab').classList.add('active'); document.getElementById('settingsTab').classList.remove('active');
+  document.getElementById('browsePanel').classList.remove('hidden'); document.getElementById('settingsPanel').classList.add('hidden');
+};
+document.getElementById('settingsTab').onclick = function() {
+  document.getElementById('settingsTab').classList.add('active'); document.getElementById('browseTab').classList.remove('active');
+  document.getElementById('settingsPanel').classList.remove('hidden'); document.getElementById('browsePanel').classList.add('hidden');
+  if (!settingsData) loadSettings();
+};
+document.getElementById('settingsSave').onclick = saveSettings;
+document.getElementById('settingsReload').onclick = loadSettings;
 function toggleSection(header) {
   header.classList.toggle('collapsed');
   header.nextElementSibling.classList.toggle('collapsed');

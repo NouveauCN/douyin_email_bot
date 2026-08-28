@@ -2,7 +2,7 @@
 
 Replaces get_cookie.py's interactive login (which blocks on input()) with
 a web interface: open http://<host>:8080, scan the QR code with the Douyin
-app, and cookies are automatically saved to .env.
+app, and cookies are automatically saved to the managed runtime settings store.
 
 Usage:
     python web_login.py [--port 8080] [--host 127.0.0.1]
@@ -18,20 +18,17 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template_string, request
 
 # ── Bootstrap: same as main.py (needed before any F2 imports) ─────
 _PROJECT_DIR = Path(__file__).parent
 
-# Load .env
-_env_path = _PROJECT_DIR / ".env"
-if _env_path.exists():
-    load_dotenv(_env_path)
-
 # Load config for profile_dir
 from config_loader import load_config  # noqa: E402
+from settings_store import SettingsStore, default_database_path  # noqa: E402
+
 _config = load_config(_PROJECT_DIR / "config.yaml")
+_settings = SettingsStore(default_database_path(_PROJECT_DIR / "config.yaml"))
 
 from cookie_extractor import (  # noqa: E402
     DOUYIN_HOMEPAGE,
@@ -201,9 +198,22 @@ def api_status():
         grade, _ = _assess_quality(cookie_str)
         result["message"] += f" — {grade}"
 
-        # Persist to .env
-        _write_env(str(_env_path), "DOUYIN_COOKIE", cookie_str)
-        os.environ["DOUYIN_COOKIE"] = cookie_str
+        # Persist only after quality validation. Do not put the cookie in the
+        # process environment: it would hide later managed-store updates.
+        try:
+            _settings.apply([{"key": "douyin.cookie", "action": "set", "value": cookie_str}])
+        except Exception:
+            # Never include the cookie or the storage exception in a response
+            # or log line.  The browser can retry after the operator fixes the
+            # environment override or runtime database.
+            log.error("Login cookie detected but could not be saved to runtime settings")
+            response = jsonify({
+                "status": "failure",
+                "auth_count": result.get("auth_count"),
+                "message": "Cookie 保存失败，请稍后重试",
+            })
+            response.headers["Cache-Control"] = "no-store"
+            return response, 500
         log.info(
             "Login success! Cookie saved (%d chars, %d auth tokens) — %s",
             len(cookie_str), result["auth_count"], grade,
@@ -213,26 +223,6 @@ def api_status():
     response = jsonify({key: result.get(key) for key in _STATUS_RESPONSE_FIELDS})
     response.headers["Cache-Control"] = "no-store"
     return response
-
-
-# ── .env writeback ─────────────────────────────────────────────────
-
-def _write_env(env_path: str, key: str, value: str) -> None:
-    """Update or add key=value in .env file."""
-    p = Path(env_path)
-    if p.exists():
-        lines = p.read_text(encoding="utf-8").splitlines()
-        found = False
-        for i, line in enumerate(lines):
-            if line.startswith(f"{key}=") or line.startswith(f"{key} ="):
-                lines[i] = f"{key}={value}"
-                found = True
-                break
-        if not found:
-            lines.append(f"{key}={value}")
-        p.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    else:
-        p.write_text(f"{key}={value}\n", encoding="utf-8")
 
 
 # ── Single-page frontend (inline template — no separate file needed) ──
@@ -301,7 +291,7 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 
   <p class="hint">
     使用 <b>抖音 App</b> 扫描二维码<br>
-    扫码成功后 Cookie 将自动保存到 .env
+    扫码成功后 Cookie 将自动保存到运行时设置
   </p>
 </div>
 

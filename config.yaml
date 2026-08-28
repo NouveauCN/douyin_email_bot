@@ -1,4 +1,9 @@
 # Email settings (QQ Mail by default)
+#
+# This checked-in file remains a read-only baseline. The browser file-browser
+# Settings tab writes managed runtime overrides to runtime_settings; those take
+# precedence over this file and legacy .env values (explicit environment
+# variables remain the deployment-level highest priority).
 email:
   # IMAP server for receiving emails
   imap_server: "imap.qq.com"
@@ -9,8 +14,8 @@ email:
   smtp_timeout: 30
   # Poll inbox interval (seconds)
   poll_interval: 30
-  # NOTE: email address and password are loaded from .env file.
-  #       See .env.example for the required variables:
+  # NOTE: email address and password are loaded from managed settings or the
+  #       legacy .env file. See .env.example for bootstrap variables:
   #         EMAIL_ADDRESS=your_bot@qq.com
   #         EMAIL_PASSWORD=your_authorization_code
 
@@ -28,8 +33,8 @@ douyin:
   max_retries: 3
   # Max concurrent download tasks
   max_tasks: 5
-  # NOTE: douyin cookie is loaded from .env file.
-  #       See .env.example:
+  # NOTE: Douyin cookie is loaded from managed settings or the legacy .env file.
+  #       See .env.example for bootstrap usage:
   #         DOUYIN_COOKIE=your_douyin_cookie
 
 # Bilibili download settings (via yutto)
@@ -45,7 +50,7 @@ bilibili:
   batch: false
   # yutto executable path. Docker exposes an isolated yutto CLI at "yutto".
   yutto_bin: "yutto"
-  # NOTE: Bilibili auth is loaded from .env file if needed:
+  # NOTE: Bilibili auth is loaded from managed settings or the legacy .env file:
   #       BILIBILI_AUTH="SESSDATA=...; bili_jct=..."
 
 # Bot behavior
