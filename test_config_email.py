@@ -1,4 +1,3 @@
-from pathlib import Path
 from types import SimpleNamespace
 
 from config_loader import load_config
@@ -11,7 +10,6 @@ from email_bot import (  # noqa: E402
     _format_success_reply,
     _partial_failure_error,
     _success_subject_status,
-    _try_extract_cookie,
 )
 
 
@@ -99,24 +97,6 @@ bot:
     assert config.bot.worker_count == 3
 
 
-def test_try_extract_cookie_forwards_configured_options(monkeypatch):
-    captured = {}
-
-    def fake_extract_cookies(**kwargs):
-        captured.update(kwargs)
-        return "cookie", "ok"
-
-    import cookie_extractor
-
-    monkeypatch.setattr(cookie_extractor, "extract_cookies", fake_extract_cookies)
-    result = _try_extract_cookie(Path("profile"), headless=False, validate=False)
-
-    assert result == ("cookie", "ok")
-    assert captured == {
-        "profile_dir": Path("profile"),
-        "headless": False,
-        "validate": False,
-    }
 
 
 def test_malformed_pending_retry_fields_do_not_abort_other_items(monkeypatch):

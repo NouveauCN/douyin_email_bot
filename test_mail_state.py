@@ -204,8 +204,8 @@ def test_legacy_schema_upgrade_recovers_incomplete_intake_and_scrubs_cookie(tmp_
     assert secret not in recovered["payload_json"]
     assert recovered["payload_json"] == json.dumps(
         {
-            "body": "旧版 Cookie 任务无法安全恢复，请重新发送 Cookie 命令。",
-            "subject_status": "Cookie 需重新发送",
+            "body": "旧版 Cookie 任务无法安全恢复，请通过 Web Login 或 uv run python get_cookie.py 更新 Cookie。",
+            "subject_status": "Cookie 需通过 Web Login 更新",
             "to_addr": "user@example.test",
         },
         ensure_ascii=False,

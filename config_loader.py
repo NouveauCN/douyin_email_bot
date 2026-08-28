@@ -41,7 +41,6 @@ Environment variable mappings:
     BOT_HEARTBEAT_SECONDS — overrides bot.heartbeat_seconds
     BOT_OUTBOX_RETRY_ATTEMPTS — overrides bot.outbox_retry_attempts
     BOT_OUTBOX_RETRY_DELAY_SECONDS — overrides bot.outbox_retry_delay_seconds
-    BOT_COOKIE_UPDATE_COMMAND / BOT_COOKIE_AUTO_COMMAND — bot command keywords
     MEDIA_BACKUP_RETENTION_DAYS — overrides media_cleanup.backup_retention_days
     MEDIA_BACKUP_CHECK_INTERVAL_DAYS — overrides media_cleanup.check_interval_days
     COOKIE_PROFILE_DIR / COOKIE_HEADLESS / COOKIE_VALIDATE — cookie extractor options
@@ -182,14 +181,6 @@ class BilibiliConfig:
 
 
 @dataclass
-class BotCommands:
-    """Email subject keywords that trigger special actions."""
-
-    cookie_update: str = "更新cookie"    # Paste new cookie in body
-    cookie_auto: str = "自动获取cookie"   # Auto-extract from browser
-
-
-@dataclass
 class BotConfig:
     """Bot behavior settings."""
 
@@ -210,7 +201,6 @@ class BotConfig:
     heartbeat_seconds: int = 30
     outbox_retry_attempts: int = 5
     outbox_retry_delay_seconds: int = 60
-    commands: BotCommands = field(default_factory=BotCommands)
 
     def __post_init__(self) -> None:
         self.worker_count = max(1, int(self.worker_count))
@@ -324,11 +314,6 @@ def load_config(path: Path) -> AppConfig:
 
     # ── Bot ──
     bot_raw = raw.get("bot", {})
-    cmd_raw = bot_raw.get("commands", {})
-    bot_commands = BotCommands(
-        cookie_update=_setting_value("bot.commands.cookie_update", "BOT_COOKIE_UPDATE_COMMAND", managed, dotenv, cmd_raw.get("cookie_update"), "更新cookie"),
-        cookie_auto=_setting_value("bot.commands.cookie_auto", "BOT_COOKIE_AUTO_COMMAND", managed, dotenv, cmd_raw.get("cookie_auto"), "自动获取cookie"),
-    )
     bot = BotConfig(
         allowed_senders=_parse_allowed_senders(
             _setting_value("bot.allowed_senders", "BOT_ALLOWED_SENDERS", managed, dotenv, bot_raw.get("allowed_senders"), [])
@@ -357,7 +342,6 @@ def load_config(path: Path) -> AppConfig:
         heartbeat_seconds=max(1, _env_int("BOT_HEARTBEAT_SECONDS", int(_setting_value("bot.heartbeat_seconds", "BOT_HEARTBEAT_SECONDS", managed, dotenv, bot_raw.get("heartbeat_seconds"), 30)))),
         outbox_retry_attempts=max(1, _env_int("BOT_OUTBOX_RETRY_ATTEMPTS", int(_setting_value("bot.outbox_retry_attempts", "BOT_OUTBOX_RETRY_ATTEMPTS", managed, dotenv, bot_raw.get("outbox_retry_attempts"), 5)))),
         outbox_retry_delay_seconds=max(1, _env_int("BOT_OUTBOX_RETRY_DELAY_SECONDS", int(_setting_value("bot.outbox_retry_delay_seconds", "BOT_OUTBOX_RETRY_DELAY_SECONDS", managed, dotenv, bot_raw.get("outbox_retry_delay_seconds"), 60)))),
-        commands=bot_commands,
     )
 
     # ── Media backup cleanup ──

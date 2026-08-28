@@ -1,8 +1,9 @@
-"""EmailBot — polls an IMAP inbox for video links and replies via SMTP.
+"""EmailBot — IMAP intake adapter and email notification projector.
 
-Also supports cookie management commands via email:
-- "更新cookie" in subject → body contains new cookie → write to .env
-- "自动获取cookie" in subject → extract from browser on this machine
+Downloads execute through the shared ``DownloadTaskService`` in durable mode;
+the legacy mode uses its synchronous ``DownloadExecutor`` compatibility path.
+Cookie acquisition is intentionally provided by Web Login and ``get_cookie.py``
+instead of email commands.
 """
 
 import email
@@ -27,9 +28,15 @@ from backup_cleanup import BackupCleanupScheduler
 from bilibili_downloader import BilibiliDownloader
 from colorama import Fore, Style
 from douyin_downloader import DouyinDownloader
+from download_task_service import (
+    DownloadExecutor,
+    DownloaderRegistry,
+    DownloadTaskService,
+)
 from mail_state import MailStateStore
 from migrate_mail_state import import_pending_retries
 from settings_store import SettingsStore, default_database_path
+from task_store import TaskStore
 from url_extractor import UrlExtractor, detect_platform
 
 logger = logging.getLogger("EmailBot")
@@ -74,6 +81,14 @@ def _format_success_reply(result: dict, filepath: str, prefix: str = "下载完�
     return "\n".join(lines)
 
 
+def _download_failure_hint() -> str:
+    return (
+        "\n\n解决方案："
+        "\n1. 抖音链接：通过 Web Login 更新托管 Cookie；也可运行 uv run python get_cookie.py"
+        "\n2. B站链接：如需登录内容，请在 .env 配置 BILIBILI_AUTH"
+    )
+
+
 def _success_subject_status(result: dict, refreshed_cookie: bool = False) -> str:
     """Build a short status phrase for reply subjects."""
     if result.get("partial"):
@@ -90,13 +105,27 @@ def _success_subject_status(result: dict, refreshed_cookie: bool = False) -> str
 class EmailBot:
     """Monitors an inbox for emails containing supported links and downloads videos.
 
-    Also handles cookie management commands.
+    Cookie settings are hot-reloaded from the managed settings store; email
+    bodies are never treated as cookie commands.
     """
 
     def __init__(self, config, *, settings_store=None, restart_timeout_seconds=None, exit_fn=None):
         self.config = config
         self.downloader = DouyinDownloader(config.douyin)
         self.bilibili_downloader = BilibiliDownloader(config.bilibili)
+        self._downloader_registry = DownloaderRegistry()
+        self._downloader_registry.register(
+            "douyin",
+            self.downloader,
+            matcher=lambda url: detect_platform(url) == "douyin",
+        )
+        self._downloader_registry.register(
+            "bilibili",
+            self.bilibili_downloader,
+            matcher=lambda url: detect_platform(url) == "bilibili",
+        )
+        self._download_executor = DownloadExecutor(self._downloader_registry)
+        self._task_service: DownloadTaskService | None = None
         self.extractor = UrlExtractor()
         self._cooldowns: dict[str, float] = {}
         self._project_dir = Path(__file__).parent
@@ -143,6 +172,23 @@ class EmailBot:
             self._state = MailStateStore(
                 state_db_path,
                 default_lease_seconds=getattr(config.bot, "lease_seconds", 300),
+            )
+            self._task_service = DownloadTaskService(
+                TaskStore(self._state),
+                self._download_executor,
+                worker_count=getattr(config.bot, "worker_count", 2),
+                platform_worker_counts={
+                    "douyin": getattr(config.bot, "douyin_worker_count", 1),
+                    "bilibili": getattr(config.bot, "bilibili_worker_count", 1),
+                },
+                lease_seconds=getattr(config.bot, "lease_seconds", 300),
+                heartbeat_seconds=getattr(config.bot, "heartbeat_seconds", 30),
+                max_attempts=getattr(config.bot, "transient_retry_attempts", 3),
+                retry_delay_seconds=getattr(
+                    config.bot, "transient_retry_delay_seconds", 120
+                ),
+                before_execute=self._before_task_service_execute,
+                after_execute=self._after_task_service_execute,
             )
         elif state_db_path.exists():
             # A legacy rollback must not silently abandon Seen mail or pending
@@ -223,6 +269,7 @@ class EmailBot:
 
         with MailStateStore(state_db_path) as rollback_state:
             unfinished = rollback_state.unfinished_work_counts()
+            unfinished["events"] = rollback_state.unfinished_event_count("email")
             terminal_legacy_keys = rollback_state.terminal_legacy_retry_keys(strict=True)
         if any(unfinished.values()):
             raise RuntimeError(
@@ -281,6 +328,9 @@ class EmailBot:
 
     def shutdown(self) -> None:
         """Stop intake and let bounded runtime threads finish their current work."""
+        service = getattr(self, "_task_service", None)
+        if service is not None:
+            service.quiesce()
         self._stop_event.set()
         restart_pending = getattr(self, "_restart_id", None) is not None
         current = threading.current_thread()
@@ -288,13 +338,14 @@ class EmailBot:
             if thread is not current:
                 thread.join(timeout=30)
         self._runtime_threads.clear()
+        if service is not None:
+            service.shutdown(timeout=30)
         lifecycle_stop = getattr(self, "_lifecycle_stop", None)
         if self._state is not None:
             # Never close SQLite underneath an active worker.  Normal restart
             # drains before this point; a manual stop leaves the process to
             # close the connection during interpreter teardown if necessary.
-            with self._active_lock:
-                active = self._active_tasks + self._active_outbox
+            active = self._active_count()
             if active == 0:
                 self._state.close()
             else:
@@ -314,6 +365,33 @@ class EmailBot:
 
     def _start_runtime(self) -> None:
         if self._state is None or self._runtime_threads:
+            return
+        service = getattr(self, "_task_service", None)
+        if service is not None:
+            service.start()
+            events = threading.Thread(
+                target=self._task_event_worker_loop,
+                name="mail-task-events",
+                daemon=True,
+            )
+            events.start()
+            self._runtime_threads.append(events)
+            # The DownloadTaskService owns download workers.  SMTP and event
+            # projection remain entry-specific and stay with EmailBot.
+            outbox = threading.Thread(
+                target=self._outbox_worker_loop,
+                name="mail-smtp-outbox",
+                daemon=True,
+            )
+            outbox.start()
+            self._runtime_threads.append(outbox)
+            maintenance = threading.Thread(
+                target=self._maintenance_loop,
+                name="mail-maintenance",
+                daemon=True,
+            )
+            maintenance.start()
+            self._runtime_threads.append(maintenance)
             return
         worker_count = max(1, getattr(self.config.bot, "worker_count", 2))
         for index in range(worker_count):
@@ -481,8 +559,7 @@ class EmailBot:
         logger.info("Draining mail workers for settings restart %s (revision %d)", request_id, revision)
 
     def _finish_restart_if_ready(self) -> None:
-        with self._active_lock:
-            active = self._active_tasks + self._active_outbox
+        active = self._active_count()
         started = self._restart_started_at or time.monotonic()
         elapsed = time.monotonic() - started
         run_thread = getattr(self, "_run_thread", None)
@@ -530,7 +607,11 @@ class EmailBot:
 
     def _active_count(self) -> int:
         with self._active_lock:
-            return self._active_tasks + self._active_outbox
+            active = self._active_tasks + self._active_outbox
+        service = getattr(self, "_task_service", None)
+        if service is not None:
+            active += service.active_count()
+        return active
 
     def _update_restart(self, request_id: str, status: str, error=None, **details) -> None:
         """Call the richer lifecycle API while tolerating an old store."""
@@ -554,6 +635,93 @@ class EmailBot:
                     self._process_pending_retries(self.config.email, self.config.bot)
             except Exception:
                 logger.exception("Independent mail maintenance failed")
+
+    def _task_event_worker_loop(self) -> None:
+        """Project durable task events into the mail-specific SMTP outbox."""
+        service = getattr(self, "_task_service", None)
+        if service is None or self._state is None:
+            return
+        consumer = "email"
+        while not self._stop_event.is_set():
+            try:
+                events = service.store.events(consumer=consumer, limit=25)
+                if not events:
+                    self._stop_event.wait(0.25)
+                    continue
+                for event in events:
+                    task_id = int(event["task_id"])
+                    task = self._state.get_task_by_id(task_id)
+                    if task is None:
+                        service.store.consume_event(int(event["id"]), consumer)
+                        continue
+                    event_type = str(event.get("event_type") or "")
+                    if event_type not in {
+                        "task.succeeded",
+                        "task.partially_succeeded",
+                        "task.failed",
+                    }:
+                        service.store.consume_event(int(event["id"]), consumer)
+                        continue
+                    if self._state.task_has_outbox(task_id):
+                        # Compatibility calls that still atomically created an
+                        # outbox item must not receive a second notification.
+                        service.store.consume_event(int(event["id"]), consumer)
+                        continue
+                    notification = self._task_notification(task, event)
+                    if notification is None:
+                        service.store.consume_event(int(event["id"]), consumer)
+                        continue
+                    event_payload = event.get("payload") or {}
+                    if not isinstance(event_payload, dict):
+                        event_payload = {}
+                    result = event_payload.get("result") or task.get("result") or {}
+                    if not isinstance(result, dict):
+                        result = {}
+                    outbox_event = "partial-failed" if result.get("partial") else (
+                        "failed" if event_type == "task.failed" else "completed"
+                    )
+                    service.store.project_event(
+                        int(event["id"]),
+                        consumer,
+                        outbox_event=outbox_event,
+                        outbox_payload=notification,
+                    )
+            except Exception:
+                logger.exception("Durable task event projector failed")
+                self._stop_event.wait(1)
+
+    @staticmethod
+    def _task_notification(task: dict, event: dict) -> dict | None:
+        payload = task.get("payload") or {}
+        if not isinstance(payload, dict):
+            return None
+        sender = str(payload.get("sender") or "")
+        if not sender:
+            return None
+        event_payload = event.get("payload") or {}
+        if not isinstance(event_payload, dict):
+            event_payload = {}
+        result = event_payload.get("result") or task.get("result") or {}
+        if not isinstance(result, dict):
+            result = {}
+        successful = event.get("event_type") in {
+            "task.succeeded",
+            "task.partially_succeeded",
+        }
+        if successful or result.get("success"):
+            filepath = result.get("filepath") or "未知路径"
+            if result.get("partial"):
+                body = _format_success_reply(
+                    result, filepath, prefix="部分下载完成。"
+                )
+            else:
+                body = _format_success_reply(result, filepath)
+            subject = _success_subject_status(result)
+        else:
+            error = event_payload.get("error") or task.get("last_error") or "未知错误"
+            body = f"下载失败：{error}{_download_failure_hint()}"
+            subject = "下载失败"
+        return {"to_addr": sender, "body": body, "subject_status": subject}
 
     def _migrate_legacy_retries(self) -> None:
         """Import JSON retry entries without deleting the rollback source."""
@@ -652,24 +820,7 @@ class EmailBot:
                 else:
                     self._complete_durable_failure(task, token, "notice payload missing")
                 return
-            if platform == "cookie":
-                notification, safe_payload = self._process_cookie_command(task)
-                completed = self._state.complete_task(
-                    task_id,
-                    token,
-                    result={"command": task.get("payload", {}).get("command")},
-                    notification=notification,
-                )
-                if completed is not None:
-                    self._state.redact_task_payload(task_id, safe_payload)
-                return
             result = self._download_url(task["original_url"])
-            if (
-                not result.get("success")
-                and platform == "douyin"
-                and _is_cookie_failure(result.get("error"))
-            ):
-                result = self._retry_douyin_after_cookie_refresh(task["original_url"], result)
             partial_error = _partial_failure_error(result)
             error_msg = partial_error or result.get("error")
             if result.get("success") and partial_error:
@@ -741,73 +892,30 @@ class EmailBot:
         with self._sender_locks_guard:
             return self._sender_locks.setdefault(sender, threading.Lock())
 
-    def _process_cookie_command(self, task: dict) -> tuple[dict, dict]:
-        """Execute a durable cookie command and return a safe outbox payload."""
-        payload = task.get("payload") or {}
-        sender = payload.get("sender", "")
-        command = payload.get("command")
-        body = str(payload.get("body") or "").strip()
-        safe_payload = {
-            "sender": sender,
-            "subject": payload.get("subject", ""),
-            "command": command,
-        }
-        if command == "cookie_update":
-            if not body:
-                return {
-                    "to_addr": sender,
-                    "body": "邮件正文为空，请粘贴新的 cookie 后重试。",
-                    "subject_status": "Cookie 更新失败",
-                }, safe_payload
-            if len(body) < 100:
-                return {
-                    "to_addr": sender,
-                    "body": (
-                        f"收到的 cookie 似乎不完整（仅 {len(body)} 字符），请确认已粘贴完整的 cookie 字符串。\n\n"
-                        "获取方式: 浏览器登录 douyin.com → F12 → 控制台 → 输入 document.cookie → 复制全部输出。"
-                    ),
-                    "subject_status": "Cookie 不完整",
-                }, safe_payload
-            if not self._save_cookie(body):
-                return {
-                    "to_addr": sender,
-                    "body": "保存 Cookie 失败，请检查设置存储权限或环境变量覆盖。",
-                    "subject_status": "Cookie 写入失败",
-                }, safe_payload
-            return {
-                "to_addr": sender,
-                "body": f"Cookie 已更新！（{len(body)} 字符）\n有效期通常 24-48 小时，过期后请重新发送。",
-                "subject_status": "Cookie 已更新",
-            }, safe_payload
+    def _before_task_service_execute(self, task) -> None:
+        """Apply the email adapter's sender cooldown before a download."""
+        state = getattr(self, "_state", None)
+        if state is None:
+            return
+        row = state.get_task_by_id(task.task_id)
+        sender = str(((row or {}).get("payload") or {}).get("sender") or "")
+        if not sender:
+            return
+        with self._sender_locks_guard:
+            lock = self._sender_locks.setdefault(sender, threading.Lock())
+        with lock:
+            cooldown = max(0, getattr(self.config.bot, "cooldown_seconds", 0))
+            remaining = cooldown - (time.time() - self._cooldowns.get(sender, 0))
+            if remaining > 0:
+                self._stop_event.wait(remaining)
 
-        if command == "cookie_auto":
-            with self._cookie_lock:
-                cookie, status = _try_extract_cookie(
-                    profile_dir=self.config.cookie_extractor.profile_dir or None,
-                    headless=self.config.cookie_extractor.headless,
-                    validate=self.config.cookie_extractor.validate,
-                )
-                if cookie and self._save_cookie(cookie):
-                    return {
-                        "to_addr": sender,
-                        "body": f"Cookie 已自动获取并更新！（{len(cookie)} 字符）\n来源：{status}",
-                        "subject_status": "Cookie 已更新",
-                    }, safe_payload
-            return {
-                "to_addr": sender,
-                "body": (
-                    f"自动获取失败：{status}\n\n"
-                    "方案一：在宿主机终端运行 uv run python get_cookie.py\n"
-                    "方案二：发送主题含「更新cookie」的邮件，正文粘贴 document.cookie 的输出。"
-                ),
-                "subject_status": "Cookie 获取失败",
-            }, safe_payload
-
-        return {
-            "to_addr": sender,
-            "body": "不支持的 cookie 命令。",
-            "subject_status": "Cookie 操作失败",
-        }, safe_payload
+    def _after_task_service_execute(self, task, result) -> None:
+        if result.success:
+            state = getattr(self, "_state", None)
+            row = state.get_task_by_id(task.task_id) if state is not None else None
+            sender = str(((row or {}).get("payload") or {}).get("sender") or "")
+            if sender:
+                self._cooldowns[sender] = time.time()
 
     def _complete_durable_failure(
         self,
@@ -826,10 +934,10 @@ class EmailBot:
                 result,
                 filepath,
                 prefix="部分下载完成，但自动重试已耗尽。",
-            ) + f"\n最后错误：{error}"
+            ) + f"\n最后错误：{error}" + _download_failure_hint()
             subject_status = "部分下载失败"
         else:
-            body = f"下载失败：{error}"
+            body = f"下载失败：{error}{_download_failure_hint()}"
             subject_status = "下载失败"
         self._record_failed_link(
             {
@@ -870,27 +978,6 @@ class EmailBot:
                     return
             except Exception:
                 logger.exception("Task heartbeat failed for %d", task_id)
-
-    def _retry_douyin_after_cookie_refresh(self, url: str, first_result: dict) -> dict:
-        """Serialize Firefox access and preserve the existing cookie retry."""
-        with self._cookie_lock:
-            refreshed_cookie, refresh_msg = _try_extract_cookie(
-                profile_dir=self.config.cookie_extractor.profile_dir or None,
-                headless=self.config.cookie_extractor.headless,
-                validate=self.config.cookie_extractor.validate,
-            )
-            if not refreshed_cookie or refreshed_cookie == self.downloader.config.cookie:
-                return first_result
-            old_length = len(self.downloader.config.cookie)
-            if not self._save_cookie(refreshed_cookie):
-                return first_result
-            logger.info(
-                "Cookie refreshed (%d chars -> %d chars; %s), retrying durable task",
-                old_length,
-                len(refreshed_cookie),
-                refresh_msg,
-            )
-            return self.downloader.download(url)
 
     def _outbox_worker_loop(self) -> None:
         assert self._state is not None
@@ -1260,7 +1347,6 @@ class EmailBot:
         raw_sha256 = hashlib.sha256(raw).hexdigest()
         urls: list[str] = []
         platform = None
-        command = None
         routing_error = None
         try:
             msg = email.message_from_bytes(raw)
@@ -1278,11 +1364,7 @@ class EmailBot:
 
             sender_allowed = not bot_cfg.allowed_senders or sender in bot_cfg.allowed_senders
             if sender != cfg.email and sender_allowed:
-                if bot_cfg.commands.cookie_update and bot_cfg.commands.cookie_update in subject:
-                    command = "cookie_update"
-                elif bot_cfg.commands.cookie_auto and bot_cfg.commands.cookie_auto in subject:
-                    command = "cookie_auto"
-                elif (
+                if (
                     not getattr(bot_cfg, "subject_keyword", "")
                     or getattr(bot_cfg, "subject_keyword", "") in subject
                 ):
@@ -1314,7 +1396,13 @@ class EmailBot:
             }
 
         try:
-            accepted = self._state.accept_message(
+            task_service = getattr(self, "_task_service", None)
+            accept_mail = (
+                task_service.accept_mail_message
+                if task_service is not None
+                else self._state.accept_message
+            )
+            accepted = accept_mail(
                 mailbox,
                 uidvalidity,
                 uid,
@@ -1324,6 +1412,7 @@ class EmailBot:
                 if routing_error
                 else {**metadata, "platform": platform},
                 platform=platform,
+                max_attempts=getattr(bot_cfg, "transient_retry_attempts", 3),
                 advance_position=advance_position,
             )
         except Exception:
@@ -1345,10 +1434,7 @@ class EmailBot:
                     uid,
                     platform or "unknown",
                 )
-            elif command:
-                self._ensure_command_task(source_id, metadata, body, command)
-
-            # A source stays pending until URL/command routing (or the safe
+            # A source stays pending until URL routing (or the safe
             # empty/quarantine intake) has been persisted.
             try:
                 if not self._state.mark_intake_complete(source_id):
@@ -1386,7 +1472,13 @@ class EmailBot:
             "intake_error": type(error).__name__,
         }
         try:
-            accepted = self._state.accept_message(
+            task_service = getattr(self, "_task_service", None)
+            accept_mail = (
+                task_service.accept_mail_message
+                if task_service is not None
+                else self._state.accept_message
+            )
+            accepted = accept_mail(
                 mailbox,
                 uidvalidity,
                 uid,
@@ -1410,30 +1502,6 @@ class EmailBot:
         except Exception:
             logger.exception("Could not quarantine malformed email UID %d", uid)
             return False
-
-    def _ensure_command_task(
-        self, source_id: str, metadata: dict, body: str, command: str
-    ) -> int:
-        assert self._state is not None
-        notice_url = f"urn:mail-notice:{command}"
-        existing = self._state.get_task(source_id, notice_url)
-        if existing is not None:
-            # A duplicate UID after a crash may reach this path again. The
-            # notice/outbox transaction is idempotent, so do not re-run a
-            # cookie side effect or send a second notification.
-            return int(existing["id"])
-        # Cookie input is deliberately processed in memory: durable state
-        # must not become a second plaintext cookie store. Only the resulting
-        # safe notification is persisted in the SMTP outbox.
-        notification, _safe_payload = self._process_cookie_command(
-            {"payload": {**metadata, "body": body, "command": command}}
-        )
-        return self._ensure_task_for_notice(
-            source_id,
-            metadata,
-            command,
-            notification,
-        )
 
     def _ensure_task_for_notice(
         self, source_id: str, metadata: dict, event: str, notification: dict
@@ -1482,18 +1550,6 @@ class EmailBot:
             return
 
         body = _get_body_text(msg)
-        commands = bot_cfg.commands
-
-        # ── Command: cookie update (manual paste) ──────────────────
-        if commands.cookie_update and commands.cookie_update in subject:
-            self._handle_cookie_update(mail, msg_id, cfg, sender, body)
-            return
-
-        # ── Command: cookie auto-extract from browser ──────────────
-        if commands.cookie_auto and commands.cookie_auto in subject:
-            self._handle_cookie_auto(mail, msg_id, cfg, sender, body)
-            return
-
         # ── Normal: download ───────────────────────────────────────
         url = self.extractor.extract(subject + " " + body)
         if url is None:
@@ -1575,63 +1631,8 @@ class EmailBot:
                 _mark_seen(mail, msg_id)
                 return
 
-            # ── Douyin-only: auto-refresh cookie and retry once ─────
-            is_cookie_issue = (
-                platform == "douyin"
-                and (
-                "删" in error_msg
-                or "私密" in error_msg
-                or "cookie" in error_msg.lower()
-                or "异常" in error_msg
-                )
-            )
-            if is_cookie_issue:
-                logger.info("Attempting auto cookie refresh from Firefox profile...")
-                refreshed_cookie, refresh_msg = _try_extract_cookie(
-                    profile_dir=self.config.cookie_extractor.profile_dir or None,
-                    headless=self.config.cookie_extractor.headless,
-                    validate=self.config.cookie_extractor.validate,
-                )
-                if refreshed_cookie and refreshed_cookie != self.downloader.config.cookie:
-                    # Hot-reload new cookie and retry
-                    if self._save_cookie(refreshed_cookie):
-                        logger.info(
-                            "Cookie refreshed (%d chars → %d chars), retrying download...",
-                            len(self.config.douyin.cookie), len(refreshed_cookie),
-                        )
-                        retry_result = self.downloader.download(url)
-                        if retry_result["success"]:
-                            self._cooldowns[sender] = time.time()
-                            filepath = retry_result["filepath"] or "未知路径"
-                            logger.info(
-                                f"{Fore.GREEN}{Style.BRIGHT}[DONE] 下载成功 (cookie 刷新后): %s -> %s",
-                                retry_result["title"],
-                                filepath,
-                            )
-                            self._send_reply(
-                                cfg, sender,
-                                _format_success_reply(
-                                    retry_result,
-                                    filepath,
-                                    prefix="下载完成！（cookie 已自动刷新）",
-                                ),
-                                subject_status=_success_subject_status(
-                                    retry_result,
-                                    refreshed_cookie=True,
-                                ),
-                            )
-                            _mark_seen(mail, msg_id)
-                            return
-                        logger.warning("Retry after cookie refresh also failed: %s", retry_result["error"])
-                        error_msg += f"\n（已尝试自动刷新 cookie 并重试，仍失败）"
-
             # Build helpful hints
-            error_msg += (
-                "\n\n解决方案："
-                "\n1. 抖音链接：发送主题含「更新cookie」的邮件，正文粘贴完整 cookie"
-                "\n2. 抖音链接：发送主题含「自动获取cookie」的邮件，让机器人从 Firefox 配置文件提取"
-                "\n3. B站链接：如需登录内容，请在 .env 配置 BILIBILI_AUTH"
-            )
+            error_msg += _download_failure_hint()
             self._send_reply(
                 cfg,
                 sender,
@@ -1828,6 +1829,9 @@ class EmailBot:
 
     def _download_url(self, url: str) -> dict:
         """Dispatch a supported URL to the correct downloader."""
+        executor = getattr(self, "_download_executor", None)
+        if executor is not None:
+            return executor.execute(url).to_dict()
         platform = detect_platform(url)
         if platform == "douyin":
             return self.downloader.download(url)
@@ -1841,114 +1845,6 @@ class EmailBot:
             "title": None,
             "error": "暂不支持该链接类型",
         }
-
-    # ── Cookie command handlers ───────────────────────────────────
-
-    def _save_cookie(self, cookie: str) -> bool:
-        """Persist a cookie in the shared settings registry and hot-load it."""
-        if not hasattr(self, "_settings"):
-            # Compatibility for pre-lifecycle lightweight callers. Production
-            # instances always use the shared SQLite registry.
-            ok = _write_env(self._project_dir / ".env", "DOUYIN_COOKIE", cookie)
-            if ok:
-                self.downloader.config.cookie = cookie
-            return ok
-        try:
-            revision = self._settings.apply_changes(
-                {"douyin.cookie": cookie}, base_revision=self._settings.get_revision()
-            )
-        except Exception:
-            logger.exception("Could not save DOUYIN_COOKIE in settings store")
-            return False
-        self._settings_revision = revision
-        self._managed_settings["douyin.cookie"] = cookie
-        self._hot_reload_cookie(cookie)
-        return True
-
-    def _handle_cookie_update(self, mail, msg_id, cfg, sender, body) -> None:
-        """Extract new cookie from email body, write to .env, hot-reload."""
-        new_cookie = body.strip()
-        if not new_cookie:
-            self._send_reply(
-                cfg,
-                sender,
-                "邮件正文为空，请粘贴新的 cookie 后重试。",
-                subject_status="Cookie 更新失败",
-            )
-            _mark_seen(mail, msg_id)
-            return
-
-        if len(new_cookie) < 100:
-            logger.warning("Cookie from %s looks too short (%d chars)", sender, len(new_cookie))
-            self._send_reply(
-                cfg, sender,
-                f"收到的 cookie 似乎不完整（仅 {len(new_cookie)} 字符），请确认已粘贴完整的 cookie 字符串。\n\n"
-                "获取方式: 浏览器登录 douyin.com → F12 → 控制台 → 输入 document.cookie → 复制全部输出。",
-                subject_status="Cookie 不完整",
-            )
-            _mark_seen(mail, msg_id)
-            return
-
-        ok = self._save_cookie(new_cookie)
-        if not ok:
-            self._send_reply(
-                cfg,
-                sender,
-                "写入 .env 文件失败，请检查文件权限。",
-                subject_status="Cookie 写入失败",
-            )
-            _mark_seen(mail, msg_id)
-            return
-
-        logger.info("Cookie updated by %s (%d chars)", sender, len(new_cookie))
-        self._send_reply(
-            cfg, sender,
-            f"Cookie 已更新！（{len(new_cookie)} 字符）\n有效期通常 24-48 小时，过期后请重新发送。",
-            subject_status="Cookie 已更新",
-        )
-        _mark_seen(mail, msg_id)
-
-    def _handle_cookie_auto(self, mail, msg_id, cfg, sender, body) -> None:
-        """Try to auto-extract cookie via headless Playwright Firefox."""
-        self._send_reply(
-            cfg,
-            sender,
-            "正在尝试自动获取 cookie（无头 Firefox）...",
-            subject_status="Cookie 获取中",
-        )
-
-        cookie_str, status_msg = _try_extract_cookie(
-            profile_dir=self.config.cookie_extractor.profile_dir or None,
-            headless=self.config.cookie_extractor.headless,
-            validate=self.config.cookie_extractor.validate,
-        )
-
-        if cookie_str:
-            ok = self._save_cookie(cookie_str)
-            if ok:
-                logger.info("Cookie auto-extracted (%d chars): %s", len(cookie_str), status_msg)
-                self._send_reply(
-                    cfg, sender,
-                    f"Cookie 已自动获取并更新！（{len(cookie_str)} 字符）\n来源：{status_msg}",
-                    subject_status="Cookie 已更新",
-                )
-            else:
-                self._send_reply(
-                    cfg,
-                    sender,
-                    "Cookie 已提取但写入 .env 失败，请检查文件权限。",
-                    subject_status="Cookie 写入失败",
-                )
-        else:
-            self._send_reply(
-                cfg, sender,
-                f"自动获取失败：{status_msg}\n\n"
-                "方案一：在宿主机终端运行 uv run python get_cookie.py\n"
-                "方案二：发送主题含「更新cookie」的邮件，正文粘贴 document.cookie 的输出。",
-                subject_status="Cookie 获取失败",
-            )
-
-        _mark_seen(mail, msg_id)
 
     # ── IMAP / SMTP helpers ───────────────────────────────────────
 
@@ -2132,13 +2028,6 @@ def _is_transient_failure(error_msg: str | None) -> bool:
     return any(hint in lowered for hint in _TRANSIENT_ERROR_HINTS)
 
 
-def _is_cookie_failure(error_msg: str | None) -> bool:
-    if not error_msg:
-        return False
-    lowered = error_msg.lower()
-    return any(hint in lowered for hint in ("删", "私密", "cookie", "异常"))
-
-
 def _partial_failure_error(result: dict) -> str | None:
     """Return retryable detail for a partial result without breaking success/error semantics."""
     if not result.get("partial"):
@@ -2171,53 +2060,3 @@ def _retry_next_attempt_at(item: dict, key: str) -> float | None:
 
 def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
-
-
-# ── .env file utilities ───────────────────────────────────────────
-
-def _write_env(env_path: Path, key: str, value: str) -> bool:
-    """Update or add a key=value line in a dotenv file.
-
-    Returns True on success, False on I/O error.
-    """
-    try:
-        if env_path.exists():
-            lines = env_path.read_text(encoding="utf-8").splitlines()
-            found = False
-            for i, line in enumerate(lines):
-                if line.startswith(f"{key}=") or line.startswith(f"{key} ="):
-                    lines[i] = f"{key}={value}"
-                    found = True
-                    break
-            if not found:
-                lines.append(f"{key}={value}")
-            env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        else:
-            env_path.write_text(f"{key}={value}\n", encoding="utf-8")
-        return True
-    except OSError as e:
-        logger.error("Failed to write %s: %s", env_path, e)
-        return False
-
-
-# ── Browser cookie extraction ─────────────────────────────────────
-
-def _try_extract_cookie(
-    profile_dir: Path | None = None,
-    *,
-    headless: bool = True,
-    validate: bool = True,
-) -> tuple[str | None, str]:
-    """Extract douyin.com cookies via headless Playwright Firefox.
-
-    Args:
-        profile_dir: Firefox profile directory (None = use default).
-        headless: Whether Firefox should run without a visible window.
-        validate: Whether to validate the extracted cookie.
-
-    Returns:
-        (cookie_string_or_None, status_message).
-    """
-    from cookie_extractor import extract_cookies  # noqa: E402
-
-    return extract_cookies(profile_dir=profile_dir, headless=headless, validate=validate)

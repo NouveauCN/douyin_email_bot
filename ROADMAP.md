@@ -214,15 +214,16 @@ Sol Senior final high-risk review: **FINAL PASS** (2026-08-27).
   acknowledged.
 - Bounded download workers and a separate SMTP outbox worker decouple slow
   media work and delivery from the 30-second polling coordinator. Douyin and
-  Bilibili capacity are independently limited, and Firefox cookie refresh is
-  serialized.
+  Bilibili capacity are independently limited. The reusable
+  `DownloadTaskService` owns execution, leases, retries, and completion events;
+  EmailBot owns only the mail event projector and SMTP outbox.
 - Legacy JSON retries remain intact as a rollback source and are imported
   idempotently. `migrate_mail_state.py` is dry-run by default; after SQLite
   intake, tasks, outbox, and pending `\\Seen` acknowledgements drain, set
   `BOT_DURABLE_MAIL_ENABLED=0` to use the legacy path. Startup refuses rollback
-  while durable work remains. Cookie command bodies are processed in memory
-  and are not persisted in SQLite; pre-v2 cookie tasks are redacted and
-  terminally failed so they must be resent. The migration securely rebuilds
+  while durable work or unconsumed email events remain. Email Cookie commands
+  are no longer accepted; pre-v2 cookie tasks are redacted and terminally
+  failed so operators must use Web Login or the CLI. The migration securely rebuilds
   SQLite and checkpoints/truncates its WAL; external database backups still
   require the normal secret-rotation policy.
 - A terminal durable failure removes its mirrored legacy JSON retry only after

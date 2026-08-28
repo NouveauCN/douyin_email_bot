@@ -119,10 +119,9 @@ uv run python migrate_mail_state.py --pending ./pending_retries.json --apply
 outbox 清空，再设置
 `BOT_DURABLE_MAIL_ENABLED=0`；若仍有在途 durable 工作，机器人会拒绝启动，
 避免已标记 `\\Seen` 的邮件或待发通知被静默遗弃。不要在确认 durable 状态
-与 outbox 已稳定前删除 JSON 队列。Cookie 命令正文只在内存中处理，不写入
-SQLite；升级旧版 SQLite 状态时，历史 Cookie 任务会先脱敏并标记为需重新发送。
-迁移还会安全清理 SQLite/WAL 中的旧页；任何外部数据库备份仍需按既有
-秘密轮换策略处理。
+与 outbox 已稳定前删除 JSON 队列。升级旧版 SQLite 状态时，历史 Cookie 任务会先
+脱敏并标记为需通过 Web Login 或 CLI 更新。迁移还会安全清理 SQLite/WAL 中的旧页；任何外部数据库
+备份仍需按既有秘密轮换策略处理。
 
 设置 Tab 的 SQLite 数据保存在独立的 `runtime_settings` named volume，容器内路径为
 `/app/runtime-settings/settings.sqlite3`。该卷只挂载给 `bot`、`file_browser` 和
@@ -204,24 +203,11 @@ uv run python process_media.py "/path/to/video.mp4" --apply --force-review
 
 ## Cookie 管理
 
-抖音 cookie 有效期通常 **24-48 小时**，过期后下载会失败。机器人支持两种方式更新 cookie：
-
-### 手动粘贴（主题：更新cookie）
-
-向机器人邮箱发送邮件：
-- **主题**：含"更新cookie"
-- **正文**：粘贴新的 cookie 字符串
-
-获取 cookie：浏览器登录 douyin.com → `F12` → 控制台 → `document.cookie` → 复制输出。
-
-### 自动提取（主题：自动获取cookie）
-
-向机器人邮箱发送邮件：
-- **主题**：含"自动获取cookie"
-
-机器人会复用 Playwright Firefox 持久化配置，提取已登录的抖音 cookie 并自动更新。
-
-> 提示：首次使用前先运行 `uv run python get_cookie.py` 完成 Firefox 登录。
+抖音 cookie 有效期通常 **24-48 小时**，过期后下载会失败。Cookie 不再通过邮件命令
+更新。推荐启动 `web_login` 后使用二维码登录；首次部署或故障恢复也可以运行
+`uv run python get_cookie.py`。两种入口都把 Cookie 保存到托管 settings，运行中的
+Bot 会通过 `douyin.cookie` 的 hot reload 立即读取，Cookie 内容不会回显到页面、日志
+或邮件任务状态。
 
 ## 配置说明
 
@@ -254,8 +240,6 @@ uv run python process_media.py "/path/to/video.mp4" --apply --force-review
 | `bot.douyin_worker_count` / `bilibili_worker_count` | int | `1` / `1` | 各平台并发上限；由 managed settings/YAML 控制，只有显式外部环境变量注入时锁定 |
 | `bot.lease_seconds` / `heartbeat_seconds` | int | `300` / `30` | worker 租约与心跳周期；由 managed settings/YAML 控制，只有显式外部环境变量注入时锁定 |
 | `bot.outbox_retry_attempts` | int | `5` | SMTP outbox 最大重试次数；由 managed settings/YAML 控制，只有显式外部环境变量注入时锁定 |
-| `bot.commands.cookie_update` | str | `"更新cookie"` | 手动更新 cookie 的邮件主题关键词 |
-| `bot.commands.cookie_auto` | str | `"自动获取cookie"` | 浏览器自动提取 cookie 的邮件主题关键词 |
 | `FILE_BROWSER_ALLOWED_ORIGINS` | str | 当前请求 origin | 文件浏览器精确允许来源（逗号分隔） |
 | `WEB_LOGIN_ALLOWED_ORIGINS` | str | 当前请求 origin | QR 服务精确允许来源（逗号分隔） |
 | `DOUYIN_SHORT_LINK_CA_BUNDLE` | str | 系统 CA | 私有 CA bundle 路径；不配置时使用正常证书校验 |

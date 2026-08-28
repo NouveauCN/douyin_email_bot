@@ -1,6 +1,6 @@
 # 公共下载任务服务改造计划
 
-状态：**仅规划，尚未实现**
+状态：**已按审查意见实现并完成本地验收**
 
 来源：参考任务 `codex://threads/01a0482b-4143-73b0-8781-f9ea26970b0b`。
 
@@ -22,6 +22,20 @@
 
 本轮设计不新增 HTTP API，也不实现真实 QQ 入口；未来 QQ 与 Bot 同进程时，
 直接调用 Python 接口即可。
+
+## Sol 审查后的实现决策
+
+本计划不能把 durable 任务服务和 legacy 回滚路径混成同一执行模型。实现采用
+三层边界：`DownloaderRegistry`/`DownloadExecutor` 是无状态平台执行层，
+`DownloadTaskService` 只负责 durable 任务的提交、租约、重试、事件和 worker，
+legacy JSON 路径继续同步调用 `DownloadExecutor`，不启动 durable service。
+
+`TaskRequest` 使用 `SourceRef(kind, external_id)` 形成幂等命名空间；共享 SQLite
+保留现有 mail facade，并增加 `source_kind`、`external_source_id`、任务事件、
+事件消费确认和 mail binding。终态写入与终态事件在同一事务内完成；邮件 projector
+在同一事务中把事件投影为 SMTP outbox 并确认消费。旧版 Cookie 任务继续安全脱敏，
+邮件不再接受 Cookie 更新/自动获取命令，Cookie 仍由 Web Login、`get_cookie.py`
+和托管 `douyin.cookie` secret 提供。
 
 ## 公共接口与数据模型
 
@@ -165,7 +179,8 @@ docker compose --profile login config --quiet
 1. 先增加类型、TaskStore facade、任务事件表和下载器 registry，确保不改变旧入口行为。
 2. 实现 `DownloadTaskService` 的提交、领取、执行、重试、心跳、恢复和事件回调。
 3. 将 EmailBot durable 路径切换为任务服务，并保留旧状态库兼容方法。
-4. 将 EmailBot legacy 路径切换为任务服务的同步兼容调用。
+4. 将 EmailBot legacy 路径切换为 `DownloadExecutor` 的同步兼容调用，保持
+   JSON retry 的回滚边界，不启动 `DownloadTaskService`。
 5. 删除邮件 Cookie 命令及其 UI/配置暴露，保留 Web Login 和安全迁移逻辑。
 6. 补测试、更新文档，完成完整验证后再进行独立 PR 交付。
 
