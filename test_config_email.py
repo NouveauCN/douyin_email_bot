@@ -97,6 +97,16 @@ bot:
     assert config.bot.worker_count == 3
 
 
+def test_reply_notifications_can_be_suppressed_by_environment(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("email:\n  send_replies: true\n", encoding="utf-8")
+    monkeypatch.setenv("EMAIL_SEND_REPLIES", "0")
+
+    config = load_config(config_path)
+
+    assert config.email.send_replies is False
+
+
 
 
 def test_malformed_pending_retry_fields_do_not_abort_other_items(monkeypatch):

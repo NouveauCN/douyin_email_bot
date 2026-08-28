@@ -10,6 +10,7 @@ Environment variable mappings:
     EMAIL_IMAP_SERVER / EMAIL_IMAP_PORT — email.imap_server / imap_port
     EMAIL_SMTP_SERVER / EMAIL_SMTP_PORT — email.smtp_server / smtp_port
     EMAIL_ADDRESS / EMAIL_PASSWORD — email.email / password
+    EMAIL_SEND_REPLIES — email.send_replies
     EMAIL_POLL_INTERVAL / SMTP_TIMEOUT — email polling and SMTP timeout
     DOUYIN_DOWNLOAD_PATH  — overrides douyin.download_path
     DOUYIN_COOKIE         — overrides douyin.cookie
@@ -144,6 +145,7 @@ class EmailConfig:
     smtp_port: int = 587
     email: str = ""       # From EMAIL_ADDRESS env var
     password: str = ""    # From EMAIL_PASSWORD env var
+    send_replies: bool = True  # From EMAIL_SEND_REPLIES; tasks still run when false
     poll_interval: int = 30
     smtp_timeout: int = 30
 
@@ -272,6 +274,7 @@ def load_config(path: Path) -> AppConfig:
         smtp_port=int(_setting_value("email.smtp_port", "EMAIL_SMTP_PORT", managed, dotenv, email_raw.get("smtp_port"), 587)),
         email=_setting_value("email.email", "EMAIL_ADDRESS", managed, dotenv, email_raw.get("email"), ""),
         password=_setting_value("email.password", "EMAIL_PASSWORD", managed, dotenv, email_raw.get("password"), ""),
+        send_replies=_as_bool(_setting_value("email.send_replies", "EMAIL_SEND_REPLIES", managed, dotenv, email_raw.get("send_replies"), True), True),
         poll_interval=_env_int("EMAIL_POLL_INTERVAL", int(_setting_value("email.poll_interval", "EMAIL_POLL_INTERVAL", managed, dotenv, email_raw.get("poll_interval"), 30))),
         smtp_timeout=max(1, _env_int("SMTP_TIMEOUT", int(_setting_value("email.smtp_timeout", "SMTP_TIMEOUT", managed, dotenv, email_raw.get("smtp_timeout"), 30)))),
     )

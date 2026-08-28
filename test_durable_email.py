@@ -203,6 +203,7 @@ def make_bot(tmp_path):
     bot.extractor = UrlExtractor()
     bot._pending_retries = {}
     bot._pending_retry_lock = __import__("threading").RLock()
+    bot._failure_file_lock = __import__("threading").Lock()
     bot._legacy_cleanup_pending = set()
     bot._pending_retry_file = tmp_path / "pending.json"
     bot._failed_links_file = tmp_path / "failed.txt"
@@ -525,7 +526,7 @@ def test_partial_retry_exhaustion_is_terminal_and_not_silent(tmp_path):
         "files": ["/app/downloads/slides/one.webp"],
         "failed_items": ["two.webp: network timeout"],
     }
-    bot._record_failed_link = lambda *_args: None
+    bot._record_failed_link = lambda *_args, **_kwargs: None
 
     bot._process_durable_task(task)
 
@@ -569,7 +570,7 @@ def test_terminal_legacy_retry_failure_removes_json_mirror(tmp_path):
         "files": [],
         "file_count": 0,
     }
-    bot._record_failed_link = lambda *_args: None
+    bot._record_failed_link = lambda *_args, **_kwargs: True
 
     bot._process_durable_task(task)
 
@@ -580,6 +581,153 @@ def test_terminal_legacy_retry_failure_removes_json_mirror(tmp_path):
         "SELECT status FROM tasks WHERE id = ?", (accepted["task_ids"][0],)
     ).fetchone()["status"] == "failed"
     bot._state.close()
+
+
+def test_terminal_failure_projection_replays_after_file_write_failure(tmp_path):
+    first = make_bot(tmp_path)
+    first._remove_legacy_retry = EmailBot._remove_legacy_retry.__get__(first, EmailBot)
+    first._pending_retries = {"legacy-key": {"url": "https://www.douyin.com/video/789"}}
+    accepted = first._state.accept_message(
+        "INBOX", 77, 16, "INBOX:77:16", ["https://www.douyin.com/video/789"],
+        metadata={"sender": "user@example.test", "legacy_retry_key": "legacy-key"},
+        platform="douyin",
+    )
+    claimed = first._state.claim_tasks()[0]
+    first._state.fail_task(
+        accepted["task_ids"][0], claimed["lease_token"], "permanent failure"
+    )
+    event = first._state.list_task_events()[0]
+    assert first._state.consume_task_event(event["id"], "email")
+    first._record_failed_link = lambda *_args, **_kwargs: False
+
+    assert first._project_terminal_failure(
+        first._state.get_task_by_id(accepted["task_ids"][0]), event
+    ) is False
+    assert "legacy-key" in first._pending_retries
+    first._state.close()
+
+    second = make_bot(tmp_path)
+    second._remove_legacy_retry = EmailBot._remove_legacy_retry.__get__(second, EmailBot)
+    second._pending_retries = {"legacy-key": {"url": "https://www.douyin.com/video/789"}}
+    second._replay_terminal_failure_projections()
+    second._replay_terminal_failure_projections()
+
+    failure_text = second._failed_links_file.read_text(encoding="utf-8")
+    assert failure_text.count("https://www.douyin.com/video/789") == 1
+    assert "legacy-key" not in second._pending_retries
+    second._state.close()
+
+
+def test_consumed_terminal_failure_replays_on_same_bot_after_write_recovers(tmp_path):
+    bot = make_bot(tmp_path)
+    try:
+        accepted = bot._state.accept_message(
+            "INBOX", 77, 17, "INBOX:77:17", ["https://www.douyin.com/video/789"],
+            metadata={"sender": "user@example.test", "legacy_retry_key": "legacy-key"},
+            platform="douyin",
+        )
+        task_id = accepted["task_ids"][0]
+        claimed = bot._state.claim_tasks()[0]
+        bot._state.fail_task(task_id, claimed["lease_token"], "permanent failure")
+        event = bot._state.list_task_events()[0]
+        assert bot._state.consume_task_event(event["id"], "email")
+
+        bot._record_failed_link = lambda *_args, **_kwargs: False
+        bot._replay_terminal_failure_projections()
+        assert not bot._failed_links_file.exists()
+
+        bot._record_failed_link = EmailBot._record_failed_link.__get__(bot, EmailBot)
+        bot._replay_terminal_failure_projections()
+
+        failure_text = bot._failed_links_file.read_text(encoding="utf-8")
+        assert failure_text.count(f"task_id={task_id}\t") == 1
+    finally:
+        bot._state.close()
+
+
+def test_terminal_failure_replay_scans_second_event_page(tmp_path):
+    bot = make_bot(tmp_path)
+    try:
+        accepted = bot._state.accept_message(
+            "INBOX", 77, 18, "INBOX:77:18", ["https://www.douyin.com/video/789"],
+            metadata={"sender": "user@example.test", "legacy_retry_key": "legacy-key"},
+            platform="douyin",
+        )
+        task_id = accepted["task_ids"][0]
+        for index in range(500):
+            bot._state.record_task_event(task_id, f"task.history.{index}")
+
+        claimed = bot._state.claim_tasks()[0]
+        bot._state.fail_task(task_id, claimed["lease_token"], "permanent failure")
+        events = bot._state.list_task_events(limit=501, include_consumed=True)
+        event = events[-1]
+        first_page = bot._state.list_task_events(limit=500, include_consumed=True)
+        assert len(events) == 501
+        assert len(first_page) == 500
+        assert event["id"] > first_page[-1]["id"]
+        assert bot._state.consume_task_event(event["id"], "email")
+
+        bot._replay_terminal_failure_projections()
+
+        failure_text = bot._failed_links_file.read_text(encoding="utf-8")
+        assert failure_text.count(f"task_id={task_id}\t") == 1
+    finally:
+        bot._state.close()
+
+
+def test_terminal_failure_replay_reuses_exact_unkeyed_legacy_record(tmp_path):
+    bot = make_bot(tmp_path)
+    try:
+        bot._failed_links_file.write_text(
+            "2026-08-29T00:00:00+08:00\t"
+            "sender=user@example.test\tplatform=douyin\t"
+            "attempts=1\turl=https://www.douyin.com/video/789\t"
+            "error=permanent failure\n",
+            encoding="utf-8",
+        )
+
+        assert bot._record_failed_link(
+            {
+                "sender": "user@example.test",
+                "platform": "douyin",
+                "attempts": 1,
+                "url": "https://www.douyin.com/video/789",
+            },
+            "permanent failure",
+            task_id=99,
+            allow_legacy_unkeyed=True,
+        )
+        assert len(bot._failed_links_file.read_text(encoding="utf-8").splitlines()) == 1
+    finally:
+        bot._state.close()
+
+
+def test_new_terminal_failure_keeps_keyed_record_after_legacy_match(tmp_path):
+    bot = make_bot(tmp_path)
+    try:
+        bot._failed_links_file.write_text(
+            "2026-08-29T00:00:00+08:00\t"
+            "sender=user@example.test\tplatform=douyin\t"
+            "attempts=1\turl=https://www.douyin.com/video/789\t"
+            "error=permanent failure\n",
+            encoding="utf-8",
+        )
+
+        assert bot._record_failed_link(
+            {
+                "sender": "user@example.test",
+                "platform": "douyin",
+                "attempts": 1,
+                "url": "https://www.douyin.com/video/789",
+            },
+            "permanent failure",
+            task_id=100,
+        )
+        failure_text = bot._failed_links_file.read_text(encoding="utf-8")
+        assert failure_text.count("url=https://www.douyin.com/video/789") == 2
+        assert "task_id=100\t" in failure_text
+    finally:
+        bot._state.close()
 
 
 def test_legacy_retry_removal_restores_entry_when_json_save_fails(tmp_path, monkeypatch):

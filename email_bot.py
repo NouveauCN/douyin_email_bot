@@ -160,6 +160,7 @@ class EmailBot:
         self._seen_ids: set[str] = set()  # dedup across poll cycles
         self._pending_retries: dict[str, dict] = {}
         self._pending_retry_lock = threading.RLock()
+        self._failure_file_lock = threading.Lock()
         self._legacy_cleanup_pending: set[str] = set()
         self._pending_retry_file = Path(config.bot.transient_pending_file)
         self._failed_links_file = Path(config.bot.transient_failed_file)
@@ -189,6 +190,7 @@ class EmailBot:
                 ),
                 before_execute=self._before_task_service_execute,
                 after_execute=self._after_task_service_execute,
+                on_execute_finished=self._after_task_service_finished,
             )
         elif state_db_path.exists():
             # A legacy rollback must not silently abandon Seen mail or pending
@@ -208,6 +210,7 @@ class EmailBot:
         self._cookie_lock = threading.Lock()
         self._sender_locks: dict[str, threading.Lock] = {}
         self._sender_locks_guard = threading.Lock()
+        self._held_sender_locks: dict[int, threading.Lock] = {}
         self._backup_cleanup = BackupCleanupScheduler(
             Path(config.douyin.download_path),
             retention_days=config.media_cleanup.backup_retention_days,
@@ -216,7 +219,7 @@ class EmailBot:
         self._load_pending_retries()
         if self._state is not None:
             self._migrate_legacy_retries()
-            self._cleanup_terminal_legacy_mirrors()
+            self._replay_terminal_failure_projections()
             self._retry_legacy_cleanup()
 
         # Runtime settings are watched in SQLite.  Do not reload .env here:
@@ -285,11 +288,42 @@ class EmailBot:
                     "the legacy retry file"
                 )
 
-    def _cleanup_terminal_legacy_mirrors(self) -> None:
+    def _replay_terminal_failure_projections(self) -> None:
+        """Replay terminal event projections before accepting new mail.
+
+        The event remains the durable source of truth. Replaying all known
+        terminal events repairs a crash between task completion and the
+        failure-file projection, including events consumed by an older bot
+        version. ``task_id`` makes the append idempotent.
+        """
         if self._state is None:
             return
-        for key in self._state.terminal_legacy_retry_keys():
-            self._remove_legacy_retry({"legacy_retry_key": key})
+        after_id = None
+        while True:
+            events = self._state.list_task_events(
+                limit=500,
+                include_consumed=True,
+                after_id=after_id,
+            )
+            if not events:
+                return
+            for event in events:
+                after_id = int(event["id"])
+                if str(event.get("event_type") or "") not in {
+                    "task.succeeded",
+                    "task.partially_succeeded",
+                    "task.failed",
+                }:
+                    continue
+                task = self._state.get_task_by_id(int(event["task_id"]))
+                consumed = self._state.task_event_consumed(int(event["id"]), "email")
+                if task is None or not self._project_terminal_failure(
+                    task, event, allow_legacy_unkeyed=consumed
+                ):
+                    logger.warning(
+                        "Could not replay terminal failure projection for event %s",
+                        event.get("id"),
+                    )
 
     def run(self) -> None:
         self._run_thread = threading.current_thread()
@@ -378,13 +412,14 @@ class EmailBot:
             self._runtime_threads.append(events)
             # The DownloadTaskService owns download workers.  SMTP and event
             # projection remain entry-specific and stay with EmailBot.
-            outbox = threading.Thread(
-                target=self._outbox_worker_loop,
-                name="mail-smtp-outbox",
-                daemon=True,
-            )
-            outbox.start()
-            self._runtime_threads.append(outbox)
+            if self._notifications_enabled():
+                outbox = threading.Thread(
+                    target=self._outbox_worker_loop,
+                    name="mail-smtp-outbox",
+                    daemon=True,
+                )
+                outbox.start()
+                self._runtime_threads.append(outbox)
             maintenance = threading.Thread(
                 target=self._maintenance_loop,
                 name="mail-maintenance",
@@ -403,13 +438,14 @@ class EmailBot:
             )
             thread.start()
             self._runtime_threads.append(thread)
-        outbox = threading.Thread(
-            target=self._outbox_worker_loop,
-            name="mail-smtp-outbox",
-            daemon=True,
-        )
-        outbox.start()
-        self._runtime_threads.append(outbox)
+        if self._notifications_enabled():
+            outbox = threading.Thread(
+                target=self._outbox_worker_loop,
+                name="mail-smtp-outbox",
+                daemon=True,
+            )
+            outbox.start()
+            self._runtime_threads.append(outbox)
         maintenance = threading.Thread(
             target=self._maintenance_loop,
             name="mail-maintenance",
@@ -482,6 +518,11 @@ class EmailBot:
         """Return intake state; tolerate lightweight test doubles/old callers."""
         gate = getattr(self, "_intake_enabled", None)
         return gate is None or gate.is_set()
+
+    def _notifications_enabled(self) -> bool:
+        """Return whether SMTP replies are enabled for this process."""
+        email_config = getattr(getattr(self, "config", None), "email", None)
+        return bool(getattr(email_config, "send_replies", True))
 
     def _handle_settings_revision(self, revision: int) -> None:
         current = self._settings.managed_values()
@@ -629,6 +670,7 @@ class EmailBot:
                     recovered = self._state.recover_expired()
                     if recovered["tasks"] or recovered["outbox"]:
                         logger.warning("Recovered expired mail leases: %s", recovered)
+                    self._replay_terminal_failure_projections()
                     self._retry_legacy_cleanup()
                 self._backup_cleanup.run_if_due()
                 if self._state is None:
@@ -660,6 +702,16 @@ class EmailBot:
                         "task.partially_succeeded",
                         "task.failed",
                     }:
+                        service.store.consume_event(int(event["id"]), consumer)
+                        continue
+                    if not self._project_terminal_failure(task, event):
+                        logger.warning("Could not project failure record for task %d", task_id)
+                        continue
+                    if not self._notifications_enabled():
+                        # Suppression acknowledges the terminal event without
+                        # creating an SMTP outbox item. Existing outbox rows
+                        # remain untouched and can be delivered after a
+                        # restart with notifications enabled.
                         service.store.consume_event(int(event["id"]), consumer)
                         continue
                     if self._state.task_has_outbox(task_id):
@@ -814,7 +866,7 @@ class EmailBot:
                         task_id,
                         token,
                         result={"notice": (task.get("payload") or {}).get("event")},
-                        notification=notification,
+                        notification=notification if self._notifications_enabled() else None,
                         outbox_event=(task.get("payload") or {}).get("event", "notice"),
                     )
                 else:
@@ -849,7 +901,7 @@ class EmailBot:
                     task_id,
                     token,
                     result=result,
-                    notification=payload,
+                    notification=payload if self._notifications_enabled() else None,
                 )
                 if completed is None:
                     logger.warning("Lost lease before completing task %d", task_id)
@@ -893,7 +945,7 @@ class EmailBot:
             return self._sender_locks.setdefault(sender, threading.Lock())
 
     def _before_task_service_execute(self, task) -> None:
-        """Apply the email adapter's sender cooldown before a download."""
+        """Hold a sender lock across cooldown check and the full download."""
         state = getattr(self, "_state", None)
         if state is None:
             return
@@ -903,11 +955,20 @@ class EmailBot:
             return
         with self._sender_locks_guard:
             lock = self._sender_locks.setdefault(sender, threading.Lock())
-        with lock:
+        lock.acquire()
+        try:
             cooldown = max(0, getattr(self.config.bot, "cooldown_seconds", 0))
             remaining = cooldown - (time.time() - self._cooldowns.get(sender, 0))
             if remaining > 0:
-                self._stop_event.wait(remaining)
+                getattr(self, "_stop_event", threading.Event()).wait(remaining)
+            with self._sender_locks_guard:
+                held = getattr(self, "_held_sender_locks", None)
+                if held is None:
+                    held = self._held_sender_locks = {}
+                held[task.task_id] = lock
+        except Exception:
+            lock.release()
+            raise
 
     def _after_task_service_execute(self, task, result) -> None:
         if result.success:
@@ -916,6 +977,59 @@ class EmailBot:
             sender = str(((row or {}).get("payload") or {}).get("sender") or "")
             if sender:
                 self._cooldowns[sender] = time.time()
+
+    def _after_task_service_finished(self, task) -> None:
+        """Release sender serialization even if the executor raises."""
+        with self._sender_locks_guard:
+            held = getattr(self, "_held_sender_locks", None)
+            lock = held.pop(task.task_id, None) if held is not None else None
+        if lock is not None:
+            lock.release()
+
+    def _project_terminal_failure(
+        self,
+        task: dict,
+        event: dict,
+        *,
+        allow_legacy_unkeyed: bool = False,
+    ) -> bool:
+        """Persist a terminal failure record before acknowledging its event."""
+        event_type = str(event.get("event_type") or "")
+        if event_type not in {"task.succeeded", "task.partially_succeeded", "task.failed"}:
+            return True
+        payload = task.get("payload") or {}
+        event_payload = event.get("payload") or {}
+        if not isinstance(event_payload, dict):
+            event_payload = {}
+        result = event_payload.get("result") or task.get("result") or {}
+        if not isinstance(result, dict):
+            result = {}
+        if event_type == "task.failed" or result.get("partial"):
+            if not payload.get("sender"):
+                return True
+            error = (
+                event_payload.get("error")
+                or task.get("last_error")
+                or result.get("error")
+                or "；".join(str(item) for item in result.get("failed_items") or [])
+                or "未知错误"
+            )
+            if not self._record_failed_link(
+                {
+                    "sender": payload.get("sender", ""),
+                    "platform": task.get("platform", ""),
+                    "attempts": task.get("attempts", ""),
+                    "url": task.get("original_url", ""),
+                },
+                error,
+                task_id=int(task["id"]),
+                allow_legacy_unkeyed=allow_legacy_unkeyed,
+            ):
+                return False
+        # A terminal durable event is the safe point to remove the mirrored
+        # legacy retry. If removal fails, maintenance retains the retry mirror.
+        self._remove_legacy_retry(payload)
+        return True
 
     def _complete_durable_failure(
         self,
@@ -939,7 +1053,24 @@ class EmailBot:
         else:
             body = f"下载失败：{error}{_download_failure_hint()}"
             subject_status = "下载失败"
-        self._record_failed_link(
+        failed = self._state.fail_task(
+            int(task["id"]),
+            token,
+            error,
+            notification=(
+                {
+                    "to_addr": sender,
+                    "body": body,
+                    "subject_status": subject_status,
+                }
+                if self._notifications_enabled()
+                else None
+            ),
+            outbox_event="partial-failed" if result and result.get("success") else "failed",
+        )
+        if failed is None:
+            return
+        recorded = self._record_failed_link(
             {
                 "sender": sender,
                 "platform": task.get("platform", ""),
@@ -947,19 +1078,9 @@ class EmailBot:
                 "url": task.get("original_url", ""),
             },
             error,
+            task_id=int(task["id"]),
         )
-        failed = self._state.fail_task(
-            int(task["id"]),
-            token,
-            error,
-            notification={
-                "to_addr": sender,
-                "body": body,
-                "subject_status": subject_status,
-            },
-            outbox_event="partial-failed" if result and result.get("success") else "failed",
-        )
-        if failed is not None:
+        if recorded:
             # The durable terminal failure and its notification are now safe;
             # remove the mirrored legacy retry so a later rollback cannot
             # execute the same link a second time.
@@ -981,6 +1102,9 @@ class EmailBot:
 
     def _outbox_worker_loop(self) -> None:
         assert self._state is not None
+        if not self._notifications_enabled():
+            logger.info("SMTP outbox worker disabled by EMAIL_SEND_REPLIES")
+            return
         while not self._stop_event.is_set():
             try:
                 with self._claim_gate:
@@ -1810,22 +1934,72 @@ class EmailBot:
                 url,
             )
 
-    def _record_failed_link(self, item: dict, error_msg: str) -> None:
-        try:
-            self._failed_links_file.parent.mkdir(parents=True, exist_ok=True)
-            line = (
-                f"{_now_iso()}\t"
-                f"sender={item.get('sender', '')}\t"
-                f"platform={item.get('platform', '')}\t"
-                f"attempts={item.get('attempts', '')}\t"
-                f"url={item.get('url', '')}\t"
-                f"error={error_msg.replace(chr(9), ' ')}\n"
-            )
-            with self._failed_links_file.open("a", encoding="utf-8") as f:
-                f.write(line)
-            logger.info("Recorded failed link: %s", item.get("url", ""))
-        except OSError as exc:
-            logger.error("Failed to record failed link in %s: %s", self._failed_links_file, exc)
+    def _record_failed_link(
+        self,
+        item: dict,
+        error_msg: str,
+        *,
+        task_id: int | None = None,
+        allow_legacy_unkeyed: bool = False,
+    ) -> bool:
+        with self._failure_file_lock:
+            try:
+                self._failed_links_file.parent.mkdir(parents=True, exist_ok=True)
+                if task_id is not None and self._failed_links_file.exists():
+                    failure_text = self._failed_links_file.read_text(encoding="utf-8")
+                    marker = f"task_id={task_id}\t"
+                    if marker in failure_text:
+                        return True
+                    # Pre-task-id versions wrote unkeyed rows before the
+                    # durable terminal commit. An exact match is treated as
+                    # the already-projected row during replay, preventing a
+                    # one-time upgrade duplicate when the old projection did
+                    # succeed. New rows remain keyed by task_id.
+                    if allow_legacy_unkeyed and self._has_unkeyed_failure_match(
+                        failure_text, item, error_msg
+                    ):
+                        logger.info(
+                            "Reusing legacy failure record for task %d: %s",
+                            task_id,
+                            item.get("url", ""),
+                        )
+                        return True
+                line = (
+                    f"{_now_iso()}\t"
+                    f"task_id={task_id if task_id is not None else ''}\t"
+                    f"sender={item.get('sender', '')}\t"
+                    f"platform={item.get('platform', '')}\t"
+                    f"attempts={item.get('attempts', '')}\t"
+                    f"url={item.get('url', '')}\t"
+                    f"error={error_msg.replace(chr(9), ' ')}\n"
+                )
+                with self._failed_links_file.open("a", encoding="utf-8") as f:
+                    f.write(line)
+                logger.info("Recorded failed link: %s", item.get("url", ""))
+                return True
+            except (OSError, UnicodeError) as exc:
+                logger.error("Failed to record failed link in %s: %s", self._failed_links_file, exc)
+                return False
+
+    @staticmethod
+    def _has_unkeyed_failure_match(text: str, item: dict, error_msg: str) -> bool:
+        expected = {
+            "sender": str(item.get("sender", "")),
+            "platform": str(item.get("platform", "")),
+            "url": str(item.get("url", "")),
+            "error": str(error_msg).replace(chr(9), " "),
+        }
+        for line in text.splitlines():
+            fields: dict[str, str] = {}
+            for field in line.split("\t")[1:]:
+                key, separator, value = field.partition("=")
+                if separator:
+                    fields[key] = value
+            if fields.get("task_id") in {None, ""} and all(
+                fields.get(key) == value for key, value in expected.items()
+            ):
+                return True
+        return False
 
     def _download_url(self, url: str) -> dict:
         """Dispatch a supported URL to the correct downloader."""
@@ -1895,6 +2069,9 @@ class EmailBot:
         subject_status: str = "通知",
         message_id: str | None = None,
     ) -> None:
+        if not getattr(cfg, "send_replies", True):
+            logger.info("SMTP reply suppressed for %s", to_addr)
+            return
         msg = MIMEText(body, "plain", "utf-8")
         msg["From"] = cfg.email
         msg["To"] = to_addr
