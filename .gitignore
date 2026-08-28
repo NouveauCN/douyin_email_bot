@@ -13,4 +13,5 @@ state/
 douyin_users.db
 pending_retries.json
 failed_links.txt
+.codegraph/
 short_link_cache.json
