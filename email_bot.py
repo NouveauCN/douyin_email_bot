@@ -786,11 +786,18 @@ class EmailBot:
                 return
             position = self._state.get_mailbox_position(mailbox)
             reset = position is None or position["uidvalidity"] != uidvalidity
-            start_uid = 1 if reset else int(position["last_uid"]) + 1
+            baseline_uid = None
             if reset:
-                # Establish the new UID epoch even when the mailbox is empty;
-                # otherwise every empty reconciliation would repeat the reset.
-                self._state.set_mailbox_position(mailbox, uidvalidity, 0)
+                # A reset must establish a baseline without routing historical
+                # Seen mail.  Keep it provisional until every candidate has
+                # been fetched and durably routed below.
+                status, data = mail.uid("search", None, "ALL")
+                if status != "OK":
+                    logger.warning("IMAP UID SEARCH failed for ALL during reset")
+                    return
+                baseline_uid = self._max_uid_search_result(data)
+            else:
+                start_uid = int(position["last_uid"]) + 1
 
             # Re-acknowledge messages whose intake commit succeeded but whose
             # IMAP STORE failed in a previous cycle.
@@ -804,9 +811,11 @@ class EmailBot:
                 for item in self._state.pending_intake(mailbox, uidvalidity)
             )
             # Reconcile the durable high-water mark and still honor the
-            # service's normal UNSEEN poll contract. The union also catches a
-            # message whose Seen flag was changed outside this bot.
-            for criteria in (f"UID {start_uid}:*", "UNSEEN"):
+            # service's normal UNSEEN poll contract. During a reset, ALL is
+            # only the baseline above; UNSEEN is the sole search that adds
+            # candidates, so historical Seen mail is never fetched.
+            criteria_list = ["UNSEEN"] if reset else [f"UID {start_uid}:*", "UNSEEN"]
+            for criteria in criteria_list:
                 status, data = mail.uid("search", None, criteria)
                 if status != "OK":
                     logger.warning("IMAP UID SEARCH failed for %s", criteria)
@@ -820,10 +829,11 @@ class EmailBot:
                     # range such as ``UID 1000:*``. Never let that regress
                     # the durable high-water mark; UNSEEN remains independent
                     # and still catches historical flag changes.
-                    if criteria.startswith("UID ") and parsed_uid < start_uid:
+                    if not reset and criteria.startswith("UID ") and parsed_uid < start_uid:
                         continue
                     uids.add(parsed_uid)
             uids = sorted(uids)
+            reconciliation_ok = True
             for uid in uids:
                 fetched = self._imap_fetch_uid(mail, uid)
                 if fetched is None:
@@ -831,12 +841,26 @@ class EmailBot:
                     # reconciliation will retry it instead of silently
                     # skipping a message.
                     logger.warning("Could not fetch IMAP UID %d; stopping reconciliation", uid)
+                    reconciliation_ok = False
                     break
                 source_id = f"{mailbox}:{uidvalidity}:{uid}"
                 try:
-                    accepted = self._durably_accept_email(
-                        mail, mailbox, uidvalidity, uid, source_id, fetched, cfg, bot_cfg
+                    accepted, routing_failed = self._durably_accept_email(
+                        mail,
+                        mailbox,
+                        uidvalidity,
+                        uid,
+                        source_id,
+                        fetched,
+                        cfg,
+                        bot_cfg,
+                        advance_position=not reset,
                     )
+                    if routing_failed:
+                        # Parsing/routing failures are quarantined by the
+                        # intake helper, but still invalidate a provisional
+                        # reset baseline.
+                        reconciliation_ok = False
                 except Exception as exc:
                     logger.exception(
                         "Durable routing failed for UID %d; quarantining message",
@@ -850,11 +874,32 @@ class EmailBot:
                         source_id,
                         fetched,
                         exc,
+                        advance_position=not reset,
                     )
+                    # Quarantine isolates one malformed message, but a reset
+                    # must not claim its baseline after any routing exception.
+                    reconciliation_ok = False
                 if not accepted:
+                    reconciliation_ok = False
                     break
+            if reset and reconciliation_ok:
+                assert baseline_uid is not None
+                self._state.set_mailbox_position(mailbox, uidvalidity, baseline_uid)
         finally:
             self._safe_logout(mail)
+
+    @staticmethod
+    def _max_uid_search_result(data) -> int:
+        """Return the largest valid UID from an IMAP UID SEARCH response."""
+        if not data:
+            return 0
+        value = data[0] if isinstance(data, (list, tuple)) else data
+        if isinstance(value, bytes):
+            value = value.decode("ascii", "ignore")
+        if not isinstance(value, str):
+            return 0
+        uids = [int(item) for item in value.split() if item.isdigit()]
+        return max(uids, default=0)
 
     @staticmethod
     def _imap_uidvalidity(mail) -> int | None:
@@ -911,7 +956,9 @@ class EmailBot:
         raw: bytes,
         cfg,
         bot_cfg,
-    ) -> bool:
+        *,
+        advance_position: bool = True,
+    ) -> tuple[bool, bool]:
         """Commit source identity and route work before attempting IMAP STORE."""
         assert self._state is not None
         raw_sha256 = hashlib.sha256(raw).hexdigest()
@@ -981,10 +1028,11 @@ class EmailBot:
                 if routing_error
                 else {**metadata, "platform": platform},
                 platform=platform,
+                advance_position=advance_position,
             )
         except Exception:
             logger.exception("Durable intake failed for UID %d", uid)
-            return False
+            return False, bool(routing_error)
 
         routing_pending = not accepted["intake_complete"]
         if accepted["duplicate"]:
@@ -1009,17 +1057,17 @@ class EmailBot:
             try:
                 if not self._state.mark_intake_complete(source_id):
                     logger.warning("Could not finalize durable intake for UID %d", uid)
-                    return False
+                    return False, bool(routing_error)
             except Exception:
                 logger.exception("Could not finalize durable intake for UID %d", uid)
-                return False
+                return False, bool(routing_error)
 
         try:
             if _mark_seen_uid(mail, uid):
                 self._state.ack_message(source_id)
         except Exception:
             logger.warning("Durable intake committed but IMAP \\Seen ACK failed for UID %d", uid)
-        return True
+        return True, bool(routing_error)
 
     def _quarantine_durable_email(
         self,
@@ -1030,6 +1078,8 @@ class EmailBot:
         source_id: str,
         raw: bytes,
         error: BaseException,
+        *,
+        advance_position: bool = True,
     ) -> bool:
         """Persist safe error metadata, acknowledge, and isolate one mail."""
         assert self._state is not None
@@ -1047,6 +1097,7 @@ class EmailBot:
                 source_id,
                 [],
                 metadata=metadata,
+                advance_position=advance_position,
             )
             if not self._state.replace_source_metadata(source_id, metadata):
                 logger.error("Could not persist quarantine metadata for UID %d", uid)

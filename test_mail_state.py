@@ -281,6 +281,23 @@ def test_duplicate_intake_and_urls_are_idempotent(tmp_path):
     store.close()
 
 
+def test_accept_message_can_persist_without_advancing_mailbox_position(tmp_path):
+    store = make_store(tmp_path)
+    accepted = store.accept_message(
+        "INBOX",
+        77,
+        12,
+        "INBOX:77:12",
+        ["https://example.test/post"],
+        advance_position=False,
+    )
+
+    assert accepted["position"] is None
+    assert store.get_mailbox_position("INBOX") is None
+    assert store.pending_intake("INBOX", 77)[0]["uid"] == 12
+    store.close()
+
+
 def test_source_metadata_can_be_replaced_for_quarantine(tmp_path):
     store = make_store(tmp_path)
     store.accept_message(

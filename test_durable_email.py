@@ -77,6 +77,45 @@ class MultiUidImap(FakeImap):
         raise AssertionError(command)
 
 
+class ResetAwareImap(MultiUidImap):
+    def __init__(self, raws, *, uidvalidity=77, all_uids=(), unseen_uids=(), fail_uids=()):
+        super().__init__(raws)
+        self.uidvalidity = uidvalidity
+        self.all_uids = list(all_uids)
+        self.unseen_uids = list(unseen_uids)
+        self.fail_uids = set(fail_uids)
+        self.searches = []
+        self.fetches = []
+
+    def response(self, _name):
+        return "OK", [str(self.uidvalidity).encode()]
+
+    def uid(self, command, *args):
+        if command == "search":
+            criteria = args[1]
+            self.searches.append(criteria)
+            if criteria == "ALL":
+                uids = self.all_uids
+            elif criteria == "UNSEEN":
+                uids = self.unseen_uids
+            else:
+                start = int(criteria.split()[1].split(":", 1)[0])
+                uids = [uid for uid in self.raws if uid >= start]
+            return "OK", [" ".join(str(uid) for uid in uids).encode()]
+        if command == "fetch":
+            uid = int(args[0])
+            self.fetches.append(uid)
+            if uid in self.fail_uids:
+                return "NO", []
+            return "OK", [
+                (f"{uid} (UID {uid} BODY[] {{0}})".encode(), self.raws[uid])
+            ]
+        if command == "store":
+            self.stored.append((args[0], args[2]))
+            return "OK", [b"1"]
+        raise AssertionError(command)
+
+
 class LegacyImap(FakeImap):
     def fetch(self, _msg_id, _query):
         return "OK", [(b"9 (RFC822 {0})", self.raw)]
@@ -229,6 +268,90 @@ def test_durable_email_skips_body_link_without_subject_keyword(tmp_path):
 
     assert bot._state._conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
     assert bot._state._conn.execute("SELECT COUNT(*) FROM smtp_outbox").fetchone()[0] == 0
+    bot._state.close()
+
+
+def test_reset_baseline_does_not_fetch_historical_seen_mail(tmp_path):
+    bot = make_bot(tmp_path)
+    mail = ResetAwareImap(
+        {1: make_raw_mail(message_id="<seen@example.test>"), 2: make_raw_mail()},
+        all_uids=[1, 2],
+        unseen_uids=[2],
+    )
+    bot._imap_connect = lambda _cfg: mail
+
+    bot._poll_once_durable(bot.config.email, bot.config.bot)
+
+    assert mail.searches == ["ALL", "UNSEEN"]
+    assert mail.fetches == [2]
+    assert bot._state.get_mailbox_position("INBOX")["last_uid"] == 2
+    bot._state.close()
+
+
+def test_uidvalidity_reset_routes_only_unseen_mail(tmp_path):
+    bot = make_bot(tmp_path)
+    bot._state.set_mailbox_position("INBOX", 76, 99)
+    mail = ResetAwareImap(
+        {1: make_raw_mail(message_id="<old-generation@example.test>"), 2: make_raw_mail()},
+        uidvalidity=77,
+        all_uids=[1, 2],
+        unseen_uids=[2],
+    )
+    bot._imap_connect = lambda _cfg: mail
+
+    bot._poll_once_durable(bot.config.email, bot.config.bot)
+
+    assert mail.fetches == [2]
+    position = bot._state.get_mailbox_position("INBOX")
+    assert position["uidvalidity"] == 77
+    assert position["last_uid"] == 2
+    assert position["generation"] == 2
+    bot._state.close()
+
+
+def test_reset_with_all_seen_mail_only_commits_baseline(tmp_path):
+    bot = make_bot(tmp_path)
+    mail = ResetAwareImap(
+        {1: make_raw_mail(message_id="<seen-one@example.test>"), 2: make_raw_mail(message_id="<seen-two@example.test>")},
+        all_uids=[1, 2],
+        unseen_uids=[],
+    )
+    bot._imap_connect = lambda _cfg: mail
+
+    bot._poll_once_durable(bot.config.email, bot.config.bot)
+
+    assert mail.fetches == []
+    assert bot._state.get_mailbox_position("INBOX")["last_uid"] == 2
+    assert bot._state._conn.execute("SELECT COUNT(*) FROM source_messages").fetchone()[0] == 0
+    bot._state.close()
+
+
+def test_reset_candidate_fetch_failure_does_not_commit_baseline(tmp_path):
+    bot = make_bot(tmp_path)
+    mail = ResetAwareImap(
+        {2: make_raw_mail()}, all_uids=[2], unseen_uids=[2], fail_uids=[2]
+    )
+    bot._imap_connect = lambda _cfg: mail
+
+    bot._poll_once_durable(bot.config.email, bot.config.bot)
+
+    assert mail.fetches == [2]
+    assert bot._state.get_mailbox_position("INBOX") is None
+    bot._state.close()
+
+
+def test_mail_arriving_after_reset_unseen_is_caught_by_next_uid_range(tmp_path):
+    bot = make_bot(tmp_path)
+    mail = ResetAwareImap({1: make_raw_mail(), 2: make_raw_mail()}, all_uids=[1], unseen_uids=[])
+    bot._imap_connect = lambda _cfg: mail
+
+    bot._poll_once_durable(bot.config.email, bot.config.bot)
+    mail.all_uids = [1, 2]
+    bot._poll_once_durable(bot.config.email, bot.config.bot)
+
+    assert mail.fetches == [2]
+    assert mail.searches == ["ALL", "UNSEEN", "UID 2:*", "UNSEEN"]
+    assert bot._state.get_mailbox_position("INBOX")["last_uid"] == 2
     bot._state.close()
 
 

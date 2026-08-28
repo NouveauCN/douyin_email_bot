@@ -629,6 +629,7 @@ class MailStateStore:
         *,
         metadata: dict[str, Any] | None = None,
         platform: str | None = None,
+        advance_position: bool = True,
         now: float | None = None,
     ) -> dict[str, Any]:
         """Durably accept one source and create URL tasks idempotently.
@@ -653,7 +654,8 @@ class MailStateStore:
 
         with self._lock, self._transaction():
             self._ensure_open()
-            self._set_mailbox_position_locked(mailbox, uidvalidity, uid, timestamp)
+            if advance_position:
+                self._set_mailbox_position_locked(mailbox, uidvalidity, uid, timestamp)
             existing = self._conn.execute(
                 "SELECT source_message_id FROM source_messages WHERE source_message_id = ?",
                 (source_message_id,),
