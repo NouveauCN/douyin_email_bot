@@ -14,8 +14,10 @@ import math
 import os
 import re
 import smtplib
+import sqlite3
 import threading
 import time
+import uuid
 from datetime import datetime
 from email.header import decode_header
 from email.mime.text import MIMEText
@@ -27,6 +29,7 @@ from colorama import Fore, Style
 from douyin_downloader import DouyinDownloader
 from mail_state import MailStateStore
 from migrate_mail_state import import_pending_retries
+from settings_store import SettingsStore, default_database_path
 from url_extractor import UrlExtractor, detect_platform
 
 logger = logging.getLogger("EmailBot")
@@ -90,13 +93,41 @@ class EmailBot:
     Also handles cookie management commands.
     """
 
-    def __init__(self, config):
+    def __init__(self, config, *, settings_store=None, restart_timeout_seconds=None, exit_fn=None):
         self.config = config
         self.downloader = DouyinDownloader(config.douyin)
         self.bilibili_downloader = BilibiliDownloader(config.bilibili)
         self.extractor = UrlExtractor()
         self._cooldowns: dict[str, float] = {}
         self._project_dir = Path(__file__).parent
+        # Settings are shared with the browser process.  Keep this separate
+        # from MailStateStore: the latter must remain open while workers drain.
+        self._settings = settings_store or SettingsStore(
+            default_database_path(self._project_dir / "config.yaml")
+        )
+        self._boot_id = uuid.uuid4().hex
+        self._settings_revision = self._settings.get_revision()
+        self._managed_settings = self._settings.managed_values()
+        self._lifecycle_thread: threading.Thread | None = None
+        self._lifecycle_stop = threading.Event()
+        self._run_thread: threading.Thread | None = None
+        self._run_finished = threading.Event()
+        self._intake_enabled = threading.Event()
+        self._intake_enabled.set()
+        self._claim_gate = threading.Lock()
+        self._imap_lock = threading.Lock()
+        self._imap_connection = None
+        self._active_lock = threading.Lock()
+        self._active_tasks = 0
+        self._active_outbox = 0
+        self._restart_id: str | None = None
+        self._restart_started_at: float | None = None
+        self._restart_timeout = float(
+            restart_timeout_seconds
+            if restart_timeout_seconds is not None
+            else os.getenv("BOT_RESTART_DRAIN_TIMEOUT", "300")
+        )
+        self._exit_fn = exit_fn or os._exit
         self._seen_ids: set[str] = set()  # dedup across poll cycles
         self._pending_retries: dict[str, dict] = {}
         self._pending_retry_lock = threading.RLock()
@@ -142,15 +173,10 @@ class EmailBot:
             self._cleanup_terminal_legacy_mirrors()
             self._retry_legacy_cleanup()
 
-        # Optional .env auto-reload (for Docker: web_login writes cookie → bot picks it up)
-        self._env_path = self._project_dir / ".env"
-        self._env_watch = os.getenv("ENV_AUTO_RELOAD", "").lower() in ("1", "true", "yes")
-        if self._env_watch:
-            try:
-                self._env_mtime: float = self._env_path.stat().st_mtime if self._env_path.exists() else 0.0
-            except OSError:
-                self._env_mtime = 0.0
-            logger.debug(".env auto-reload enabled")
+        # Runtime settings are watched in SQLite.  Do not reload .env here:
+        # it is a lower-priority startup source and must never override the
+        # managed settings registry in a running process.
+        self._env_watch = False
 
     @staticmethod
     def _assert_legacy_rollback_safe(
@@ -219,6 +245,8 @@ class EmailBot:
             self._remove_legacy_retry({"legacy_retry_key": key})
 
     def run(self) -> None:
+        self._run_thread = threading.current_thread()
+        self._run_finished.clear()
         cfg = self.config.email
         bot_cfg = self.config.bot
 
@@ -229,7 +257,9 @@ class EmailBot:
         )
 
         self._backup_cleanup.run_if_due()
+        self._mark_startup()
         self._start_runtime()
+        self._start_lifecycle_watcher()
         try:
             while not self._stop_event.is_set():
                 try:
@@ -247,15 +277,40 @@ class EmailBot:
                 self._stop_event.wait(cfg.poll_interval)
         finally:
             self.shutdown()
+            self._run_finished.set()
 
     def shutdown(self) -> None:
         """Stop intake and let bounded runtime threads finish their current work."""
         self._stop_event.set()
+        restart_pending = getattr(self, "_restart_id", None) is not None
+        current = threading.current_thread()
         for thread in self._runtime_threads:
-            thread.join(timeout=10)
+            if thread is not current:
+                thread.join(timeout=30)
         self._runtime_threads.clear()
+        lifecycle_stop = getattr(self, "_lifecycle_stop", None)
         if self._state is not None:
-            self._state.close()
+            # Never close SQLite underneath an active worker.  Normal restart
+            # drains before this point; a manual stop leaves the process to
+            # close the connection during interpreter teardown if necessary.
+            with self._active_lock:
+                active = self._active_tasks + self._active_outbox
+            if active == 0:
+                self._state.close()
+            else:
+                logger.error("Leaving mail state open because %d worker(s) remain active", active)
+        else:
+            active = 0
+        # During a restart, the lifecycle watcher is the sole writer of
+        # restart status and remains alive until it observes the run thread
+        # exit (or enforces the drain deadline). A manual shutdown can stop it
+        # immediately.
+        if lifecycle_stop is not None and not restart_pending:
+            lifecycle_stop.set()
+        if self._lifecycle_thread is not None and self._lifecycle_thread is not current:
+            if not restart_pending:
+                self._lifecycle_thread.join(timeout=5)
+                self._lifecycle_thread = None
 
     def _start_runtime(self) -> None:
         if self._state is None or self._runtime_threads:
@@ -284,6 +339,205 @@ class EmailBot:
         )
         maintenance.start()
         self._runtime_threads.append(maintenance)
+
+    def _start_lifecycle_watcher(self) -> None:
+        if self._lifecycle_thread is not None:
+            return
+        lifecycle_stop = getattr(self, "_lifecycle_stop", None)
+        if lifecycle_stop is not None:
+            lifecycle_stop.clear()
+        self._lifecycle_thread = threading.Thread(
+            target=self._lifecycle_loop, name="bot-settings-watcher", daemon=False
+        )
+        self._lifecycle_thread.start()
+
+    def _mark_startup(self) -> None:
+        """Record this boot and complete a request interrupted by a restart."""
+        revision = self._settings.get_revision()
+        try:
+            self._settings.heartbeat(
+                "bot", boot_id=self._boot_id, revision=revision, status="ok"
+            )
+            # A previous process marks its request restarting immediately
+            # before exit.  This UPDATE is idempotent and intentionally done
+            # through the shared DB so no stale request remains visible.
+            with sqlite3.connect(self._settings.path, timeout=10) as db:
+                db.execute(
+                    "UPDATE restart_requests SET status='applied', updated_at=?, error=NULL "
+                    "WHERE status IN ('restarting', 'forcing') AND revision <= ?",
+                    (time.time(), revision),
+                )
+        except Exception:
+            logger.exception("Could not record bot startup lifecycle state")
+        self._settings_revision = revision
+        self._managed_settings = self._settings.managed_values()
+
+    def _lifecycle_loop(self) -> None:
+        """Watch managed settings and coordinate a safe Docker restart."""
+        stop = getattr(self, "_lifecycle_stop", self._stop_event)
+        while not stop.wait(1.0):
+            try:
+                revision = self._settings.get_revision()
+                self._settings.heartbeat(
+                    "bot",
+                    boot_id=self._boot_id,
+                    revision=revision,
+                    status="draining" if self._restart_id else "ok",
+                    detail=self._lifecycle_detail(),
+                )
+                if self._restart_id:
+                    self._finish_restart_if_ready()
+                    continue
+                if revision != self._settings_revision:
+                    self._handle_settings_revision(revision)
+                request = self._claim_restart_request(revision)
+                if request:
+                    self._begin_restart(str(request["request_id"]), int(request["revision"]))
+            except Exception:
+                logger.exception("Settings lifecycle watcher failed")
+
+    def _lifecycle_detail(self) -> str:
+        with self._active_lock:
+            return f"active_tasks={self._active_tasks},active_outbox={self._active_outbox}"
+
+    def _intake_is_enabled(self) -> bool:
+        """Return intake state; tolerate lightweight test doubles/old callers."""
+        gate = getattr(self, "_intake_enabled", None)
+        return gate is None or gate.is_set()
+
+    def _handle_settings_revision(self, revision: int) -> None:
+        current = self._settings.managed_values()
+        changed = set(current) | set(self._managed_settings)
+        changed = {key for key in changed if current.get(key) != self._managed_settings.get(key)}
+        self._managed_settings = current
+        self._settings_revision = revision
+        if changed and changed <= {"douyin.cookie"}:
+            # Resolve the complete effective config so reset (which removes
+            # the managed override) follows the same legacy env/YAML/default
+            # precedence as startup.  A managed clear remains an explicit
+            # empty cookie rather than falling through to an older source.
+            from config_loader import load_config
+
+            effective = load_config(self._project_dir / "config.yaml")
+            self._hot_reload_cookie(effective.douyin.cookie)
+            return
+        if changed:
+            logger.info("Managed settings changed (%s); waiting for restart request", ", ".join(sorted(changed)))
+
+    def _hot_reload_cookie(self, value) -> None:
+        cookie = "" if value is None else str(value)
+        with self._cookie_lock:
+            self.downloader.config.cookie = cookie
+        logger.info("Hot-reloaded DOUYIN_COOKIE (%d chars)", len(cookie))
+
+    def _claim_restart_request(self, revision: int) -> dict | None:
+        """Atomically claim one queued request, avoiding duplicate drains."""
+        claim = getattr(self._settings, "claim_queued_restart", None)
+        if callable(claim):
+            request = claim()
+            if not request:
+                return None
+            if isinstance(request, str):
+                return {"request_id": request, "revision": revision}
+            return dict(request)
+        # Compatibility fallback for the initial settings-store schema. The
+        # production store exposes claim_queued_restart(), but keeping this
+        # small fallback makes older checkouts fail safe during an upgrade.
+        with sqlite3.connect(self._settings.path, timeout=10) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM restart_requests WHERE status='queued' "
+                "ORDER BY created_at, request_id LIMIT 1"
+            ).fetchone()
+            if row is None:
+                db.commit()
+                return None
+            now = time.time()
+            changed = db.execute(
+                "UPDATE restart_requests SET status='draining',updated_at=? "
+                "WHERE request_id=? AND status='queued'",
+                (now, row["request_id"]),
+            ).rowcount
+            db.commit()
+            return dict(row) if changed else None
+
+    def _begin_restart(self, request_id: str, revision: int) -> None:
+        self._restart_id = request_id
+        self._restart_started_at = time.monotonic()
+        # Serialize the gate with worker claims. Once cleared, no worker can
+        # claim another task/outbox item after this point.
+        with self._claim_gate:
+            self._intake_enabled.clear()
+        # Persist the draining transition before stopping the polling loop.
+        # This makes an orderly shutdown distinguishable from a process that
+        # disappeared before it began draining.
+        self._update_restart(request_id, "draining", active_count=self._active_count())
+        # Stop the polling loop after its current IMAP operation and close the
+        # socket immediately if it is blocked in a read.  The lifecycle
+        # watcher has its own stop event and continues enforcing the deadline.
+        self._stop_event.set()
+        self._close_active_imap()
+        logger.info("Draining mail workers for settings restart %s (revision %d)", request_id, revision)
+
+    def _finish_restart_if_ready(self) -> None:
+        with self._active_lock:
+            active = self._active_tasks + self._active_outbox
+        started = self._restart_started_at or time.monotonic()
+        elapsed = time.monotonic() - started
+        run_thread = getattr(self, "_run_thread", None)
+        run_finished_event = getattr(self, "_run_finished", None)
+        if run_finished_event is not None:
+            run_exited = run_finished_event.is_set()
+        else:
+            # Lightweight callers from before lifecycle tracking have no
+            # completion event; a missing run thread means there is nothing
+            # left to wait for.
+            run_exited = run_thread is None or not run_thread.is_alive()
+        run_alive = not run_exited
+        if (active or run_alive) and elapsed < self._restart_timeout:
+            return
+        if active or run_alive:
+            self._update_restart(
+                self._restart_id,
+                "forcing",
+                "drain timeout",
+                active_count=active,
+                detail=(self._lifecycle_detail() + ",run_thread=alive") if run_alive else self._lifecycle_detail(),
+            )
+            logger.error(
+                "Restart drain timed out with %d active worker(s), run_thread_alive=%s; forcing exit",
+                active,
+                run_alive,
+            )
+            self._exit_fn(75)
+            return
+        # The lifecycle watcher is the sole owner of finalization. Closing is
+        # idempotent in MailStateStore, so this is safe even if shutdown
+        # already closed an idle state connection after its worker joins
+        # timed out.
+        state = getattr(self, "_state", None)
+        if state is not None:
+            state.close()
+        self._update_restart(
+            self._restart_id, "restarting", active_count=0, detail="drained"
+        )
+        self._settings.heartbeat("bot", boot_id=self._boot_id, status="restarting", detail="drained")
+        self._stop_event.set()
+        lifecycle_stop = getattr(self, "_lifecycle_stop", None)
+        if lifecycle_stop is not None:
+            lifecycle_stop.set()
+
+    def _active_count(self) -> int:
+        with self._active_lock:
+            return self._active_tasks + self._active_outbox
+
+    def _update_restart(self, request_id: str, status: str, error=None, **details) -> None:
+        """Call the richer lifecycle API while tolerating an old store."""
+        try:
+            self._settings.update_restart(request_id, status, error, **details)
+        except TypeError:
+            self._settings.update_restart(request_id, status, error)
 
     def _maintenance_loop(self) -> None:
         """Recover leases and run retries/cleanup independently of IMAP intake."""
@@ -318,16 +572,30 @@ class EmailBot:
         assert self._state is not None
         while not self._stop_event.is_set():
             try:
-                tasks = self._state.claim_tasks(
-                    1,
-                    lease_seconds=getattr(self.config.bot, "lease_seconds", 300),
-                    worker_id=worker_id,
-                )
+                with self._claim_gate:
+                    if not self._intake_is_enabled():
+                        return
+                    tasks = self._state.claim_tasks(
+                        1,
+                        lease_seconds=getattr(self.config.bot, "lease_seconds", 300),
+                        worker_id=worker_id,
+                    )
+                    # Count a claimed lease while still holding the claim
+                    # gate.  Restart drain clears this gate, so it must not
+                    # observe a claimed task as idle in the hand-off window
+                    # before the worker starts processing it.
+                    if tasks:
+                        with self._active_lock:
+                            self._active_tasks += len(tasks)
                 if not tasks:
                     self._stop_event.wait(0.5)
                     continue
                 for task in tasks:
-                    self._process_durable_task(task)
+                    try:
+                        self._process_durable_task(task)
+                    finally:
+                        with self._active_lock:
+                            self._active_tasks -= 1
             except Exception:
                 logger.exception("Durable download worker %s failed", worker_id)
                 self._stop_event.wait(1)
@@ -500,15 +768,12 @@ class EmailBot:
                     ),
                     "subject_status": "Cookie 不完整",
                 }, safe_payload
-            if not _write_env(self._project_dir / ".env", "DOUYIN_COOKIE", body):
+            if not self._save_cookie(body):
                 return {
                     "to_addr": sender,
-                    "body": "写入 .env 文件失败，请检查文件权限。",
+                    "body": "保存 Cookie 失败，请检查设置存储权限或环境变量覆盖。",
                     "subject_status": "Cookie 写入失败",
                 }, safe_payload
-            with self._cookie_lock:
-                self.downloader.config.cookie = body
-                os.environ["DOUYIN_COOKIE"] = body
             return {
                 "to_addr": sender,
                 "body": f"Cookie 已更新！（{len(body)} 字符）\n有效期通常 24-48 小时，过期后请重新发送。",
@@ -522,9 +787,7 @@ class EmailBot:
                     headless=self.config.cookie_extractor.headless,
                     validate=self.config.cookie_extractor.validate,
                 )
-                if cookie and _write_env(self._project_dir / ".env", "DOUYIN_COOKIE", cookie):
-                    self.downloader.config.cookie = cookie
-                    os.environ["DOUYIN_COOKIE"] = cookie
+                if cookie and self._save_cookie(cookie):
                     return {
                         "to_addr": sender,
                         "body": f"Cookie 已自动获取并更新！（{len(cookie)} 字符）\n来源：{status}",
@@ -619,9 +882,8 @@ class EmailBot:
             if not refreshed_cookie or refreshed_cookie == self.downloader.config.cookie:
                 return first_result
             old_length = len(self.downloader.config.cookie)
-            self.downloader.config.cookie = refreshed_cookie
-            os.environ["DOUYIN_COOKIE"] = refreshed_cookie
-            _write_env(self._project_dir / ".env", "DOUYIN_COOKIE", refreshed_cookie)
+            if not self._save_cookie(refreshed_cookie):
+                return first_result
             logger.info(
                 "Cookie refreshed (%d chars -> %d chars; %s), retrying durable task",
                 old_length,
@@ -634,16 +896,29 @@ class EmailBot:
         assert self._state is not None
         while not self._stop_event.is_set():
             try:
-                items = self._state.claim_outbox(
-                    1,
-                    lease_seconds=getattr(self.config.bot, "lease_seconds", 300),
-                    worker_id="smtp-outbox",
-                )
+                with self._claim_gate:
+                    if not self._intake_is_enabled():
+                        return
+                    items = self._state.claim_outbox(
+                        1,
+                        lease_seconds=getattr(self.config.bot, "lease_seconds", 300),
+                        worker_id="smtp-outbox",
+                    )
+                    # See the task worker above: restart drain must account
+                    # for every claimed outbox lease before releasing the
+                    # claim gate.
+                    if items:
+                        with self._active_lock:
+                            self._active_outbox += len(items)
                 if not items:
                     self._stop_event.wait(0.5)
                     continue
                 for item in items:
-                    self._deliver_outbox(item)
+                    try:
+                        self._deliver_outbox(item)
+                    finally:
+                        with self._active_lock:
+                            self._active_outbox -= 1
             except Exception:
                 logger.exception("SMTP outbox worker failed")
                 self._stop_event.wait(1)
@@ -727,29 +1002,12 @@ class EmailBot:
     # ── Poll cycle ────────────────────────────────────────────────
 
     def _check_env_reload(self) -> None:
-        """If .env was modified externally (e.g. by web_login), hot-reload cookie."""
-        if not self._env_watch:
-            return
-        try:
-            mtime = self._env_path.stat().st_mtime
-        except OSError:
-            return
-        if mtime <= self._env_mtime:
-            return
-        self._env_mtime = mtime
-
-        # Re-read .env
-        from dotenv import load_dotenv
-        load_dotenv(self._env_path, override=True)
-        new_cookie = os.getenv("DOUYIN_COOKIE", "")
-        if new_cookie and new_cookie != self.downloader.config.cookie:
-            self.downloader.config.cookie = new_cookie
-            os.environ["DOUYIN_COOKIE"] = new_cookie
-            logger.info(
-                "Hot-reloaded DOUYIN_COOKIE from .env (%d chars)", len(new_cookie)
-            )
+        """Compatibility hook; SQLite lifecycle watcher owns runtime reloads."""
+        return
 
     def _poll_once(self, cfg, bot_cfg) -> None:
+        if not self._intake_is_enabled():
+            return
         self._check_env_reload()
         if self._state is not None:
             self._poll_once_durable(cfg, bot_cfg)
@@ -769,8 +1027,11 @@ class EmailBot:
             logger.debug("Found %d unseen email(s)", len(msg_ids))
 
             for msg_id in msg_ids:
+                if not self._intake_is_enabled():
+                    break
                 self._process_email(mail, msg_id, cfg, bot_cfg)
         finally:
+            self._clear_active_imap(mail)
             self._safe_logout(mail)
 
     def _poll_once_durable(self, cfg, bot_cfg) -> None:
@@ -835,6 +1096,9 @@ class EmailBot:
             uids = sorted(uids)
             reconciliation_ok = True
             for uid in uids:
+                if not self._intake_is_enabled():
+                    reconciliation_ok = False
+                    break
                 fetched = self._imap_fetch_uid(mail, uid)
                 if fetched is None:
                     # Do not advance beyond an un-fetchable UID. The next
@@ -886,6 +1150,38 @@ class EmailBot:
                 assert baseline_uid is not None
                 self._state.set_mailbox_position(mailbox, uidvalidity, baseline_uid)
         finally:
+            self._clear_active_imap(mail)
+            self._safe_logout(mail)
+
+    def _register_active_imap(self, mail) -> None:
+        lock = getattr(self, "_imap_lock", None)
+        if lock is None:
+            self._imap_connection = mail
+            return
+        with lock:
+            self._imap_connection = mail
+
+    def _clear_active_imap(self, mail) -> None:
+        lock = getattr(self, "_imap_lock", None)
+        if lock is None:
+            if getattr(self, "_imap_connection", None) is mail:
+                self._imap_connection = None
+            return
+        with lock:
+            if self._imap_connection is mail:
+                self._imap_connection = None
+
+    def _close_active_imap(self) -> None:
+        """Interrupt a potentially blocked IMAP operation during restart."""
+        lock = getattr(self, "_imap_lock", None)
+        if lock is None:
+            mail = getattr(self, "_imap_connection", None)
+            self._imap_connection = None
+        else:
+            with lock:
+                mail = self._imap_connection
+                self._imap_connection = None
+        if mail is not None:
             self._safe_logout(mail)
 
     @staticmethod
@@ -1298,37 +1594,34 @@ class EmailBot:
                 )
                 if refreshed_cookie and refreshed_cookie != self.downloader.config.cookie:
                     # Hot-reload new cookie and retry
-                    self.downloader.config.cookie = refreshed_cookie
-                    os.environ["DOUYIN_COOKIE"] = refreshed_cookie
-                    _write_env(self._project_dir / ".env", "DOUYIN_COOKIE", refreshed_cookie)
-                    logger.info(
-                        "Cookie refreshed (%d chars → %d chars), retrying download...",
-                        len(self.config.douyin.cookie), len(refreshed_cookie),
-                    )
-                    retry_result = self.downloader.download(url)
-                    if retry_result["success"]:
-                        self._cooldowns[sender] = time.time()
-                        filepath = retry_result["filepath"] or "未知路径"
+                    if self._save_cookie(refreshed_cookie):
                         logger.info(
-                            f"{Fore.GREEN}{Style.BRIGHT}[DONE] 下载成功 (cookie 刷新后): %s -> %s",
-                            retry_result["title"],
-                            filepath,
+                            "Cookie refreshed (%d chars → %d chars), retrying download...",
+                            len(self.config.douyin.cookie), len(refreshed_cookie),
                         )
-                        self._send_reply(
-                            cfg, sender,
-                            _format_success_reply(
-                                retry_result,
+                        retry_result = self.downloader.download(url)
+                        if retry_result["success"]:
+                            self._cooldowns[sender] = time.time()
+                            filepath = retry_result["filepath"] or "未知路径"
+                            logger.info(
+                                f"{Fore.GREEN}{Style.BRIGHT}[DONE] 下载成功 (cookie 刷新后): %s -> %s",
+                                retry_result["title"],
                                 filepath,
-                                prefix="下载完成！（cookie 已自动刷新）",
-                            ),
-                            subject_status=_success_subject_status(
-                                retry_result,
-                                refreshed_cookie=True,
-                            ),
-                        )
-                        _mark_seen(mail, msg_id)
-                        return
-                    else:
+                            )
+                            self._send_reply(
+                                cfg, sender,
+                                _format_success_reply(
+                                    retry_result,
+                                    filepath,
+                                    prefix="下载完成！（cookie 已自动刷新）",
+                                ),
+                                subject_status=_success_subject_status(
+                                    retry_result,
+                                    refreshed_cookie=True,
+                                ),
+                            )
+                            _mark_seen(mail, msg_id)
+                            return
                         logger.warning("Retry after cookie refresh also failed: %s", retry_result["error"])
                         error_msg += f"\n（已尝试自动刷新 cookie 并重试，仍失败）"
 
@@ -1551,6 +1844,27 @@ class EmailBot:
 
     # ── Cookie command handlers ───────────────────────────────────
 
+    def _save_cookie(self, cookie: str) -> bool:
+        """Persist a cookie in the shared settings registry and hot-load it."""
+        if not hasattr(self, "_settings"):
+            # Compatibility for pre-lifecycle lightweight callers. Production
+            # instances always use the shared SQLite registry.
+            ok = _write_env(self._project_dir / ".env", "DOUYIN_COOKIE", cookie)
+            if ok:
+                self.downloader.config.cookie = cookie
+            return ok
+        try:
+            revision = self._settings.apply_changes(
+                {"douyin.cookie": cookie}, base_revision=self._settings.get_revision()
+            )
+        except Exception:
+            logger.exception("Could not save DOUYIN_COOKIE in settings store")
+            return False
+        self._settings_revision = revision
+        self._managed_settings["douyin.cookie"] = cookie
+        self._hot_reload_cookie(cookie)
+        return True
+
     def _handle_cookie_update(self, mail, msg_id, cfg, sender, body) -> None:
         """Extract new cookie from email body, write to .env, hot-reload."""
         new_cookie = body.strip()
@@ -1575,7 +1889,7 @@ class EmailBot:
             _mark_seen(mail, msg_id)
             return
 
-        ok = _write_env(self._project_dir / ".env", "DOUYIN_COOKIE", new_cookie)
+        ok = self._save_cookie(new_cookie)
         if not ok:
             self._send_reply(
                 cfg,
@@ -1585,10 +1899,6 @@ class EmailBot:
             )
             _mark_seen(mail, msg_id)
             return
-
-        # Hot-reload into the running downloader
-        self.downloader.config.cookie = new_cookie
-        os.environ["DOUYIN_COOKIE"] = new_cookie
 
         logger.info("Cookie updated by %s (%d chars)", sender, len(new_cookie))
         self._send_reply(
@@ -1614,10 +1924,8 @@ class EmailBot:
         )
 
         if cookie_str:
-            ok = _write_env(self._project_dir / ".env", "DOUYIN_COOKIE", cookie_str)
+            ok = self._save_cookie(cookie_str)
             if ok:
-                self.downloader.config.cookie = cookie_str
-                os.environ["DOUYIN_COOKIE"] = cookie_str
                 logger.info("Cookie auto-extracted (%d chars): %s", len(cookie_str), status_msg)
                 self._send_reply(
                     cfg, sender,
@@ -1646,13 +1954,22 @@ class EmailBot:
 
     def _imap_connect(self, cfg):
         logger.debug("Connecting to IMAP %s:%d", cfg.imap_server, cfg.imap_port)
-        mail = imaplib.IMAP4_SSL(cfg.imap_server, cfg.imap_port)
-        # Set a socket timeout so broken connections don't hang the bot.
-        # 30s is enough for normal IMAP operations but prevents infinite hangs
-        # when the remote side has torn down the connection (SSL EOF, timeout).
-        mail.socket().settimeout(30)
-        mail.login(cfg.email, cfg.password)
-        return mail
+        # Pass the timeout into the constructor as well as applying it to the
+        # resulting socket.  This bounds the connect/TLS handshake and makes
+        # the socket available to restart interruption as soon as possible.
+        mail = imaplib.IMAP4_SSL(cfg.imap_server, cfg.imap_port, timeout=30)
+        self._register_active_imap(mail)
+        try:
+            # Set a socket timeout so broken connections don't hang the bot.
+            # 30s is enough for normal IMAP operations but prevents infinite
+            # hangs when the remote side has torn down the connection.
+            mail.socket().settimeout(30)
+            mail.login(cfg.email, cfg.password)
+            return mail
+        except Exception:
+            self._clear_active_imap(mail)
+            self._safe_logout(mail)
+            raise
 
     @staticmethod
     def _safe_logout(mail) -> None:

@@ -23,21 +23,19 @@ def test_status_saves_cookie_but_redacts_it_from_response(monkeypatch, tmp_path)
     }
     saved = {}
 
+    class FakeSettings:
+        def apply(self, changes):
+            saved["changes"] = changes
+
     monkeypatch.setattr(web_login, "_get_profile_dir", lambda: tmp_path)
     monkeypatch.setattr(web_login, "check_auth_cookies", lambda _: result.copy())
     monkeypatch.setattr(web_login, "_assess_quality", lambda _: ("A", True))
-    monkeypatch.setattr(
-        web_login,
-        "_write_env",
-        lambda path, key, value: saved.update(path=path, key=key, value=value),
-    )
+    monkeypatch.setattr(web_login, "_settings", FakeSettings())
 
     response = web_login.app.test_client().get("/api/status", headers=SAME_ORIGIN_HEADERS)
 
     assert saved == {
-        "path": str(web_login._env_path),
-        "key": "DOUYIN_COOKIE",
-        "value": cookie,
+        "changes": [{"key": "douyin.cookie", "action": "set", "value": cookie}],
     }
     assert response.get_json() == {
         "status": "logged_in",
@@ -70,6 +68,39 @@ def test_status_returns_only_whitelisted_fields_and_is_not_cacheable(monkeypatch
         "auth_count": 1,
         "message": "等待扫码...",
     }
+    assert response.headers["Cache-Control"] == "no-store"
+
+
+def test_status_returns_safe_500_when_cookie_save_fails(monkeypatch, tmp_path):
+    cookie = "sessionid=must-not-leak"
+
+    class FailingSettings:
+        def apply(self, changes):
+            raise RuntimeError(f"database error involving {cookie}")
+
+    monkeypatch.setattr(web_login, "_get_profile_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        web_login,
+        "check_auth_cookies",
+        lambda _: {
+            "status": "logged_in",
+            "cookie_str": cookie,
+            "auth_count": 1,
+            "message": "检测到登录态",
+        },
+    )
+    monkeypatch.setattr(web_login, "_assess_quality", lambda _: ("A", True))
+    monkeypatch.setattr(web_login, "_settings", FailingSettings())
+
+    response = web_login.app.test_client().get("/api/status", headers=SAME_ORIGIN_HEADERS)
+
+    assert response.status_code == 500
+    assert response.get_json() == {
+        "status": "failure",
+        "auth_count": 1,
+        "message": "Cookie 保存失败，请稍后重试",
+    }
+    assert cookie not in response.get_data(as_text=True)
     assert response.headers["Cache-Control"] == "no-store"
 
 

@@ -7,6 +7,7 @@ services:
       - /srv/nas_data/douyin_downloads:/app/downloads
       - logs:/app/logs
       - state:/app/state
+      - runtime_settings:/app/runtime-settings
       - firefox_profile:/app/firefox_profile
       - ./config.yaml:/app/config.yaml:ro
       - ./.env:/app/.env
@@ -19,14 +20,8 @@ services:
       - BOT_TRANSIENT_PENDING_FILE=/app/state/pending_retries.json
       - BOT_TRANSIENT_FAILED_FILE=/app/state/failed_links.txt
       - BOT_STATE_DB=/app/state/mail_state.sqlite3
+      - RUNTIME_SETTINGS_DB=/app/runtime-settings/settings.sqlite3
       - BOT_DURABLE_MAIL_ENABLED=${BOT_DURABLE_MAIL_ENABLED:-1}
-      - BOT_WORKER_COUNT=${BOT_WORKER_COUNT:-2}
-      - BOT_DOUYIN_WORKER_COUNT=${BOT_DOUYIN_WORKER_COUNT:-1}
-      - BOT_BILIBILI_WORKER_COUNT=${BOT_BILIBILI_WORKER_COUNT:-1}
-      - BOT_LEASE_SECONDS=${BOT_LEASE_SECONDS:-300}
-      - BOT_HEARTBEAT_SECONDS=${BOT_HEARTBEAT_SECONDS:-30}
-      - BOT_OUTBOX_RETRY_ATTEMPTS=${BOT_OUTBOX_RETRY_ATTEMPTS:-5}
-      - BOT_OUTBOX_RETRY_DELAY_SECONDS=${BOT_OUTBOX_RETRY_DELAY_SECONDS:-60}
       - TZ=Asia/Shanghai
       # Keep Douyin traffic direct even when the Docker host has proxy vars set.
       - HTTP_PROXY=
@@ -37,9 +32,6 @@ services:
       - https_proxy=
       - all_proxy=
       - no_proxy=
-      # Optional: enable .env auto-reload so bot picks up cookie
-      # changes without restart (requires web_login to write to .env)
-      - ENV_AUTO_RELOAD=1
 
   web_login:
     build: .
@@ -53,10 +45,12 @@ services:
       - "${LAN_BIND_ADDRESS:-192.168.1.94}:8080:8080"
     volumes:
       - firefox_profile:/app/firefox_profile
+      - runtime_settings:/app/runtime-settings
       - ./.env:/app/.env
       - ./config.yaml:/app/config.yaml:ro
     environment:
       - COOKIE_PROFILE_DIR=/app/firefox_profile
+      - RUNTIME_SETTINGS_DB=/app/runtime-settings/settings.sqlite3
       - TZ=Asia/Shanghai
       - WEB_LOGIN_ALLOWED_ORIGINS=${WEB_LOGIN_ALLOWED_ORIGINS:-}
     # The container needs an all-interface bind; host port publication remains
@@ -77,11 +71,18 @@ services:
     volumes:
       - /srv/nas_data/douyin_downloads:/app/downloads
       - /srv/nas_data/comics:/app/comics:ro
+      - runtime_settings:/app/runtime-settings
       - ./config.yaml:/app/config.yaml:ro
+      # Read-only bootstrap fallback so the Settings tab can report whether
+      # legacy credentials are configured without ever returning their value.
+      - ./.env:/app/.env:ro
     environment:
       - DOUYIN_DOWNLOAD_PATH=/app/downloads
       - COMICS_PICS_PATH=/app/comics/pics
+      - RUNTIME_SETTINGS_DB=/app/runtime-settings/settings.sqlite3
       - TZ=Asia/Shanghai
+      # Leave empty unless an exact trusted origin is explicitly configured;
+      # Settings PATCH intentionally returns 403 without this allowlist.
       - FILE_BROWSER_ALLOWED_ORIGINS=${FILE_BROWSER_ALLOWED_ORIGINS:-}
       - FILE_BROWSER_MAX_UPLOAD_BYTES=${FILE_BROWSER_MAX_UPLOAD_BYTES:-2147483648}
       - FILE_BROWSER_MAX_UPLOAD_FILES=${FILE_BROWSER_MAX_UPLOAD_FILES:-10}
@@ -94,4 +95,6 @@ volumes:
   firefox_profile:
     driver: local
   state:
+    driver: local
+  runtime_settings:
     driver: local

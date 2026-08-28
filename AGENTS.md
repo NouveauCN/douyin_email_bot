@@ -12,6 +12,7 @@ service on port 8080, and a trusted-LAN file browser on port 8081.
 main.py                 Bot entry point and order-sensitive F2 bootstrap
 email_bot.py            IMAP loop, routing, retries, SMTP, cookie refresh
 mail_state.py           SQLite mailbox position, task leases, and SMTP outbox
+settings_store.py       SQLite managed runtime configuration and revisions
 migrate_mail_state.py   Dry-run/apply migration for legacy JSON retries
 douyin_downloader.py    F2 metadata and direct httpx media downloads
 bilibili_downloader.py  Isolated yutto CLI wrapper
@@ -40,7 +41,8 @@ IMAP -> EmailBot -> UrlExtractor -> platform downloader -> SMTP reply
 ## Safety And Boundaries
 
 - Never commit credentials, cookies, yutto auth files, Firefox profiles,
-  downloaded media, or logs. Secrets belong in the gitignored `.env`.
+  downloaded media, or logs. Secrets belong in the managed settings volume or
+  the gitignored `.env` bootstrap file.
 - Preserve unrelated user changes in a dirty worktree.
 - Do not casually run `smoke_download.py`: it uses a hardcoded live URL, valid
   credentials, network access, and the configured download destination.
@@ -196,13 +198,38 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   changing them.
 - Email-triggered extraction honors `cookie_extractor.headless` and `.validate`.
 
+### Browser settings control plane
+
+- `file_browser` exposes a Settings tab for supported email, sender allowlist,
+  keyword, downloader, retry, media, and cookie settings.
+- Managed settings are persisted in the dedicated `runtime_settings` volume at
+  `/app/runtime-settings/settings.sqlite3`; it is shared only by `bot`,
+  `file_browser`, and `web_login`. `file_browser` must never receive the bot's
+  `/app/state` volume or Docker socket.
+- Secret values (mail credentials, Douyin Cookie, Bilibili auth) are write-only
+  in the UI: responses, logs, and errors may report only configured/unconfigured
+  status. `config.yaml` remains read-only.
+- Settings `PATCH` requests require an explicitly configured
+  `FILE_BROWSER_ALLOWED_ORIGINS`; when it is missing the endpoint must return
+  `403`, including for otherwise same-origin requests. Use exact origins only.
+- Cookie-only changes hot-reload in the bot. Other changes request a graceful
+  restart: stop intake and new claims, drain active work for at most 300 seconds,
+  then exit so Docker `restart: unless-stopped` starts the bot automatically.
+  Interrupted long Bilibili work is recovered by SQLite lease expiry.
+
 ## Configuration And Paths
 
 For supported overrides, priority is:
 
 ```text
-environment > config.yaml > dataclass default
+environment > managed settings > legacy .env > config.yaml > dataclass default
 ```
+
+The environment layer means only variables explicitly injected by the
+deployment/operator; Compose does not provide default environment overrides for
+editable worker, lease/heartbeat, or SMTP outbox settings. Those are controlled
+by managed settings or `config.yaml` unless an external process variable is
+deliberately supplied, in which case the field is locked in the Settings tab.
 
 `config_loader.py` is the source of truth for environment-variable mappings.
 Sensitive variables include `EMAIL_ADDRESS`, `EMAIL_PASSWORD`, `DOUYIN_COOKIE`,
@@ -231,6 +258,11 @@ deployment host.
 The short-link cache defaults to `logs/short_link_cache.json` and can be moved
 with `DOUYIN_SHORT_LINK_CACHE`. Cache, retry, failure, media, log, and profile
 artifacts must remain untracked.
+
+The browser Settings tab writes managed values to the runtime-settings database;
+the legacy `.env` bind remains for bootstrap, compatibility, and Compose
+interpolation. Environment variables intentionally supplied by the deployment
+remain the highest-priority, read-only overrides in the UI.
 
 ## Development And Verification
 
@@ -289,10 +321,22 @@ sudo docker compose down
 - The bot owns the `logs` and `state` volumes; `state` persists
   `pending_retries.json` and `failed_links.txt` across bot container rebuilds.
   Bot and `web_login` share the Firefox-profile volume.
+- `runtime_settings` is an independent named volume mounted at
+  `/app/runtime-settings` in `bot`, `file_browser`, and `web_login`, with
+  `RUNTIME_SETTINGS_DB=/app/runtime-settings/settings.sqlite3`. It is not the
+  mail state volume and is never mounted into unrelated services.
 - Bot and `file_browser` bind the host NAS root to `/app/downloads`.
 - `file_browser` also mounts `/srv/nas_data/comics` read-only at `/app/comics`
   and uses `COMICS_PICS_PATH=/app/comics/pics` for the in-site comics gallery.
-- All services bind `config.yaml`; only bot and `web_login` bind `.env`.
+- All services bind `config.yaml` read-only; only bot and `web_login` bind the
+  legacy `.env` for compatibility. Managed settings are the normal mutable
+  control-plane source.
+- `file_browser` also receives the legacy `.env` as read-only bootstrap input;
+  it must not write that file. The bot Compose environment must not reintroduce
+  default `BOT_WORKER_COUNT`, `BOT_DOUYIN_WORKER_COUNT`,
+  `BOT_BILIBILI_WORKER_COUNT`, `BOT_LEASE_SECONDS`, `BOT_HEARTBEAT_SECONDS`, or
+  `BOT_OUTBOX_*` values: these remain managed/YAML settings unless explicitly
+  injected outside Compose.
 - The bot intentionally clears proxy variables so Douyin traffic goes direct.
 - Python 3.12 is required locally and in Docker. `pyproject.toml` declares the
   exact direct dependencies, `uv.lock` is the authoritative transitive lock,

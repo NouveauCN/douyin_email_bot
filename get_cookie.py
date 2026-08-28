@@ -1,4 +1,4 @@
-"""Get Douyin cookie via Playwright Firefox and write to .env.
+"""Get Douyin cookie via Playwright Firefox and save it to runtime settings.
 
 Supports both interactive login (visible browser) and headless
 re-extraction from a persistent profile.
@@ -25,9 +25,11 @@ from cookie_extractor import (
     extract_with_playwright,
     validate_cookie,
 )
+from settings_store import SettingsStore, default_database_path
 
 PROJECT_DIR = Path(__file__).parent
-ENV_PATH = PROJECT_DIR / ".env"
+SETTINGS_DB = default_database_path(PROJECT_DIR / "config.yaml")
+_settings = SettingsStore(SETTINGS_DB)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -118,26 +120,14 @@ def _filter_douyin(cookies: list) -> list[str]:
     ]
 
 
-def _write_env(env_path: Path, key: str, value: str) -> None:
-    """Update or add a key=value line in a dotenv file."""
-    if env_path.exists():
-        lines = env_path.read_text(encoding="utf-8").splitlines()
-        found = False
-        for i, line in enumerate(lines):
-            if line.startswith(f"{key}=") or line.startswith(f"{key} ="):
-                lines[i] = f"{key}={value}"
-                found = True
-                break
-        if not found:
-            lines.append(f"{key}={value}")
-        env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    else:
-        env_path.write_text(f"{key}={value}\n", encoding="utf-8")
+def _save_cookie(cookie: str) -> None:
+    """Persist a validated cookie in the shared managed settings store."""
+    _settings.apply([{"key": "douyin.cookie", "action": "set", "value": cookie}])
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="获取抖音 cookie 并写入 .env",
+        description="获取抖音 cookie 并保存到运行时设置",
     )
     parser.add_argument(
         "--headless",
@@ -173,9 +163,15 @@ def main():
         cookie, msg = interactive_login(profile_dir, validate=validate)
 
     if cookie:
-        _write_env(ENV_PATH, "DOUYIN_COOKIE", cookie)
+        try:
+            _save_cookie(cookie)
+        except Exception:
+            # Keep storage errors generic: a database exception must not echo
+            # the cookie value or any other sensitive setting.
+            print(f"{Fore.RED}X Cookie 保存失败，请检查运行时设置后重试")
+            sys.exit(1)
         print()
-        print(f"{Fore.GREEN}{Style.BRIGHT}[DONE] Cookie 已写入 .env ({len(cookie)} 字符)")
+        print(f"{Fore.GREEN}{Style.BRIGHT}[DONE] Cookie 已保存到运行时设置 ({len(cookie)} 字符)")
         print(f"来源: {msg}")
         print()
         print("提示：Cookie 有效期通常 24-48 小时。")

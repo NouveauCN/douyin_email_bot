@@ -61,7 +61,8 @@ BILIBILI_AUTH="SESSDATA=...; bili_jct=..."  # 可选
 
 ### 5. 编辑 config.yaml（可选）
 
-`config.yaml` 只包含非敏感设置（服务器地址、端口等），隐私信息从 `.env` 加载。
+`config.yaml` 只包含非敏感的只读基线设置（服务器地址、端口等）。敏感信息首次启动
+可从 `.env` 加载，日常修改推荐使用 file browser 的 Settings Tab。
 
 如需限制发件人，编辑 `bot.allowed_senders`：
 
@@ -71,7 +72,23 @@ bot:
     - "your_email@qq.com"       # 允许发送下载请求的邮箱
 ```
 
-### 5. 运行
+### 6. 使用浏览器设置 Tab（推荐）
+
+启动 `file_browser` 后打开 8081 端口的“设置” Tab，可以查看和修改邮箱、发件人
+白名单、主题关键词、Douyin/Bilibili 登录信息、Cookie、重试和媒体处理等运行配置。
+配置页面显示每项的来源；环境变量覆盖的部署项保持只读。邮箱密码、Douyin Cookie、
+Bilibili 登录信息等 secret 只显示“已配置/未配置”，不会回显原值、掩码片段或长度。
+
+Cookie-only 修改会热加载，不需要重启 bot。其他配置保存后 bot 会停止接收新邮件和领取
+新任务，等待当前任务排空（最多 300 秒）后安全退出；Docker 的
+`restart: unless-stopped` 会自动拉起新 bot。长时间 B 站任务如果超时被中断，会由
+SQLite lease 到期恢复，不需要手动介入。设置页面本身不需要 Docker socket，也不能访问
+bot 的 mail state 数据库。
+
+`.env` 仍可用于首次启动、旧部署兼容和 Compose 插值；保存到设置 Tab 的 managed
+settings 优先于 `.env` 和 `config.yaml`（实际注入的环境变量仍是最高优先级）。
+
+### 7. 运行
 
 ```bash
 uv run python main.py
@@ -107,6 +124,11 @@ SQLite；升级旧版 SQLite 状态时，历史 Cookie 任务会先脱敏并标�
 迁移还会安全清理 SQLite/WAL 中的旧页；任何外部数据库备份仍需按既有
 秘密轮换策略处理。
 
+设置 Tab 的 SQLite 数据保存在独立的 `runtime_settings` named volume，容器内路径为
+`/app/runtime-settings/settings.sqlite3`。该卷只挂载给 `bot`、`file_browser` 和
+`web_login`；`file_browser` 不挂载 `/app/state`，也不挂载 Docker socket。`config.yaml`
+继续以只读方式挂载，旧 `.env` 继续保留用于兼容读取。
+
 ## 局域网 + Tailscale Web 访问
 
 `file_browser` 和 `web_login` 不显示应用登录页，访问边界由 Docker
@@ -118,12 +140,18 @@ Tailscale 侧请用 Serve（不要用 Funnel）并用 ACL/Grants 只允许自己
 
 服务仍会拒绝缺少或不匹配 Origin/Referer 的写请求，并限制上传大小、文件
 数量、媒体并发、二维码生成和状态轮询；这些保护不需要额外登录操作。
+出于设置接口会修改邮箱凭据和 Cookie，`PATCH /api/settings` 还要求显式配置
+`FILE_BROWSER_ALLOWED_ORIGINS`；未配置时即使请求来自同源也返回 `403`。
 如 Tailscale Serve 使用的地址与请求 Host 不同，可在 `.env` 中配置精确的
 允许来源：
 
 ```env
-FILE_BROWSER_ALLOWED_ORIGINS=https://your-machine.your-tailnet.ts.net
-WEB_LOGIN_ALLOWED_ORIGINS=https://your-machine.your-tailnet.ts.net
+# Replace 192.168.1.94 with the trusted LAN address when needed.
+FILE_BROWSER_ALLOWED_ORIGINS=http://127.0.0.1:8081,http://localhost:8081,http://192.168.1.94:8081
+WEB_LOGIN_ALLOWED_ORIGINS=http://127.0.0.1:8080,http://localhost:8080,http://192.168.1.94:8080
+# Append (do not wildcard) the exact HTTPS Tailscale Serve origin:
+# FILE_BROWSER_ALLOWED_ORIGINS=http://127.0.0.1:8081,http://localhost:8081,http://192.168.1.94:8081,https://your-machine.your-tailnet.ts.net
+# WEB_LOGIN_ALLOWED_ORIGINS=http://127.0.0.1:8080,http://localhost:8080,http://192.168.1.94:8080,https://your-machine.your-tailnet.ts.net
 ```
 
 不要把这两个服务绑定到 `0.0.0.0`、访客/IoT 网段或公网 Funnel；可信家庭
@@ -139,7 +167,8 @@ B站链接由 [yutto](https://github.com/yutto-dev/yutto) CLI 下载，支持 BV
 
 封面图片会保存到 `downloads/slides/`，文件名带 `bilibili_` 前缀，方便和抖音图集一起浏览。
 
-普通公开视频通常不需要登录信息；如遇到登录、大会员或受限内容，在 `.env` 中配置：
+普通公开视频通常不需要登录信息；如遇到登录、大会员或受限内容，可在 Settings Tab
+中填写 B 站登录信息（旧部署也可继续在 `.env` 中配置）：
 
 ```env
 BILIBILI_AUTH="SESSDATA=xxxxx; bili_jct=yyyyy"
@@ -202,14 +231,14 @@ uv run python process_media.py "/path/to/video.mp4" --apply --force-review
 | `email.imap_port` | int | `993` | IMAP SSL 端口 |
 | `email.smtp_server` | str | `smtp.qq.com` | SMTP 发件服务器 |
 | `email.smtp_port` | int | `587` | SMTP STARTTLS 端口 |
-| `email.email` | str | `""` | **必填**（.env `EMAIL_ADDRESS`），机器人邮箱地址 |
-| `email.password` | str | `""` | **必填**（.env `EMAIL_PASSWORD`），QQ 邮箱授权码 |
+| `email.email` | str | `""` | **必填**（managed settings 或 `.env` `EMAIL_ADDRESS`），机器人邮箱地址 |
+| `email.password` | str | `""` | **必填**（managed settings 或 `.env` `EMAIL_PASSWORD`），QQ 邮箱授权码 |
 | `email.poll_interval` | int | `30` | 收件箱轮询间隔（秒） |
-| `email.smtp_timeout` | int | `30` | SMTP 连接与发送超时（秒）；可由 `SMTP_TIMEOUT` 覆盖 |
-| `douyin.cookie` | str | `""` | **必填**（.env `DOUYIN_COOKIE`），抖音登录 cookie |
+| `email.smtp_timeout` | int | `30` | SMTP 连接与发送超时（秒）；由 managed settings/YAML 控制，只有显式外部环境变量注入时锁定 |
+| `douyin.cookie` | str | `""` | **必填**（managed settings 或 `.env` `DOUYIN_COOKIE`），抖音登录 cookie |
 | `douyin.download_path` | str | `"/srv/nas_data/douyin_downloads"` | 视频下载目录（提交配置） |
 | `bilibili.download_path` | str | `"/srv/nas_data/douyin_downloads/bilibili"` | B站视频下载目录（提交配置） |
-| `bilibili.auth` | str | `""` | 可选（.env `BILIBILI_AUTH`），B站登录 cookie |
+| `bilibili.auth` | str | `""` | 可选（managed settings 或 `.env` `BILIBILI_AUTH`），B站登录 cookie |
 | `bilibili.auth_file` | str | `""` | 可选（env `BILIBILI_AUTH_FILE`），yutto 扫码登录认证文件 |
 | `bilibili.video_quality` | int | `127` | yutto 视频清晰度，127=请求最高可用画质 |
 | `bilibili.batch` | bool | `false` | 是否默认启用 yutto 批量下载 |
@@ -221,10 +250,10 @@ uv run python process_media.py "/path/to/video.mp4" --apply --force-review
 | `bot.transient_failed_file` | str | `./failed_links.txt` | 重试耗尽链接的失败清单；可由 `BOT_TRANSIENT_FAILED_FILE` 覆盖 |
 | `bot.durable_mail_enabled` | bool | `true` | 启用 SQLite durable intake、worker 和 SMTP outbox；可由 `BOT_DURABLE_MAIL_ENABLED` 覆盖 |
 | `bot.state_db` | str | `./state/mail_state.sqlite3` | SQLite 状态库；Docker 中固定在 `/app/state` named volume |
-| `bot.worker_count` | int | `2` | 全局下载 worker 数；可由 `BOT_WORKER_COUNT` 覆盖 |
-| `bot.douyin_worker_count` / `bilibili_worker_count` | int | `1` / `1` | 各平台并发上限 |
-| `bot.lease_seconds` / `heartbeat_seconds` | int | `300` / `30` | worker 租约与心跳周期 |
-| `bot.outbox_retry_attempts` | int | `5` | SMTP outbox 最大重试次数 |
+| `bot.worker_count` | int | `2` | 全局下载 worker 数；由 managed settings/YAML 控制，只有显式外部环境变量注入时锁定 |
+| `bot.douyin_worker_count` / `bilibili_worker_count` | int | `1` / `1` | 各平台并发上限；由 managed settings/YAML 控制，只有显式外部环境变量注入时锁定 |
+| `bot.lease_seconds` / `heartbeat_seconds` | int | `300` / `30` | worker 租约与心跳周期；由 managed settings/YAML 控制，只有显式外部环境变量注入时锁定 |
+| `bot.outbox_retry_attempts` | int | `5` | SMTP outbox 最大重试次数；由 managed settings/YAML 控制，只有显式外部环境变量注入时锁定 |
 | `bot.commands.cookie_update` | str | `"更新cookie"` | 手动更新 cookie 的邮件主题关键词 |
 | `bot.commands.cookie_auto` | str | `"自动获取cookie"` | 浏览器自动提取 cookie 的邮件主题关键词 |
 | `FILE_BROWSER_ALLOWED_ORIGINS` | str | 当前请求 origin | 文件浏览器精确允许来源（逗号分隔） |
