@@ -32,7 +32,7 @@ _AUTH_COOKIE_NAMES = frozenset({
 # ── Extraction ────────────────────────────────────────────────────
 
 def extract_with_playwright(
-    profile_dir: Path,
+    profile_dir: str | Path | None = None,
     headless: bool = True,
     timeout: int = 30000,
 ) -> Optional[str]:
@@ -41,13 +41,16 @@ def extract_with_playwright(
     Uses a persistent browser context so login state survives across runs.
 
     Args:
-        profile_dir: Firefox profile directory (created if missing).
+        profile_dir: Firefox profile directory (created if missing). If omitted
+            or empty, use the default profile directory.
         headless: True = no GUI, False = visible browser for interactive login.
         timeout: Navigation timeout in milliseconds.
 
     Returns:
         Semicolon-joined cookie string, or None on failure.
     """
+    profile_dir = _normalize_profile_dir(profile_dir)
+
     try:
         from playwright.sync_api import sync_playwright  # type: ignore[import-untyped]
     except ImportError:
@@ -208,7 +211,7 @@ def validate_cookie(cookie_str: str, timeout: int = 15) -> tuple[bool, str]:
 # ── Orchestrator ───────────────────────────────────────────────────
 
 def extract_cookies(
-    profile_dir: Optional[Path] = None,
+    profile_dir: str | Path | None = None,
     headless: bool = True,
     validate: bool = True,
 ) -> tuple[Optional[str], str]:
@@ -225,8 +228,7 @@ def extract_cookies(
     Returns:
         (cookie_string_or_None, status_message).
     """
-    if profile_dir is None:
-        profile_dir = DEFAULT_PROFILE_DIR
+    profile_dir = _normalize_profile_dir(profile_dir)
 
     logger.info(
         "Extracting cookies (headless=%s, profile=%s)",
@@ -263,6 +265,13 @@ def extract_cookies(
 def _has_login_state(profile_dir: Path) -> bool:
     """Check if the profile directory has signs of prior browser use."""
     return (profile_dir / "cookies.sqlite").exists()
+
+
+def _normalize_profile_dir(profile_dir: str | Path | None) -> Path:
+    """Normalize public profile-directory inputs to a concrete ``Path``."""
+    if not profile_dir:
+        return DEFAULT_PROFILE_DIR
+    return Path(profile_dir)
 
 
 # ── QR code screenshot (for web login service) ─────────────────────
