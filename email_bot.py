@@ -33,7 +33,12 @@ from download_task_service import (
     DownloaderRegistry,
     DownloadTaskService,
 )
+from download_types import DownloadResult
+from outcome_policy import classify_result, decide_outcome
 from mail_state import MailStateStore
+from mail_store import MailStore
+from qq_store import QQStore
+from event_projectors import EmailEventProjector, QQEventProjector
 from migrate_mail_state import import_pending_retries
 from settings_store import SettingsStore, default_database_path
 from task_store import TaskStore
@@ -181,6 +186,11 @@ class EmailBot:
         self._failed_links_file = Path(config.bot.transient_failed_file)
         self._durable_mail_enabled = bool(getattr(config.bot, "durable_mail_enabled", True))
         self._state: MailStateStore | None = None
+        self._task_store: TaskStore | None = None
+        self._mail_store: MailStore | None = None
+        self._qq_store: QQStore | None = None
+        self._email_projector: EmailEventProjector | None = None
+        self._qq_projector: QQEventProjector | None = None
         state_db_path = Path(
             getattr(config.bot, "state_db", str(self._project_dir / "state" / "mail_state.sqlite3"))
         )
@@ -189,8 +199,14 @@ class EmailBot:
                 state_db_path,
                 default_lease_seconds=getattr(config.bot, "lease_seconds", 300),
             )
+            # One transactional kernel, with explicit source/channel facades.
+            # Workers receive only TaskStore; adapters and projectors never
+            # need to reach through it to MailStateStore.
+            self._task_store = TaskStore(self._state)
+            self._mail_store = MailStore(self._state)
+            self._qq_store = QQStore(self._state)
             self._task_service = DownloadTaskService(
-                TaskStore(self._state),
+                self._task_store,
                 self._download_executor,
                 worker_count=getattr(config.bot, "worker_count", 2),
                 platform_worker_counts={
@@ -206,6 +222,16 @@ class EmailBot:
                 before_execute=self._before_task_service_execute,
                 after_execute=self._after_task_service_execute,
                 on_execute_finished=self._after_task_service_finished,
+            )
+            self._email_projector = EmailEventProjector(
+                self._mail_store,
+                failure_projector=self._project_terminal_failure,
+                notification_builder=self._task_notification,
+                notifications_enabled=self._notifications_enabled,
+            )
+            self._qq_projector = QQEventProjector(
+                self._qq_store,
+                notification_builder=self._qq_task_notification,
             )
         elif state_db_path.exists():
             # A legacy rollback must not silently abandon Seen mail or pending
@@ -314,11 +340,12 @@ class EmailBot:
         failure-file projection, including events consumed by an older bot
         version. ``task_id`` makes the append idempotent.
         """
-        if self._state is None:
+        mail_store = self._mail_store_for_use()
+        if mail_store is None:
             return
         after_id = None
         while True:
-            events = self._state.list_task_events(
+            events = mail_store.events(
                 limit=500,
                 include_consumed=True,
                 after_id=after_id,
@@ -333,10 +360,10 @@ class EmailBot:
                     "task.failed",
                 }:
                     continue
-                task = self._state.get_task_by_id(int(event["task_id"]))
+                task = mail_store.get_task_by_id(int(event["task_id"]))
                 if task is not None and task.get("source_kind") != "mail":
                     continue
-                consumed = self._state.task_event_consumed(int(event["id"]), "email")
+                consumed = mail_store.task_event_consumed(int(event["id"]), "email")
                 if task is None or not self._project_terminal_failure(
                     task, event, allow_legacy_unkeyed=consumed
                 ):
@@ -438,11 +465,7 @@ class EmailBot:
             )
             events.start()
             self._runtime_threads.append(events)
-            qq_store = service.store
-            qq_projector = getattr(qq_store, "project_qq_task_event", None)
-            if not callable(qq_projector):
-                qq_projector = getattr(getattr(qq_store, "state", None), "project_qq_task_event", None)
-            if callable(qq_projector):
+            if getattr(self, "_qq_projector", None) is not None:
                 qq_events = threading.Thread(
                     target=self._qq_task_event_worker_loop,
                     name="qq-task-events",
@@ -468,77 +491,26 @@ class EmailBot:
             maintenance.start()
             self._runtime_threads.append(maintenance)
             return
-        worker_count = max(1, getattr(self.config.bot, "worker_count", 2))
-        for index in range(worker_count):
-            thread = threading.Thread(
-                target=self._task_worker_loop,
-                args=(f"download-{index + 1}",),
-                name=f"mail-download-{index + 1}",
-                daemon=True,
-            )
-            thread.start()
-            self._runtime_threads.append(thread)
-        if self._notifications_enabled():
-            outbox = threading.Thread(
-                target=self._outbox_worker_loop,
-                name="mail-smtp-outbox",
-                daemon=True,
-            )
-            outbox.start()
-            self._runtime_threads.append(outbox)
-        maintenance = threading.Thread(
-            target=self._maintenance_loop,
-            name="mail-maintenance",
-            daemon=True,
-        )
-        maintenance.start()
-        self._runtime_threads.append(maintenance)
+        # Legacy mode is synchronous by design.  There is no durable task
+        # queue or SMTP outbox to service, so the old durable workers must not
+        # be started against a missing state object.
+        return
 
     def _qq_task_event_worker_loop(self) -> None:
         """Project terminal QQ events into the QQ-specific durable outbox."""
-        service = getattr(self, "_task_service", None)
-        state = getattr(service, "store", None) if service is not None else None
-        projector = getattr(state, "project_qq_task_event", None)
-        raw_state = getattr(state, "state", state)
-        if not callable(projector):
-            projector = getattr(raw_state, "project_qq_task_event", None)
-        if not callable(projector):
-            return
+        projector = getattr(self, "_qq_projector", None)
+        if projector is None:
+            qq_store = self._qq_store_for_use()
+            if qq_store is None or not callable(getattr(qq_store, "project_terminal_event", None)):
+                return
+            projector = self._qq_projector = QQEventProjector(
+                qq_store,
+                notification_builder=self._qq_task_notification,
+            )
         while not self._stop_event.is_set():
             try:
-                list_events = getattr(state, "events", None)
-                if callable(list_events):
-                    events = list_events(consumer="qq", limit=25)
-                else:
-                    events = raw_state.list_task_events(consumer="qq", limit=25)
-                if not events:
+                if not projector.project_once(limit=25):
                     self._stop_event.wait(0.25)
-                    continue
-                for event in events:
-                    event_type = str(event.get("event_type") or "")
-                    if event_type not in {
-                        "task.succeeded",
-                        "task.partially_succeeded",
-                        "task.failed",
-                    }:
-                        # There is no user-visible reply for non-terminal
-                        # events, but they must not block the QQ consumer.
-                        consume = getattr(state, "consume_event", None)
-                        if callable(consume):
-                            consume(int(event["id"]), "qq")
-                        else:
-                            raw_state.consume_task_event(int(event["id"]), "qq")
-                        continue
-                    # TaskStore returns TaskSnapshot; use its underlying
-                    # MailStateStore here because notification formatting
-                    # needs the raw payload/source binding fields.
-                    get_task = getattr(raw_state, "get_task_by_id", None)
-                    get_snapshot = getattr(state, "get", None)
-                    task = get_task(int(event["task_id"])) if callable(get_task) else get_snapshot(int(event["task_id"]))
-                    if task is None:
-                        continue
-                    body = self._qq_task_notification(task, event)
-                    projector(int(event["id"]), payload={"body": body})
             except Exception:
                 logger.exception("QQ task event projector failed")
                 self._stop_event.wait(1)
@@ -627,11 +599,10 @@ class EmailBot:
             "open_id": open_id,
             "message_id": message_id,
         }
-        service = self._task_service
-        if service is None:
+        qq_store = self._qq_store_for_use()
+        if qq_store is None:
             raise RuntimeError("durable download service is unavailable")
-        accept = getattr(service, "accept_qq_message", None)
-        if not callable(accept):
+        if not callable(getattr(qq_store, "accept_qq_message", None)):
             raise RuntimeError("QQ task intake is unavailable")
         confirmation = "已收到链接，开始下载。完成后会在本条 QQ 消息中回复结果。"
         # Serialize intake with the settings restart gate.  A restart cannot
@@ -639,7 +610,7 @@ class EmailBot:
         with self._claim_gate:
             if not self._intake_is_enabled():
                 raise RuntimeError("QQ intake is paused while the bot is restarting")
-            accepted = accept(
+            accepted = qq_store.accept_qq_message(
                 open_id=open_id,
                 message_id=message_id,
                 url=url,
@@ -678,10 +649,8 @@ class EmailBot:
             return 3600.0
 
     def claim_qq_outbox(self, *, limit: int = 10, worker_id=None):
-        service = self._task_service
-        claim = getattr(service, "claim_qq_outbox", None) if service is not None else None
-        if not callable(claim) and service is not None:
-            claim = getattr(getattr(service.store, "state", None), "claim_qq_outbox", None)
+        qq_store = self._qq_store_for_use()
+        claim = getattr(qq_store, "claim_qq_outbox", None) if qq_store is not None else None
         if not callable(claim):
             raise RuntimeError("QQ outbox is unavailable")
         items = claim(
@@ -723,19 +692,15 @@ class EmailBot:
             return 120.0
 
     def ack_qq_outbox(self, outbox_id: int, lease_token: str):
-        service = self._task_service
-        ack = getattr(service, "ack_qq_outbox", None) if service is not None else None
-        if not callable(ack) and service is not None:
-            ack = getattr(getattr(service.store, "state", None), "ack_qq_outbox", None)
+        qq_store = self._qq_store_for_use()
+        ack = getattr(qq_store, "ack_qq_outbox", None) if qq_store is not None else None
         if not callable(ack):
             raise RuntimeError("QQ outbox is unavailable")
         return ack(outbox_id, lease_token)
 
     def fail_qq_outbox(self, outbox_id: int, lease_token: str, error: str, *, retryable: bool = True):
-        service = self._task_service
-        fail = getattr(service, "fail_qq_outbox", None) if service is not None else None
-        if not callable(fail) and service is not None:
-            fail = getattr(getattr(service.store, "state", None), "fail_qq_outbox", None)
+        qq_store = self._qq_store_for_use()
+        fail = getattr(qq_store, "fail_qq_outbox", None) if qq_store is not None else None
         if not callable(fail):
             raise RuntimeError("QQ outbox is unavailable")
         try:
@@ -749,8 +714,7 @@ class EmailBot:
                 raise
             retry_at = None
             if retryable:
-                state = getattr(service.store, "state", None) if service is not None else None
-                rows = state.list_qq_outbox(limit=100) if state is not None else []
+                rows = qq_store.list_outbox(limit=100) if qq_store is not None else []
                 item = next((row for row in rows if int(row.get("id", -1)) == int(outbox_id)), None)
                 attempts = int(item.get("attempts", 0)) if item else 0
                 configured_max = getattr(getattr(self.config, "bot", None), "outbox_retry_attempts", 5)
@@ -837,6 +801,42 @@ class EmailBot:
         """Return whether SMTP replies are enabled for this process."""
         email_config = getattr(getattr(self, "config", None), "email", None)
         return bool(getattr(email_config, "send_replies", True))
+
+    def _task_store_for_use(self) -> TaskStore | None:
+        """Return the explicit task facade, including for lightweight tests."""
+        store = getattr(self, "_task_store", None)
+        if store is None:
+            state = getattr(self, "_state", None)
+            if state is not None:
+                # Keep object.__new__ compatibility doubles working without
+                # weakening the production boundary (real kernels always
+                # receive an explicit facade during __init__).
+                store = self._task_store = (
+                    TaskStore(state) if isinstance(state, MailStateStore) else state
+                )
+        return store
+
+    def _mail_store_for_use(self) -> MailStore | None:
+        """Return the explicit mail facade, including for lightweight tests."""
+        store = getattr(self, "_mail_store", None)
+        if store is None:
+            state = getattr(self, "_state", None)
+            if state is not None:
+                store = self._mail_store = (
+                    MailStore(state) if isinstance(state, MailStateStore) else state
+                )
+        return store
+
+    def _qq_store_for_use(self) -> QQStore | None:
+        """Return the explicit QQ facade; never inspect TaskStore internals."""
+        store = getattr(self, "_qq_store", None)
+        if store is None:
+            state = getattr(self, "_state", None)
+            if state is not None:
+                store = self._qq_store = (
+                    QQStore(state) if isinstance(state, MailStateStore) else state
+                )
+        return store
 
     def _handle_settings_revision(self, revision: int) -> None:
         current = self._settings.managed_values()
@@ -992,8 +992,9 @@ class EmailBot:
         interval = max(1, min(30, getattr(self.config.email, "poll_interval", 30)))
         while not self._stop_event.wait(interval):
             try:
-                if self._state is not None:
-                    recovered = self._state.recover_expired()
+                mail_store = self._mail_store_for_use()
+                if mail_store is not None:
+                    recovered = mail_store.recover_expired()
                     if recovered["tasks"] or recovered["outbox"]:
                         logger.warning("Recovered expired mail leases: %s", recovered)
                     self._replay_terminal_failure_projections()
@@ -1006,64 +1007,21 @@ class EmailBot:
 
     def _task_event_worker_loop(self) -> None:
         """Project durable task events into the mail-specific SMTP outbox."""
-        service = getattr(self, "_task_service", None)
-        if service is None or self._state is None:
-            return
-        consumer = "email"
+        projector = getattr(self, "_email_projector", None)
+        if projector is None:
+            mail_store = self._mail_store_for_use()
+            if mail_store is None or not callable(getattr(mail_store, "project_event", None)):
+                return
+            projector = self._email_projector = EmailEventProjector(
+                mail_store,
+                failure_projector=self._project_terminal_failure,
+                notification_builder=self._task_notification,
+                notifications_enabled=self._notifications_enabled,
+            )
         while not self._stop_event.is_set():
             try:
-                events = service.store.events(consumer=consumer, limit=25)
-                if not events:
+                if not projector.project_once(limit=25):
                     self._stop_event.wait(0.25)
-                    continue
-                for event in events:
-                    task_id = int(event["task_id"])
-                    task = self._state.get_task_by_id(task_id)
-                    if task is None:
-                        service.store.consume_event(int(event["id"]), consumer)
-                        continue
-                    event_type = str(event.get("event_type") or "")
-                    if event_type not in {
-                        "task.succeeded",
-                        "task.partially_succeeded",
-                        "task.failed",
-                    }:
-                        service.store.consume_event(int(event["id"]), consumer)
-                        continue
-                    if not self._project_terminal_failure(task, event):
-                        logger.warning("Could not project failure record for task %d", task_id)
-                        continue
-                    if not self._notifications_enabled():
-                        # Suppression acknowledges the terminal event without
-                        # creating an SMTP outbox item. Existing outbox rows
-                        # remain untouched and can be delivered after a
-                        # restart with notifications enabled.
-                        service.store.consume_event(int(event["id"]), consumer)
-                        continue
-                    if self._state.task_has_outbox(task_id):
-                        # Compatibility calls that still atomically created an
-                        # outbox item must not receive a second notification.
-                        service.store.consume_event(int(event["id"]), consumer)
-                        continue
-                    notification = self._task_notification(task, event)
-                    if notification is None:
-                        service.store.consume_event(int(event["id"]), consumer)
-                        continue
-                    event_payload = event.get("payload") or {}
-                    if not isinstance(event_payload, dict):
-                        event_payload = {}
-                    result = event_payload.get("result") or task.get("result") or {}
-                    if not isinstance(result, dict):
-                        result = {}
-                    outbox_event = "partial-failed" if result.get("partial") else (
-                        "failed" if event_type == "task.failed" else "completed"
-                    )
-                    service.store.project_event(
-                        int(event["id"]),
-                        consumer,
-                        outbox_event=outbox_event,
-                        outbox_payload=notification,
-                    )
             except Exception:
                 logger.exception("Durable task event projector failed")
                 self._stop_event.wait(1)
@@ -1198,35 +1156,39 @@ class EmailBot:
                 else:
                     self._complete_durable_failure(task, token, "notice payload missing")
                 return
-            result = self._download_url(task["original_url"])
-            partial_error = _partial_failure_error(result)
-            error_msg = partial_error or result.get("error")
-            if result.get("success") and partial_error:
-                if _is_transient_failure(partial_error):
-                    attempts = int(task.get("attempts") or 1)
-                    if attempts < self.config.bot.transient_retry_attempts:
-                        self._state.fail_task(
-                            task_id,
-                            token,
-                            partial_error,
-                            retry_at=time.time() + max(1, self.config.bot.transient_retry_delay_seconds),
-                        )
-                        return
-                self._complete_durable_failure(task, token, partial_error, result)
+            result = classify_result(DownloadResult.from_mapping(self._download_url(task["original_url"])))
+            attempts = int(task.get("attempts") or 1)
+            decision = decide_outcome(
+                result,
+                attempts=attempts,
+                max_attempts=max(1, int(getattr(self.config.bot, "transient_retry_attempts", 3))),
+                now=time.time(),
+                retry_delay_seconds=max(
+                    0, float(getattr(self.config.bot, "transient_retry_delay_seconds", 0))
+                ),
+            )
+            result_payload = result.to_dict()
+            if decision.action == "retry":
+                self._state.fail_task(
+                    task_id,
+                    token,
+                    decision.error or "download failed",
+                    retry_at=decision.retry_at,
+                )
                 return
-            if result.get("success"):
+            if decision.action == "complete" and result.success and not result.partial:
                 if sender:
                     self._cooldowns[sender] = time.time()
-                filepath = result.get("filepath") or "未知路径"
+                filepath = result_payload.get("filepath") or "未知路径"
                 payload = {
                     "to_addr": task.get("payload", {}).get("sender", ""),
-                    "body": _format_success_reply(result, filepath),
-                    "subject_status": _success_subject_status(result),
+                    "body": _format_success_reply(result_payload, filepath),
+                    "subject_status": _success_subject_status(result_payload),
                 }
                 completed = self._state.complete_task(
                     task_id,
                     token,
-                    result=result,
+                    result=result_payload,
                     notification=payload if self._notifications_enabled() else None,
                 )
                 if completed is None:
@@ -1235,30 +1197,30 @@ class EmailBot:
                     self._remove_legacy_retry(task.get("payload", {}))
                 return
 
-            if error_msg and _is_transient_failure(error_msg):
-                attempts = int(task.get("attempts") or 1)
-                if attempts < self.config.bot.transient_retry_attempts:
-                    self._state.fail_task(
-                        task_id,
-                        token,
-                        error_msg,
-                        retry_at=time.time() + max(1, self.config.bot.transient_retry_delay_seconds),
-                    )
-                    return
-
-            self._complete_durable_failure(task, token, error_msg or "未知错误")
+            error_msg = decision.error or result.error or "未知错误"
+            self._complete_durable_failure(task, token, error_msg, result_payload)
         except Exception as exc:
             logger.exception("Durable task %d failed", task_id)
-            attempts = int(task.get("attempts") or 1)
-            if attempts < self.config.bot.transient_retry_attempts:
+            decision = decide_exception(
+                exc,
+                attempts=int(task.get("attempts") or 1),
+                max_attempts=max(1, int(getattr(self.config.bot, "transient_retry_attempts", 3))),
+                now=time.time(),
+                retry_delay_seconds=max(
+                    0, float(getattr(self.config.bot, "transient_retry_delay_seconds", 0))
+                ),
+            )
+            if decision.action == "retry":
                 self._state.fail_task(
                     task_id,
                     token,
-                    str(exc),
-                    retry_at=time.time() + max(1, self.config.bot.transient_retry_delay_seconds),
+                    decision.error or str(exc),
+                    retry_at=decision.retry_at,
                 )
             else:
-                self._complete_durable_failure(task, token, str(exc))
+                self._complete_durable_failure(
+                    task, token, decision.error or str(exc), decision.result.to_dict()
+                )
         finally:
             heartbeat_stop.set()
             heartbeat.join(timeout=2)
@@ -1272,10 +1234,10 @@ class EmailBot:
 
     def _before_task_service_execute(self, task) -> None:
         """Hold a sender lock across cooldown check and the full download."""
-        state = getattr(self, "_state", None)
-        if state is None:
+        mail_store = self._mail_store_for_use()
+        if mail_store is None:
             return
-        row = state.get_task_by_id(task.task_id)
+        row = mail_store.get_task_by_id(task.task_id)
         sender = str(((row or {}).get("payload") or {}).get("sender") or "")
         if not sender:
             return
@@ -1298,8 +1260,8 @@ class EmailBot:
 
     def _after_task_service_execute(self, task, result) -> None:
         if result.success:
-            state = getattr(self, "_state", None)
-            row = state.get_task_by_id(task.task_id) if state is not None else None
+            mail_store = self._mail_store_for_use()
+            row = mail_store.get_task_by_id(task.task_id) if mail_store is not None else None
             sender = str(((row or {}).get("payload") or {}).get("sender") or "")
             if sender:
                 self._cooldowns[sender] = time.time()
@@ -1427,7 +1389,8 @@ class EmailBot:
                 logger.exception("Task heartbeat failed for %d", task_id)
 
     def _outbox_worker_loop(self) -> None:
-        assert self._state is not None
+        mail_store = self._mail_store_for_use()
+        assert mail_store is not None
         if not self._notifications_enabled():
             logger.info("SMTP outbox worker disabled by EMAIL_SEND_REPLIES")
             return
@@ -1436,7 +1399,7 @@ class EmailBot:
                 with self._claim_gate:
                     if not self._intake_is_enabled():
                         return
-                    items = self._state.claim_outbox(
+                    items = mail_store.claim_outbox(
                         1,
                         lease_seconds=getattr(self.config.bot, "lease_seconds", 300),
                         worker_id="smtp-outbox",
@@ -1461,7 +1424,8 @@ class EmailBot:
                 self._stop_event.wait(1)
 
     def _deliver_outbox(self, item: dict) -> None:
-        assert self._state is not None
+        mail_store = self._mail_store_for_use()
+        assert mail_store is not None
         heartbeat_stop = threading.Event()
         heartbeat = threading.Thread(
             target=self._heartbeat_outbox,
@@ -1485,7 +1449,7 @@ class EmailBot:
             retry_at = None
             if attempts < max_attempts:
                 retry_at = time.time() + max(1, getattr(self.config.bot, "outbox_retry_delay_seconds", 60))
-            self._state.mark_outbox_failed(
+            mail_store.mark_outbox_failed(
                 int(item["id"]),
                 item["lease_token"],
                 str(exc),
@@ -1493,17 +1457,18 @@ class EmailBot:
             )
             logger.warning("SMTP outbox %d delivery failed (attempt %d/%d): %s", item["id"], attempts, max_attempts, exc)
         else:
-            self._state.mark_outbox_sent(int(item["id"]), item["lease_token"])
+            mail_store.mark_outbox_sent(int(item["id"]), item["lease_token"])
         finally:
             heartbeat_stop.set()
             heartbeat.join(timeout=2)
 
     def _heartbeat_outbox(self, outbox_id: int, token: str, stop: threading.Event) -> None:
-        assert self._state is not None
+        mail_store = self._mail_store_for_use()
+        assert mail_store is not None
         interval = max(1, getattr(self.config.bot, "heartbeat_seconds", 30))
         while not stop.wait(interval):
             try:
-                if self._state.heartbeat_outbox(
+                if mail_store.heartbeat_outbox(
                     outbox_id,
                     token,
                     lease_seconds=getattr(self.config.bot, "lease_seconds", 300),
@@ -1573,7 +1538,8 @@ class EmailBot:
 
     def _poll_once_durable(self, cfg, bot_cfg) -> None:
         """Fetch UIDs and durably accept them before acknowledging ``\\Seen``."""
-        assert self._state is not None
+        mail_store = self._mail_store_for_use()
+        assert mail_store is not None
         mailbox = "INBOX"
         mail = self._imap_connect(cfg)
         try:
@@ -1582,7 +1548,7 @@ class EmailBot:
             if uidvalidity is None:
                 logger.error("IMAP UIDVALIDITY is unavailable; refusing sequence-based intake")
                 return
-            position = self._state.get_mailbox_position(mailbox)
+            position = mail_store.get_mailbox_position(mailbox)
             reset = position is None or position["uidvalidity"] != uidvalidity
             baseline_uid = None
             if reset:
@@ -1606,7 +1572,7 @@ class EmailBot:
             # if an external client changed their Seen flag after a crash.
             uids.update(
                 int(item["uid"])
-                for item in self._state.pending_intake(mailbox, uidvalidity)
+                for item in mail_store.pending_intake(mailbox, uidvalidity)
             )
             # Reconcile the durable high-water mark and still honor the
             # service's normal UNSEEN poll contract. During a reset, ALL is
@@ -1685,7 +1651,7 @@ class EmailBot:
                     break
             if reset and reconciliation_ok:
                 assert baseline_uid is not None
-                self._state.set_mailbox_position(mailbox, uidvalidity, baseline_uid)
+                mail_store.set_mailbox_position(mailbox, uidvalidity, baseline_uid)
         finally:
             self._clear_active_imap(mail)
             self._safe_logout(mail)
@@ -1768,8 +1734,9 @@ class EmailBot:
         return None
 
     def _retry_pending_seen(self, mail, mailbox: str, uidvalidity: int) -> None:
-        assert self._state is not None
-        for item in self._state.pending_seen(mailbox):
+        mail_store = self._mail_store_for_use()
+        assert mail_store is not None
+        for item in mail_store.pending_seen(mailbox):
             if int(item["uidvalidity"]) != uidvalidity:
                 continue
             try:
@@ -1777,7 +1744,7 @@ class EmailBot:
             except Exception:
                 ok = False
             if ok:
-                self._state.ack_message(item["source_message_id"])
+                mail_store.ack_message(item["source_message_id"])
 
     def _durably_accept_email(
         self,
@@ -1793,7 +1760,8 @@ class EmailBot:
         advance_position: bool = True,
     ) -> tuple[bool, bool]:
         """Commit source identity and route work before attempting IMAP STORE."""
-        assert self._state is not None
+        mail_store = self._mail_store_for_use()
+        assert mail_store is not None
         raw_sha256 = hashlib.sha256(raw).hexdigest()
         urls: list[str] = []
         platform = None
@@ -1846,13 +1814,7 @@ class EmailBot:
             }
 
         try:
-            task_service = getattr(self, "_task_service", None)
-            accept_mail = (
-                task_service.accept_mail_message
-                if task_service is not None
-                else self._state.accept_message
-            )
-            accepted = accept_mail(
+            accepted = mail_store.accept_message(
                 mailbox,
                 uidvalidity,
                 uid,
@@ -1887,7 +1849,7 @@ class EmailBot:
             # A source stays pending until URL routing (or the safe
             # empty/quarantine intake) has been persisted.
             try:
-                if not self._state.mark_intake_complete(source_id):
+                if not mail_store.mark_intake_complete(source_id):
                     logger.warning("Could not finalize durable intake for UID %d", uid)
                     return False, bool(routing_error)
             except Exception:
@@ -1896,7 +1858,7 @@ class EmailBot:
 
         try:
             if _mark_seen_uid(mail, uid):
-                self._state.ack_message(source_id)
+                mail_store.ack_message(source_id)
         except Exception:
             logger.warning("Durable intake committed but IMAP \\Seen ACK failed for UID %d", uid)
         return True, bool(routing_error)
@@ -1914,7 +1876,8 @@ class EmailBot:
         advance_position: bool = True,
     ) -> bool:
         """Persist safe error metadata, acknowledge, and isolate one mail."""
-        assert self._state is not None
+        mail_store = self._mail_store_for_use()
+        assert mail_store is not None
         metadata = {
             "uid": uid,
             "uidvalidity": uidvalidity,
@@ -1922,13 +1885,7 @@ class EmailBot:
             "intake_error": type(error).__name__,
         }
         try:
-            task_service = getattr(self, "_task_service", None)
-            accept_mail = (
-                task_service.accept_mail_message
-                if task_service is not None
-                else self._state.accept_message
-            )
-            accepted = accept_mail(
+            accepted = mail_store.accept_message(
                 mailbox,
                 uidvalidity,
                 uid,
@@ -1937,17 +1894,17 @@ class EmailBot:
                 metadata=metadata,
                 advance_position=advance_position,
             )
-            if not self._state.replace_source_metadata(source_id, metadata):
+            if not mail_store.replace_source_metadata(source_id, metadata):
                 logger.error("Could not persist quarantine metadata for UID %d", uid)
                 return False
             if (
                 not accepted["intake_complete"]
-                and not self._state.mark_intake_complete(source_id)
+                and not mail_store.mark_intake_complete(source_id)
             ):
                 logger.error("Could not finalize quarantined intake for UID %d", uid)
                 return False
             if _mark_seen_uid(mail, uid):
-                self._state.ack_message(source_id)
+                mail_store.ack_message(source_id)
             return True
         except Exception:
             logger.exception("Could not quarantine malformed email UID %d", uid)
@@ -1956,8 +1913,9 @@ class EmailBot:
     def _ensure_task_for_notice(
         self, source_id: str, metadata: dict, event: str, notification: dict
     ) -> int:
-        assert self._state is not None
-        task = self._state.enqueue_notice(
+        mail_store = self._mail_store_for_use()
+        assert mail_store is not None
+        task = mail_store.enqueue_notice(
             source_id,
             event,
             {**metadata, "notification": notification, "event": event},
@@ -2030,35 +1988,41 @@ class EmailBot:
                 logger.info("Sender %s in cooldown (%ds remaining)", sender, remaining)
                 return
 
-        result = self._download_url(url)
-
-        if result["success"]:
-            partial_error = _partial_failure_error(result)
-            if partial_error and _is_transient_failure(partial_error):
+        result = classify_result(DownloadResult.from_mapping(self._download_url(url)))
+        decision = decide_outcome(
+            result,
+            attempts=1,
+            max_attempts=max(1, int(getattr(bot_cfg, "transient_retry_attempts", 3))),
+            now=time.time(),
+            retry_delay_seconds=max(0, float(getattr(bot_cfg, "transient_retry_delay_seconds", 0))),
+        )
+        result_payload = result.to_dict()
+        if result.success:
+            if decision.action == "retry":
                 self._enqueue_retry(
                     url=url,
                     sender=sender,
                     subject=subject,
                     platform=platform or "unknown",
-                    error_msg=partial_error,
+                    error_msg=decision.error or "部分下载失败",
                     bot_cfg=bot_cfg,
                 )
-                result["retry_queued"] = True
+                result_payload["retry_queued"] = True
             self._cooldowns[sender] = time.time()
-            filepath = result["filepath"] or "未知路径"
+            filepath = result_payload["filepath"] or "未知路径"
             logger.info(
                 f"{Fore.GREEN}{Style.BRIGHT}[DONE] 下载成功: %s -> %s",
-                result["title"],
+                result_payload["title"],
                 filepath,
             )
             self._send_reply(
                 cfg, sender,
-                _format_success_reply(result, filepath),
-                subject_status=_success_subject_status(result),
+                _format_success_reply(result_payload, filepath),
+                subject_status=_success_subject_status(result_payload),
             )
         else:
-            error_msg = result["error"]
-            if _is_transient_failure(error_msg):
+            error_msg = result.error or "未知错误"
+            if decision.action == "retry":
                 self._enqueue_retry(
                     url=url,
                     sender=sender,
@@ -2203,38 +2167,45 @@ class EmailBot:
                 sender,
                 url,
             )
-            result = self._download_url(url)
-            partial_error = _partial_failure_error(result)
+            result = classify_result(DownloadResult.from_mapping(self._download_url(url)))
+            decision = decide_outcome(
+                result,
+                attempts=attempts + 1,
+                max_attempts=max(1, int(getattr(bot_cfg, "transient_retry_attempts", 3))),
+                now=now,
+                retry_delay_seconds=max(0, float(getattr(bot_cfg, "transient_retry_delay_seconds", 0))),
+            )
+            result_payload = result.to_dict()
 
-            if result["success"] and not partial_error:
+            if result.success and decision.action == "complete":
                 self._pending_retries.pop(key, None)
                 self._save_pending_retries()
-                filepath = result["filepath"] or "未知路径"
+                filepath = result_payload["filepath"] or "未知路径"
                 logger.info(
                     f"{Fore.GREEN}{Style.BRIGHT}[DONE] 自动重试下载成功: %s -> %s",
-                    result["title"],
+                    result_payload["title"],
                     filepath,
                 )
                 self._send_reply(
                     cfg,
                     sender,
-                    _format_success_reply(result, filepath, prefix="下载完成！（自动重试成功）"),
-                    subject_status=_success_subject_status(result),
+                    _format_success_reply(result_payload, filepath, prefix="下载完成！（自动重试成功）"),
+                    subject_status=_success_subject_status(result_payload),
                 )
                 continue
 
-            error_msg = partial_error or result.get("error") or "未知错误"
+            error_msg = decision.error or result.error or "未知错误"
             attempts += 1
             item["attempts"] = attempts
             item["last_error"] = error_msg
 
-            if attempts >= bot_cfg.transient_retry_attempts or not _is_transient_failure(error_msg):
+            if decision.action != "retry":
                 self._pending_retries.pop(key, None)
                 self._save_pending_retries()
                 self._record_failed_link(item, error_msg)
                 retry_prefix = (
                     "自动重试后仍有部分资源未下载，已把链接保存到失败清单。"
-                    if result.get("partial") else
+                    if result_payload.get("partial") else
                     "自动重试后仍未下载成功，已把链接保存到失败清单。"
                 )
                 self._send_reply(
@@ -2246,11 +2217,13 @@ class EmailBot:
                         f"失败清单：{self._failed_links_file}\n"
                         f"最后错误：{error_msg}"
                     ),
-                    subject_status="部分资源重试失败" if result.get("partial") else "重试失败",
+                    subject_status="部分资源重试失败" if result_payload.get("partial") else "重试失败",
                 )
                 continue
 
-            item["next_attempt_at"] = now + max(1, bot_cfg.transient_retry_delay_seconds)
+            item["next_attempt_at"] = decision.retry_at or (
+                now + max(1, bot_cfg.transient_retry_delay_seconds)
+            )
             self._pending_retries[key] = item
             self._save_pending_retries()
             logger.info(

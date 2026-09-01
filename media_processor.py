@@ -17,6 +17,8 @@ from pathlib import Path
 
 from PIL import Image, ImageChops, ImageOps, ImageStat
 
+from media_file_lock import media_file_lock
+
 
 logger = logging.getLogger("MediaProcessor")
 
@@ -228,7 +230,7 @@ def _image_save_options(image: Image.Image, image_format: str) -> dict:
     return options
 
 
-def process_image(
+def _process_image(
     path: Path, *, dry_run: bool = False, force_review: bool = False
 ) -> ProcessResult:
     """Detect and optionally crop a downloaded image, preserving the original."""
@@ -482,7 +484,7 @@ def _video_crop_from_frames(
     return VideoCropDecision(crop, requires_review=True, confidence="review")
 
 
-def process_video(
+def _process_video(
     path: Path, *, dry_run: bool = False, force_review: bool = False
 ) -> ProcessResult:
     """Sample a video across its duration and remove consensus uniform borders."""
@@ -624,16 +626,56 @@ def process_video(
 
 
 def process_media(
-    path: Path, *, dry_run: bool = False, force_review: bool = False
+    path: Path,
+    *,
+    dry_run: bool = False,
+    force_review: bool = False,
+    lock_root: Path | None = None,
+    lock_timeout: float = 5.0,
 ) -> ProcessResult:
-    """Process one supported image or video."""
+    """Process one supported image or video as one locked transaction."""
     path = Path(path)
     suffix = path.suffix.lower()
-    if suffix in IMAGE_EXTENSIONS:
-        return process_image(path, dry_run=dry_run, force_review=force_review)
-    if suffix in VIDEO_EXTENSIONS:
-        return process_video(path, dry_run=dry_run, force_review=force_review)
-    return ProcessResult(path, False, reason="unsupported media type")
+    if suffix not in IMAGE_EXTENSIONS and suffix not in VIDEO_EXTENSIONS:
+        return ProcessResult(path, False, reason="unsupported media type")
+    with media_file_lock(path, root=lock_root, timeout=lock_timeout), media_file_lock(
+        _backup_path(path), root=lock_root, timeout=lock_timeout
+    ):
+        if suffix in IMAGE_EXTENSIONS:
+            return _process_image(path, dry_run=dry_run, force_review=force_review)
+        return _process_video(path, dry_run=dry_run, force_review=force_review)
+
+
+def process_image(
+    path: Path,
+    *,
+    dry_run: bool = False,
+    force_review: bool = False,
+    lock_root: Path | None = None,
+    lock_timeout: float = 5.0,
+) -> ProcessResult:
+    """Detect and optionally crop an image under its per-file lock."""
+    path = Path(path)
+    with media_file_lock(path, root=lock_root, timeout=lock_timeout), media_file_lock(
+        _backup_path(path), root=lock_root, timeout=lock_timeout
+    ):
+        return _process_image(path, dry_run=dry_run, force_review=force_review)
+
+
+def process_video(
+    path: Path,
+    *,
+    dry_run: bool = False,
+    force_review: bool = False,
+    lock_root: Path | None = None,
+    lock_timeout: float = 5.0,
+) -> ProcessResult:
+    """Detect and optionally crop a video under its per-file lock."""
+    path = Path(path)
+    with media_file_lock(path, root=lock_root, timeout=lock_timeout), media_file_lock(
+        _backup_path(path), root=lock_root, timeout=lock_timeout
+    ):
+        return _process_video(path, dry_run=dry_run, force_review=force_review)
 
 
 def log_process_result(

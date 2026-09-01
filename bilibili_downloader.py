@@ -9,6 +9,7 @@ from pathlib import Path
 
 from colorama import Fore, Style
 
+from media_file_lock import MediaFileLockBusy, media_file_lock
 from media_processor import log_process_result, process_media
 
 logger = logging.getLogger("BilibiliDownloader")
@@ -37,7 +38,23 @@ class BilibiliDownloader:
         """
         download_dir = Path(self.config.download_path)
         download_dir.mkdir(parents=True, exist_ok=True)
+        shared_root = download_dir.parent
+        transaction_lock = media_file_lock(
+            download_dir / ".yutto-transaction",
+            root=shared_root,
+            timeout=max(5.0, float(self.config.timeout)),
+        )
+        try:
+            transaction_lock.acquire()
+        except MediaFileLockBusy:
+            return self._error("B站下载等待媒体目录锁超时，请稍后重试")
+        try:
+            return self._download_locked(url, download_dir, shared_root)
+        finally:
+            transaction_lock.release()
 
+    def _download_locked(self, url: str, download_dir: Path, shared_root: Path) -> dict:
+        """Run yutto and publish results while browser media writes are paused."""
         started_at = time.time()
         command = self._build_command(url, download_dir)
         logger.info("Running yutto for Bilibili URL: %s", url)
@@ -72,7 +89,7 @@ class BilibiliDownloader:
 
         covers = _move_cover_files(download_dir, started_at)
         files = _collect_downloaded_files(download_dir, started_at)
-        _process_downloaded_media([*files, *covers])
+        _process_downloaded_media([*files, *covers], shared_root)
         filepath = _format_file_result(files, download_dir)
         title = _extract_title(output) or "Bilibili Video"
 
@@ -193,7 +210,13 @@ def _move_cover_files(download_dir: Path, started_at: float) -> list[Path]:
     for cover in covers:
         target = _unique_path(slides_dir / f"bilibili_{cover.name}")
         try:
-            shutil.move(str(cover), str(target))
+            # yutto has already exited; lock only the source-to-slides
+            # publication, never the subprocess itself.
+            with media_file_lock(cover, root=download_dir.parent, timeout=5):
+                shutil.move(str(cover), str(target))
+        except MediaFileLockBusy:
+            logger.warning("Bilibili cover is busy, leaving it in place: %s", cover)
+            continue
         except OSError as exc:
             logger.warning("Failed to move Bilibili cover %s to %s: %s", cover, target, exc)
             continue
@@ -241,11 +264,11 @@ def _format_file_result(files: list[Path], download_dir: Path) -> str | None:
     return f"{download_dir} ({len(files)} 个文件)"
 
 
-def _process_downloaded_media(paths: list[Path]) -> None:
+def _process_downloaded_media(paths: list[Path], lock_root: Path | None = None) -> None:
     """Best-effort post-processing that cannot invalidate a yutto download."""
     for path in paths:
         try:
-            result = process_media(path)
+            result = process_media(path, lock_root=lock_root)
             log_process_result(result, logger)
         except Exception as exc:
             logger.warning("Auto-crop failed for %s: %s", path.name, exc)

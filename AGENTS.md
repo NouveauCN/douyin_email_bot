@@ -48,6 +48,16 @@ QQ C2C -> qq_gateway -> authenticated qq_bridge -> DownloadTaskService
                                               -> task event -> QQ outbox reply
 ```
 
+The maintained architecture contract is [ARCHITECTURE.md](ARCHITECTURE.md).
+`MailStateStore` is the shared transactional kernel; production callers use
+the Task, Mail, or QQ facade and must not reach through a facade to
+`service.store.state` or raw SQLite tables. `EmailBot` owns composition and
+lifecycle, while adapters/projectors own intake and sink-specific projection.
+The durable path is authoritative; the legacy JSON path is rollback-only.
+Media writers must use the shared-root cooperative tree-and-target lock when
+operating across bot and file-browser processes; process-local locks are not
+sufficient.
+
 ## Safety And Boundaries
 
 - Never commit credentials, cookies, yutto auth files, Firefox profiles,

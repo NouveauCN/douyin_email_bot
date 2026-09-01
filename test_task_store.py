@@ -4,12 +4,22 @@ from task_store import TaskStore
 
 def test_submit_is_idempotent_per_source_namespace(tmp_path):
     store = TaskStore(tmp_path / "state.sqlite")
+    assert not hasattr(store, "state")
     first = store.submit(TaskRequest("https://example.test/video", SourceRef("email", "1")))
     duplicate = store.submit(TaskRequest("https://example.test/video", SourceRef("email", "1")))
     other_entry = store.submit(TaskRequest("https://example.test/video", SourceRef("qq", "1")))
     assert duplicate.task_id == first.task_id
     assert other_entry.task_id != first.task_id
     assert first.source == SourceRef("email", "1")
+    store.close()
+
+
+def test_snapshot_exposes_validated_non_secret_metadata(tmp_path):
+    store = TaskStore(tmp_path / "state.sqlite")
+    submitted = store.submit(
+        TaskRequest("fake:1", SourceRef("qq", "1"), {"reply_to": "user@example.test"})
+    )
+    assert submitted.metadata == {"reply_to": "user@example.test"}
     store.close()
 
 
@@ -39,7 +49,7 @@ def test_task_lifecycle_and_event_projection_are_durable(tmp_path):
         outbox_payload={"to_addr": "user@example.test", "body": "done"},
     ) is True
     assert store.project_event(events[0]["id"], "qq-notifier") is False
-    assert store.state._conn.execute("SELECT COUNT(*) FROM smtp_outbox").fetchone()[0] == 1
+    assert store._state._conn.execute("SELECT COUNT(*) FROM smtp_outbox").fetchone()[0] == 1
     store.close()
 
 

@@ -16,6 +16,7 @@ from typing import Any, Mapping, TypeAlias
 
 JSONPrimitive: TypeAlias = None | bool | int | float | str
 JSONValue: TypeAlias = JSONPrimitive | list["JSONValue"] | dict[str, "JSONValue"]
+Metadata: TypeAlias = dict[str, JSONValue]
 
 
 class TaskStatus(str, Enum):
@@ -86,6 +87,18 @@ def _contains_secret_key(value: Any) -> bool:
     return False
 
 
+def validate_metadata(value: Mapping[str, JSONValue] | None) -> Metadata:
+    """Validate and copy non-secret JSON metadata at a public boundary."""
+    metadata: Metadata = dict(value or {})
+    _validate_json(metadata)
+    if _contains_secret_key(metadata):
+        raise ValueError("metadata must not contain secret-like fields")
+    encoded = json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > 64 * 1024:
+        raise ValueError("metadata is too large")
+    return metadata
+
+
 @dataclass(frozen=True, slots=True)
 class SourceRef:
     """An idempotency namespace and identifier owned by an entry point."""
@@ -142,13 +155,7 @@ class TaskRequest:
             raise ValueError("url must not be empty")
         if len(value) > 8192 or "\x00" in value:
             raise ValueError("url is invalid")
-        clean_metadata = dict(metadata or {})
-        _validate_json(clean_metadata)
-        if _contains_secret_key(clean_metadata):
-            raise ValueError("task metadata must not contain secret-like fields")
-        encoded = json.dumps(clean_metadata, ensure_ascii=False, separators=(",", ":"))
-        if len(encoded.encode("utf-8")) > 64 * 1024:
-            raise ValueError("metadata is too large")
+        clean_metadata = validate_metadata(metadata)
         object.__setattr__(self, "url", value)
         object.__setattr__(self, "source", source)
         object.__setattr__(self, "metadata", clean_metadata)
@@ -274,6 +281,7 @@ class TaskSnapshot:
     lease_token: str | None = None
     lease_expires_at: float | None = None
     max_attempts: int | None = None
+    metadata: Metadata = field(default_factory=dict)
 
     @classmethod
     def from_record(cls, row: Mapping[str, Any]) -> "TaskSnapshot":
@@ -311,6 +319,7 @@ class TaskSnapshot:
             lease_token=row.get("lease_token"),
             lease_expires_at=row.get("lease_expires_at"),
             max_attempts=int(row["max_attempts"]) if row.get("max_attempts") is not None else None,
+            metadata=validate_metadata(row.get("payload") if isinstance(row.get("payload"), Mapping) else {}),
         )
 
 
@@ -318,9 +327,11 @@ __all__ = [
     "DownloadResult",
     "ErrorCode",
     "JSONValue",
+    "Metadata",
     "RetryClass",
     "SourceRef",
     "TaskRequest",
     "TaskSnapshot",
     "TaskStatus",
+    "validate_metadata",
 ]

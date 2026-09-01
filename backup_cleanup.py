@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from media_file_lock import MediaFileLockBusy, media_file_lock
+
 
 logger = logging.getLogger("BackupCleanup")
 
@@ -59,17 +61,21 @@ def cleanup_expired_backups(
         candidates = root.rglob(_BACKUP_GLOB)
         for path in candidates:
             try:
-                if not path.is_file():
-                    continue
-                scanned += 1
-                if _retention_timestamp(path) > cutoff:
-                    retained += 1
-                    continue
-                path.unlink()
-                deleted += 1
-                logger.info("Deleted expired media backup: %s", path)
+                with media_file_lock(path, root=root, timeout=0.1):
+                    if not path.is_file():
+                        continue
+                    scanned += 1
+                    if _retention_timestamp(path) > cutoff:
+                        retained += 1
+                        continue
+                    path.unlink()
+                    deleted += 1
+                    logger.info("Deleted expired media backup: %s", path)
             except FileNotFoundError:
                 continue
+            except MediaFileLockBusy:
+                failed += 1
+                logger.info("Media backup is busy; skipping cleanup: %s", path)
             except OSError as exc:
                 failed += 1
                 logger.warning("Failed to delete media backup %s: %s", path, exc)
