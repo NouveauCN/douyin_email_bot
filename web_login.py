@@ -18,6 +18,7 @@ import math
 import os
 import queue
 import secrets
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -66,6 +67,8 @@ _rate_limit_buckets: dict[tuple[str, str], deque[float]] = {}
 _DESKTOP_WIDTH = 1280
 _DESKTOP_HEIGHT = 720
 _MAX_DESKTOP_JSON_BYTES = 16 * 1024
+_COOKIE_SAVE_MAX_ATTEMPTS = 4
+_COOKIE_SAVE_BACKOFF_SECONDS = (0.05, 0.1, 0.2)
 
 
 class RemoteBrowserError(RuntimeError):
@@ -545,6 +548,48 @@ def _desktop_failure(exc: RemoteBrowserError, status: int = 409):
     return _desktop_response({"success": False, "message": str(exc)}, status)
 
 
+def _persist_authenticated_cookie(cookie_str: str) -> bool:
+    """Persist a validated cookie, retrying only transient SQLite contention.
+
+    The cookie is intentionally never included in logs or exception responses.
+    The settings database is also written by the bot, so a short busy/locked
+    window is expected while both processes commit their changes.
+    """
+    changes = [{"key": "douyin.cookie", "action": "set", "value": cookie_str}]
+    for attempt in range(_COOKIE_SAVE_MAX_ATTEMPTS):
+        try:
+            _settings.apply(changes)
+            return True
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "locked" not in message and "busy" not in message:
+                log.error(
+                    "Authenticated cookie persistence failed (exception_type=%s category=sqlite_operational)",
+                    type(exc).__name__,
+                )
+                return False
+            if attempt + 1 >= _COOKIE_SAVE_MAX_ATTEMPTS:
+                log.error(
+                    "Authenticated cookie persistence failed (exception_type=%s category=sqlite_busy)",
+                    type(exc).__name__,
+                )
+                return False
+            log.warning(
+                "Authenticated cookie persistence retry %d/%d (exception_type=%s category=sqlite_busy)",
+                attempt + 1,
+                _COOKIE_SAVE_MAX_ATTEMPTS - 1,
+                type(exc).__name__,
+            )
+            time.sleep(_COOKIE_SAVE_BACKOFF_SECONDS[attempt])
+        except Exception as exc:
+            log.error(
+                "Authenticated cookie persistence failed (exception_type=%s category=unexpected)",
+                type(exc).__name__,
+            )
+            return False
+    return False
+
+
 def _desktop_payload() -> dict:
     if request.content_length is not None and request.content_length > _MAX_DESKTOP_JSON_BYTES:
         raise RemoteBrowserError("请求过大")
@@ -668,10 +713,7 @@ def api_desktop_save():
         grade, is_authenticated = _assess_quality(cookie_str)
         if not is_authenticated:
             return _desktop_response({"success": False, "status": "pending", "auth_count": auth_count, "message": f"尚未检测到完整登录状态（{grade}）"}, 409)
-        try:
-            _settings.apply([{"key": "douyin.cookie", "action": "set", "value": cookie_str}])
-        except Exception:
-            log.error("Remote login cookie could not be saved")
+        if not _persist_authenticated_cookie(cookie_str):
             return _desktop_response({"success": False, "message": "Cookie 保存失败，请稍后重试"}, 500)
         log.info("Remote login cookie saved (%d auth tokens)", auth_count)
         return _desktop_response({"success": True, "status": "logged_in", "auth_count": auth_count, "message": f"登录状态已保存（{grade}）"})
@@ -728,10 +770,7 @@ def api_status():
         if cookie_str:
             grade, is_authenticated = _assess_quality(cookie_str)
             if is_authenticated:
-                try:
-                    _settings.apply([{"key": "douyin.cookie", "action": "set", "value": cookie_str}])
-                except Exception:
-                    log.error("Login cookie detected but could not be saved to runtime settings")
+                if not _persist_authenticated_cookie(cookie_str):
                     return _desktop_response({"status": "failure", "auth_count": auth_count, "message": "Cookie 保存失败，请稍后重试"}, 500)
                 return _desktop_response({"status": "logged_in", "auth_count": auth_count, "message": f"登录状态已检测并保存（{grade}）"})
         return _desktop_response({"status": "pending", "auth_count": auth_count, "message": "等待扫码或登录"})
@@ -747,13 +786,10 @@ def api_status():
 
         # Persist only after quality validation. Do not put the cookie in the
         # process environment: it would hide later managed-store updates.
-        try:
-            _settings.apply([{"key": "douyin.cookie", "action": "set", "value": cookie_str}])
-        except Exception:
+        if not _persist_authenticated_cookie(cookie_str):
             # Never include the cookie or the storage exception in a response
             # or log line.  The browser can retry after the operator fixes the
             # environment override or runtime database.
-            log.error("Login cookie detected but could not be saved to runtime settings")
             response = jsonify({
                 "status": "failure",
                 "auth_count": result.get("auth_count"),
