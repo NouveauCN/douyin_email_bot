@@ -46,6 +46,7 @@ from media_processor import (  # noqa: E402
     ProcessResult,
     process_media,
 )
+from media_file_lock import MediaFileLockBusy, media_file_lock  # noqa: E402
 from settings_store import SETTING_REGISTRY, SettingsStore  # noqa: E402
 from web_login import WEB_LOGIN_PANEL_HTML, register_web_login  # noqa: E402
 
@@ -444,6 +445,9 @@ def _safe_subpath(subpath: str) -> Path:
         p.relative_to(root)
     except ValueError:
         abort(403, "Path traversal denied")
+    lock_dir = root / ".media_locks"
+    if p == lock_dir or lock_dir in p.parents:
+        abort(403, "保留锁目录不可访问")
     return p
 
 
@@ -974,6 +978,17 @@ def api_delete():
         return _media_busy_response()
 
     try:
+        with media_file_lock(target, root=_DOWNLOAD_DIR, timeout=0.25):
+            return _delete_locked(target, download_root)
+    except MediaFileLockBusy:
+        return {"success": False, "error": "媒体文件正在处理中，请稍后重试"}, 409
+    finally:
+        _MEDIA_SEMAPHORE.release()
+
+
+def _delete_locked(target: Path, download_root: Path):
+    """Delete a validated target while its per-path lock is held."""
+    try:
         # Save this before deletion: ``Path.is_dir()`` is false after rmtree,
         # which would otherwise leave stale directory entries in dedup state.
         target_was_dir = target.is_dir()
@@ -1016,8 +1031,6 @@ def api_delete():
     except OSError as e:
         log.error("Failed to delete %s: %s", target, e)
         return {"success": False, "error": str(e)}, 500
-    finally:
-        _MEDIA_SEMAPHORE.release()
 
 
 def _crop_result_payload(result: ProcessResult) -> dict:
@@ -1062,6 +1075,8 @@ def api_crop_preview():
     try:
         result = process_media(target, dry_run=True)
         return _crop_result_payload(result)
+    except MediaFileLockBusy:
+        return {"success": False, "error": "媒体文件正在处理中，请稍后重试"}, 409
     except Exception as exc:
         log.exception("Crop preview failed for %s", target)
         return {"success": False, "error": str(exc)}, 500
@@ -1090,6 +1105,8 @@ def api_crop_apply():
             return payload, 422
         log.info("Manual crop applied: %s (%s)", target, result.confidence)
         return payload
+    except MediaFileLockBusy:
+        return {"success": False, "error": "媒体文件正在处理中，请稍后重试"}, 409
     except Exception as exc:
         log.exception("Crop apply failed for %s", target)
         return {"success": False, "error": str(exc)}, 500
@@ -1115,7 +1132,7 @@ def _convert_video(src: Path, dst: Path) -> bool:
 def _upload_response(payload: dict, status: int = 200):
     """Return JSON to enhanced clients and redirect native form submissions."""
     if request.headers.get("X-Requested-With") == "XMLHttpRequest" or status in {
-        413, 429, 503
+        409, 413, 429, 503
     }:
         return payload, status
 
@@ -1304,7 +1321,20 @@ def api_upload():
             {"success": False, "error": "媒体处理繁忙，请稍后重试"}, 429
         )
     try:
-        processed = [_process_uploaded_file(file) for file in files]
+        try:
+            # Serialize upload publish/convert transactions.  This lock is
+            # intentionally separate from per-file processing locks and never
+            # spans network downloads (uploads are already local input).
+            with media_file_lock(
+                _DOWNLOAD_DIR / ".upload-transaction",
+                root=_DOWNLOAD_DIR,
+                timeout=0.25,
+            ):
+                processed = [_process_uploaded_file(file) for file in files]
+        except MediaFileLockBusy:
+            return _upload_response(
+                {"success": False, "error": "媒体目录正在处理中，请稍后重试"}, 409
+            )
     finally:
         _MEDIA_SEMAPHORE.release()
     if len(processed) == 1:
@@ -1383,7 +1413,9 @@ def api_dup_delete():
     if not _try_acquire_media_slot():
         return _media_busy_response()
 
+    file_lock = media_file_lock(target, root=_DOWNLOAD_DIR, timeout=0.25)
     try:
+        file_lock.acquire()
         target.unlink()
         _cleanup_empty_parents(target.parent)
 
@@ -1407,10 +1439,13 @@ def api_dup_delete():
             _PENDING_DUPS = [d for d in _PENDING_DUPS if d != entry]
             _DEDUP_INDEX.pop(path, None)
         return {"success": True}
+    except MediaFileLockBusy:
+        return {"success": False, "error": "媒体文件正在处理中，请稍后重试"}, 409
     except OSError as e:
         log.error("Dup delete failed: %s", e)
         return {"success": False, "error": str(e)}, 500
     finally:
+        file_lock.release()
         _MEDIA_SEMAPHORE.release()
 
 
@@ -1428,7 +1463,9 @@ def api_dup_keep():
     if not _try_acquire_media_slot():
         return _media_busy_response()
 
+    file_lock = media_file_lock(target, root=_DOWNLOAD_DIR, timeout=0.25)
     try:
+        file_lock.acquire()
         # Add to dedup index
         img = _media_to_image(target)
         with _DEDUP_LOCK:
@@ -1438,10 +1475,13 @@ def api_dup_keep():
             _PENDING_DUPS = [d for d in _PENDING_DUPS if d["new_file"] != path]
         log.info("Dup-kept: %s → added to index", path)
         return {"success": True}
+    except MediaFileLockBusy:
+        return {"success": False, "error": "媒体文件正在处理中，请稍后重试"}, 409
     except Exception as e:
         log.error("Dup keep failed: %s", e)
         return {"success": False, "error": str(e)}, 500
     finally:
+        file_lock.release()
         _MEDIA_SEMAPHORE.release()
 
 

@@ -30,6 +30,7 @@ from f2.exceptions import (
 )
 
 from media_processor import log_process_result, process_media
+from media_file_lock import media_file_lock
 
 logger = logging.getLogger("DouyinDownloader")
 
@@ -230,7 +231,7 @@ class DouyinDownloader:
             )
 
         if downloaded:
-            await _process_downloaded_media(filepath)
+            await _process_downloaded_media(filepath, download_dir)
 
         return {
             "success": True,
@@ -335,7 +336,7 @@ class DouyinDownloader:
                 done += 1
                 total_size += filepath.stat().st_size
                 successful_paths.append(filepath)
-                await _process_downloaded_media(filepath)
+                await _process_downloaded_media(filepath, download_dir)
             except Exception as exc:
                 logger.warning("Failed to download %s %s: %s", label, filepath.name, exc)
                 failures.append(f"{label} {filepath.name}: {exc}")
@@ -419,7 +420,14 @@ class DouyinDownloader:
                 else:
                     final_mode = 0o644
                 temp_path.chmod(final_mode)
-                temp_path.replace(filepath)
+                # Only the atomic publish is locked; network streaming stays
+                # outside the media critical section.
+                with media_file_lock(
+                    filepath,
+                    root=Path(getattr(self.config, "download_path", filepath.parent)),
+                    timeout=5,
+                ):
+                    temp_path.replace(filepath)
                 temp_path = None
                 return
             except Exception as e:
@@ -630,10 +638,14 @@ def _write_cached_aweme_id(cache_key: str, aweme_id: str) -> None:
         logger.warning("Failed to write short-link cache %s: %s", SHORT_LINK_CACHE_PATH, exc)
 
 
-async def _process_downloaded_media(filepath: Path) -> None:
+async def _process_downloaded_media(
+    filepath: Path, lock_root: Path | None = None
+) -> None:
     """Run CPU/subprocess media work without blocking the downloader loop."""
     try:
-        result = await asyncio.to_thread(process_media, filepath)
+        result = await asyncio.to_thread(
+            process_media, filepath, lock_root=lock_root
+        )
         log_process_result(result, logger)
     except Exception as exc:
         # Post-processing must never turn a completed download into a failure.

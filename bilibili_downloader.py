@@ -9,6 +9,7 @@ from pathlib import Path
 
 from colorama import Fore, Style
 
+from media_file_lock import MediaFileLockBusy, media_file_lock
 from media_processor import log_process_result, process_media
 
 logger = logging.getLogger("BilibiliDownloader")
@@ -72,7 +73,7 @@ class BilibiliDownloader:
 
         covers = _move_cover_files(download_dir, started_at)
         files = _collect_downloaded_files(download_dir, started_at)
-        _process_downloaded_media([*files, *covers])
+        _process_downloaded_media([*files, *covers], download_dir)
         filepath = _format_file_result(files, download_dir)
         title = _extract_title(output) or "Bilibili Video"
 
@@ -193,7 +194,13 @@ def _move_cover_files(download_dir: Path, started_at: float) -> list[Path]:
     for cover in covers:
         target = _unique_path(slides_dir / f"bilibili_{cover.name}")
         try:
-            shutil.move(str(cover), str(target))
+            # yutto has already exited; lock only the source-to-slides
+            # publication, never the subprocess itself.
+            with media_file_lock(cover, root=download_dir, timeout=5):
+                shutil.move(str(cover), str(target))
+        except MediaFileLockBusy:
+            logger.warning("Bilibili cover is busy, leaving it in place: %s", cover)
+            continue
         except OSError as exc:
             logger.warning("Failed to move Bilibili cover %s to %s: %s", cover, target, exc)
             continue
@@ -241,11 +248,11 @@ def _format_file_result(files: list[Path], download_dir: Path) -> str | None:
     return f"{download_dir} ({len(files)} 个文件)"
 
 
-def _process_downloaded_media(paths: list[Path]) -> None:
+def _process_downloaded_media(paths: list[Path], lock_root: Path | None = None) -> None:
     """Best-effort post-processing that cannot invalidate a yutto download."""
     for path in paths:
         try:
-            result = process_media(path)
+            result = process_media(path, lock_root=lock_root)
             log_process_result(result, logger)
         except Exception as exc:
             logger.warning("Auto-crop failed for %s: %s", path.name, exc)
