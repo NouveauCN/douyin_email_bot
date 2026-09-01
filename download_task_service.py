@@ -251,6 +251,12 @@ class DownloadTaskService:
         """Preserve atomic IMAP source/task acceptance for the mail adapter."""
         return self.store.accept_mail_message(*args, **kwargs)
 
+    def accept_qq_message(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Atomically persist one QQ source, task, and confirmation outbox."""
+        # TaskStore deliberately keeps its public facade source-agnostic; QQ
+        # intake is nevertheless part of the same SQLite transaction.
+        return self.store.state.accept_qq_message(*args, **kwargs)
+
     def start(self) -> None:
         with self._thread_lock:
             if self._threads:

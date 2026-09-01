@@ -2,6 +2,9 @@
 
 邮箱机器人 —— 发邮件给机器人，自动下载抖音或 B 站视频到本地。
 
+也可以启用可选的 QQ 私聊入口：QQ C2C 消息由独立 Gateway 接收，经内部桥接交给
+同一套下载任务和持久化 outbox，再回传处理结果。
+
 ## 工作原理
 
 ```
@@ -109,6 +112,35 @@ Docker 部署时，失败清单和自动重试队列保存在 bot 的 `state` na
 `/app/state/mail_state.sqlite3`。收件采用 IMAP UID/UIDVALIDITY 幂等入库，
 下载与回复由有界 worker 异步处理；SMTP 失败、进程重启或租约过期都会在
 后续调度中恢复。旧 JSON 队列会保留为回滚源。迁移工具默认只检查不写入：
+
+## QQ 私聊机器人（可选）
+
+QQ 入口使用独立的 QQ Open Platform App，只接收 C2C 私聊；群聊、频道和未列入
+`QQBOT_ALLOWED_OPENIDS` 的 OpenID 都会被拒绝。请在 QQ 开放平台创建专用 App，
+把 App ID、App Secret、允许的 OpenID 列表和内部桥接随机密钥写入未提交的 `.env`：
+
+```env
+QQBOT_APP_ID=你的QQ开放平台AppID
+QQBOT_APP_SECRET=你的QQ开放平台AppSecret
+QQBOT_ALLOWED_OPENIDS=允许的OpenID1,允许的OpenID2
+QQ_BRIDGE_TOKEN=一段足够长的随机字符串
+```
+
+Docker 部署时启动 `bot` 和 `qq_gateway`：
+
+```bash
+docker compose up -d --build bot qq_gateway file_browser
+```
+
+Gateway 只通过 Compose 内网访问 bot 的桥接端口（`bot:8082`），不发布宿主机端口；
+会话状态保存在独立的 `qq_gateway_state` named volume，保持单实例运行。不要把
+桥接端口暴露到 LAN、公网或 Tailscale，也不要把 QQ App Secret 或桥接密钥提交到 Git。
+
+每条 QQ 消息必须包含且只能包含一个抖音或 B 站链接；多链接消息需拆成多条发送。
+机器人会先回复已接收，再在下载任务完成后回复成功、部分成功或失败摘要。回复依赖
+QQ 平台的被动回复窗口，默认 `QQBOT_REPLY_WINDOW_SECONDS=3600` 秒；超时后不会
+发送主动消息，结果仍保留在 bot 的持久化任务/outbox 状态中。失败时请按回复提示
+通过 Web Login 或 `get_cookie.py` 更新抖音 Cookie，不要把 Cookie 贴到 QQ 消息里。
 
 临时验收时可在 `.env` 设置 `EMAIL_SEND_REPLIES=0`；它不会停止收件、下载、
 重试或失败清单投影，只会暂停新 SMTP 回信，已有 outbox 也会保留。用于真实
@@ -274,6 +306,17 @@ Bot 会通过 `douyin.cookie` 的 hot reload 立即读取，Cookie 内容不会�
 
 ### 邮件发不出去
 - QQ 邮箱 SMTP 有频率限制，建议 `poll_interval` 不小于 30 秒
+
+### QQ 私聊没有回复
+- 确认 `.env` 中 `QQBOT_APP_ID`、`QQBOT_APP_SECRET`、`QQ_BRIDGE_TOKEN` 已填写，且
+  `QQBOT_ALLOWED_OPENIDS` 包含发送者的准确 OpenID；不要使用 `*` 放开所有人
+- 确认已执行 `docker compose up -d --build bot qq_gateway`，并检查
+  `docker compose logs --tail=100 bot qq_gateway`
+- 确认 bot 与 gateway 使用相同的 `QQ_BRIDGE_TOKEN`，且桥接地址仍为内部的
+  `http://bot:8082`；不要为桥接端口添加 `ports` 发布
+- 消息必须只有一个抖音或 B 站链接；多链接、无链接、群聊或频道消息不会创建下载任务
+- 若只有“已接收”而没有最终结果，检查下载失败和 QQ 被动回复窗口；窗口过期后 QQ
+  不支持主动补发，需查看 bot 日志和持久化状态
 
 ## 其他邮箱
 
