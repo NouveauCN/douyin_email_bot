@@ -132,6 +132,27 @@ class PlaylistTests(unittest.TestCase):
         self.assertNotIn("queue =", ended_body)
         self.assertNotIn("VIDEOS", ended_body)
 
+    def test_shuffle_toggle_only_reorders_unplayed_queue_tail(self):
+        script = self._playlist_script(
+            self.client.get("/playlist").get_data(as_text=True)
+        )
+        match = re.search(
+            r"function toggleShuffle\(\) \{(?P<body>.*?)\n\}",
+            script,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        toggle_body = match.group("body")
+
+        self.assertIn(
+            "const remaining = queue.slice(currentQueueIdx + 1);", toggle_body
+        )
+        self.assertIn(
+            "queue = queue.slice(0, currentQueueIdx + 1).concat(remaining);",
+            toggle_body,
+        )
+        self.assertNotIn("buildQueue();", toggle_body)
+
 
 if __name__ == "__main__":
     unittest.main()
