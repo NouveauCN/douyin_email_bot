@@ -1,6 +1,7 @@
 """Focused tests for the QR login web API."""
 
 import sys
+import sqlite3
 
 import pytest
 
@@ -120,6 +121,44 @@ def test_status_returns_safe_500_when_cookie_save_fails(monkeypatch, tmp_path):
     }
     assert cookie not in response.get_data(as_text=True)
     assert response.headers["Cache-Control"] == "no-store"
+
+
+def test_cookie_save_retries_transient_sqlite_contention(monkeypatch):
+    cookie = "sessionid=retry-secret"
+    calls = []
+
+    class FlakySettings:
+        def apply(self, changes):
+            calls.append(changes)
+            if len(calls) < 3:
+                raise sqlite3.OperationalError("database is locked")
+
+    sleeps = []
+    monkeypatch.setattr(web_login, "_settings", FlakySettings())
+    monkeypatch.setattr(web_login.time, "sleep", sleeps.append)
+
+    assert web_login._persist_authenticated_cookie(cookie) is True
+    assert len(calls) == 3
+    assert sleeps == [0.05, 0.1]
+    assert calls[-1][0]["value"] == cookie
+
+
+def test_cookie_save_permanent_failure_is_redacted(monkeypatch, caplog):
+    cookie = "sessionid=must-not-leak"
+
+    class FailingSettings:
+        def apply(self, changes):
+            raise sqlite3.OperationalError(f"database error involving {cookie}")
+
+    monkeypatch.setattr(web_login, "_settings", FailingSettings())
+    monkeypatch.setattr(web_login.time, "sleep", lambda _: None)
+
+    with caplog.at_level("ERROR", logger="web_login"):
+        assert web_login._persist_authenticated_cookie(cookie) is False
+
+    assert cookie not in caplog.text
+    assert "OperationalError" in caplog.text
+    assert "category=sqlite_operational" in caplog.text or "category=sqlite_busy" in caplog.text
 
 
 def test_qr_response_is_not_cacheable(monkeypatch, tmp_path):
