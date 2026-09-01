@@ -2,6 +2,8 @@
 
 import sys
 
+import pytest
+
 import web_login
 
 
@@ -11,6 +13,16 @@ SAME_ORIGIN_HEADERS = {"Origin": "http://localhost"}
 def _clear_rate_limits():
     with web_login._rate_limit_lock:
         web_login._rate_limit_buckets.clear()
+
+
+@pytest.fixture(autouse=True)
+def configured_password(monkeypatch):
+    monkeypatch.setenv("WEB_LOGIN_PASSWORD", "test-password")
+    _clear_rate_limits()
+
+
+def _unlock(client, headers=SAME_ORIGIN_HEADERS):
+    return client.post("/api/unlock", json={"password": "test-password"}, headers=headers)
 
 
 def test_status_saves_cookie_but_redacts_it_from_response(monkeypatch, tmp_path):
@@ -32,7 +44,9 @@ def test_status_saves_cookie_but_redacts_it_from_response(monkeypatch, tmp_path)
     monkeypatch.setattr(web_login, "_assess_quality", lambda _: ("A", True))
     monkeypatch.setattr(web_login, "_settings", FakeSettings())
 
-    response = web_login.app.test_client().get("/api/status", headers=SAME_ORIGIN_HEADERS)
+    client = web_login.app.test_client()
+    assert _unlock(client).status_code == 200
+    response = client.get("/api/status", headers=SAME_ORIGIN_HEADERS)
 
     assert saved == {
         "changes": [{"key": "douyin.cookie", "action": "set", "value": cookie}],
@@ -61,7 +75,9 @@ def test_status_returns_only_whitelisted_fields_and_is_not_cacheable(monkeypatch
         },
     )
 
-    response = web_login.app.test_client().get("/api/status", headers=SAME_ORIGIN_HEADERS)
+    client = web_login.app.test_client()
+    assert _unlock(client).status_code == 200
+    response = client.get("/api/status", headers=SAME_ORIGIN_HEADERS)
 
     assert response.get_json() == {
         "status": "pending",
@@ -92,7 +108,9 @@ def test_status_returns_safe_500_when_cookie_save_fails(monkeypatch, tmp_path):
     monkeypatch.setattr(web_login, "_assess_quality", lambda _: ("A", True))
     monkeypatch.setattr(web_login, "_settings", FailingSettings())
 
-    response = web_login.app.test_client().get("/api/status", headers=SAME_ORIGIN_HEADERS)
+    client = web_login.app.test_client()
+    assert _unlock(client).status_code == 200
+    response = client.get("/api/status", headers=SAME_ORIGIN_HEADERS)
 
     assert response.status_code == 500
     assert response.get_json() == {
@@ -108,7 +126,9 @@ def test_qr_response_is_not_cacheable(monkeypatch, tmp_path):
     monkeypatch.setattr(web_login, "_get_profile_dir", lambda: tmp_path)
     monkeypatch.setattr(web_login, "screenshot_qr_code", lambda _: ("base64", "ok"))
 
-    response = web_login.app.test_client().get("/api/qr", headers=SAME_ORIGIN_HEADERS)
+    client = web_login.app.test_client()
+    assert _unlock(client).status_code == 200
+    response = client.get("/api/qr", headers=SAME_ORIGIN_HEADERS)
 
     assert response.status_code == 200
     assert response.headers["Cache-Control"] == "no-store"
@@ -118,6 +138,35 @@ def test_stop_endpoint_is_not_available():
     response = web_login.app.test_client().post("/api/stop")
 
     assert response.status_code == 404
+
+
+def test_missing_password_disables_login(monkeypatch):
+    monkeypatch.delenv("WEB_LOGIN_PASSWORD")
+    client = web_login.app.test_client()
+    assert client.post("/api/unlock", json={"password": "anything"}, headers=SAME_ORIGIN_HEADERS).status_code == 503
+    assert client.get("/api/qr", headers=SAME_ORIGIN_HEADERS).status_code == 503
+
+
+def test_bad_password_does_not_unlock_and_correct_password_does(monkeypatch, tmp_path):
+    called = []
+    monkeypatch.setattr(web_login, "_get_profile_dir", lambda: tmp_path)
+    monkeypatch.setattr(web_login, "screenshot_qr_code", lambda _: called.append(True) or ("base64", "ok"))
+    client = web_login.app.test_client()
+    bad = client.post("/api/unlock", json={"password": "wrong"}, headers=SAME_ORIGIN_HEADERS)
+    assert bad.status_code == 401
+    assert client.get("/api/qr", headers=SAME_ORIGIN_HEADERS).status_code == 401
+    assert _unlock(client).status_code == 200
+    assert client.get("/api/qr", headers=SAME_ORIGIN_HEADERS).status_code == 200
+    assert called == [True]
+
+
+def test_logout_relocks_qr_api(monkeypatch, tmp_path):
+    monkeypatch.setattr(web_login, "_get_profile_dir", lambda: tmp_path)
+    monkeypatch.setattr(web_login, "screenshot_qr_code", lambda _: ("base64", "ok"))
+    client = web_login.app.test_client()
+    assert _unlock(client).status_code == 200
+    assert client.post("/api/logout", headers=SAME_ORIGIN_HEADERS).status_code == 200
+    assert client.get("/api/qr", headers=SAME_ORIGIN_HEADERS).status_code == 401
 
 
 def test_api_rejects_missing_and_cross_origin_requests(monkeypatch, tmp_path):
@@ -140,7 +189,9 @@ def test_allowed_origin_can_be_configured_exactly(monkeypatch, tmp_path):
     monkeypatch.setattr(web_login, "_get_profile_dir", lambda: tmp_path)
     monkeypatch.setattr(web_login, "screenshot_qr_code", lambda _: ("base64", "ok"))
 
-    response = web_login.app.test_client().get(
+    client = web_login.app.test_client()
+    assert _unlock(client, {"Origin": "https://admin.example"}).status_code == 200
+    response = client.get(
         "/api/qr", headers={"Origin": "https://admin.example"}
     )
 
@@ -155,6 +206,7 @@ def test_qr_rate_limit_returns_retry_after(monkeypatch, tmp_path):
     monkeypatch.setattr(web_login, "screenshot_qr_code", lambda _: ("base64", "ok"))
     client = web_login.app.test_client()
 
+    assert _unlock(client).status_code == 200
     assert client.get("/api/qr", headers=SAME_ORIGIN_HEADERS).status_code == 200
     response = client.get("/api/qr", headers=SAME_ORIGIN_HEADERS)
 
@@ -175,6 +227,7 @@ def test_status_rate_limit_is_separate_from_qr(monkeypatch, tmp_path):
     )
     client = web_login.app.test_client()
 
+    assert _unlock(client).status_code == 200
     assert client.get("/api/status", headers=SAME_ORIGIN_HEADERS).status_code == 200
     response = client.get("/api/status", headers=SAME_ORIGIN_HEADERS)
 

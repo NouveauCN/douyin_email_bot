@@ -39,32 +39,6 @@ services:
       - all_proxy=
       - no_proxy=
 
-  web_login:
-    build: .
-    container_name: douyin_web_login
-    restart: "no"
-    ports:
-      # Keep the host entry point local; expose it to the tailnet with
-      # `tailscale serve`. The explicit LAN binding below is for the trusted
-      # home network only; set LAN_BIND_ADDRESS to the server's LAN IP.
-      - "127.0.0.1:8080:8080"
-      - "${LAN_BIND_ADDRESS:-192.168.1.94}:8080:8080"
-    volumes:
-      - firefox_profile:/app/firefox_profile
-      - runtime_settings:/app/runtime-settings
-      - ./.env:/app/.env
-      - ./config.yaml:/app/config.yaml:ro
-    environment:
-      - COOKIE_PROFILE_DIR=/app/firefox_profile
-      - RUNTIME_SETTINGS_DB=/app/runtime-settings/settings.sqlite3
-      - TZ=Asia/Shanghai
-      - WEB_LOGIN_ALLOWED_ORIGINS=${WEB_LOGIN_ALLOWED_ORIGINS:-}
-    # The container needs an all-interface bind; host port publication remains
-    # limited to loopback plus the explicit trusted LAN address above.
-    command: ["python3", "web_login.py", "--host", "0.0.0.0"]
-    profiles:
-      - login
-
   file_browser:
     build: .
     container_name: douyin_file_browser
@@ -78,6 +52,7 @@ services:
       - /srv/nas_data/douyin_downloads:/app/downloads
       - /srv/nas_data/comics:/app/comics:ro
       - runtime_settings:/app/runtime-settings
+      - firefox_profile:/app/firefox_profile
       - ./config.yaml:/app/config.yaml:ro
       # Read-only bootstrap fallback so the Settings tab can report whether
       # legacy credentials are configured without ever returning their value.
@@ -86,6 +61,8 @@ services:
       - DOUYIN_DOWNLOAD_PATH=/app/downloads
       - COMICS_PICS_PATH=/app/comics/pics
       - RUNTIME_SETTINGS_DB=/app/runtime-settings/settings.sqlite3
+      - COOKIE_PROFILE_DIR=/app/firefox_profile
+      - WEB_LOGIN_PASSWORD=${WEB_LOGIN_PASSWORD:-}
       - TZ=Asia/Shanghai
       # Leave empty unless an exact trusted origin is explicitly configured;
       # Settings PATCH intentionally returns 403 without this allowlist.
@@ -93,6 +70,10 @@ services:
       - FILE_BROWSER_MAX_UPLOAD_BYTES=${FILE_BROWSER_MAX_UPLOAD_BYTES:-2147483648}
       - FILE_BROWSER_MAX_UPLOAD_FILES=${FILE_BROWSER_MAX_UPLOAD_FILES:-10}
       - FILE_BROWSER_MEDIA_MAX_CONCURRENCY=${FILE_BROWSER_MEDIA_MAX_CONCURRENCY:-2}
+      - WEB_LOGIN_PASSWORD_RATE_LIMIT=${WEB_LOGIN_PASSWORD_RATE_LIMIT:-5}
+      - WEB_LOGIN_QR_RATE_LIMIT=${WEB_LOGIN_QR_RATE_LIMIT:-5}
+      - WEB_LOGIN_STATUS_RATE_LIMIT=${WEB_LOGIN_STATUS_RATE_LIMIT:-120}
+      - WEB_LOGIN_RATE_WINDOW_SECONDS=${WEB_LOGIN_RATE_WINDOW_SECONDS:-60}
     command: ["python3", "file_browser.py"]
 
   qq_gateway:

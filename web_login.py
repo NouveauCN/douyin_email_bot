@@ -10,22 +10,28 @@ Usage:
 
 import argparse
 from collections import deque
+import hashlib
+import hmac
 import logging
 import math
 import os
+import secrets
 import threading
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, render_template_string, request, session
 
 # ── Bootstrap: same as main.py (needed before any F2 imports) ─────
 _PROJECT_DIR = Path(__file__).parent
 
 # Load config for profile_dir
 from config_loader import load_config  # noqa: E402
-from settings_store import SettingsStore, default_database_path  # noqa: E402
+from f2_bootstrap import bootstrap_f2  # noqa: E402
+from settings_store import SettingsStore, default_database_path, read_dotenv  # noqa: E402
+
+bootstrap_f2(_PROJECT_DIR)
 
 _config = load_config(_PROJECT_DIR / "config.yaml")
 _settings = SettingsStore(default_database_path(_PROJECT_DIR / "config.yaml"))
@@ -44,14 +50,44 @@ app = Flask(__name__)
 log = logging.getLogger("web_login")
 _browser_lock = threading.Lock()
 _STATUS_RESPONSE_FIELDS = ("status", "auth_count", "message")
-_RATE_LIMIT_DEFAULTS = {"/api/qr": 5, "/api/status": 120}
+_RATE_LIMIT_DEFAULTS = {"unlock": 5, "qr": 5, "status": 120}
 _RATE_LIMIT_ENV_VARS = {
-    "/api/qr": "WEB_LOGIN_QR_RATE_LIMIT",
-    "/api/status": "WEB_LOGIN_STATUS_RATE_LIMIT",
+    "unlock": "WEB_LOGIN_PASSWORD_RATE_LIMIT",
+    "qr": "WEB_LOGIN_QR_RATE_LIMIT",
+    "status": "WEB_LOGIN_STATUS_RATE_LIMIT",
 }
 _DEFAULT_RATE_WINDOW_SECONDS = 60
+_SESSION_SECONDS = 15 * 60
 _rate_limit_lock = threading.Lock()
 _rate_limit_buckets: dict[tuple[str, str], deque[float]] = {}
+
+
+def _password() -> str:
+    """Read the deployment-owned password without ever logging or returning it."""
+    # Compose injects this explicitly for the file browser.  The fallback keeps
+    # ``python web_login.py`` useful on a trusted local shell without loading
+    # dotenv values into the process environment.
+    return os.environ.get("WEB_LOGIN_PASSWORD") or read_dotenv(
+        _PROJECT_DIR / ".env"
+    ).get("WEB_LOGIN_PASSWORD", "")
+
+
+def _session_secret(password: str) -> bytes:
+    if password:
+        return hashlib.sha256(
+            b"douyin-email-bot:web-login-session:" + password.encode("utf-8")
+        ).digest()
+    return secrets.token_bytes(32)
+
+
+def _configure_app(target_app: Flask) -> None:
+    if not target_app.secret_key:
+        target_app.secret_key = _session_secret(_password())
+    target_app.config["PERMANENT_SESSION_LIFETIME"] = _SESSION_SECONDS
+    target_app.config.setdefault("SESSION_COOKIE_HTTPONLY", True)
+    if target_app.config.get("SESSION_COOKIE_SAMESITE") is None:
+        target_app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+    target_app.config.setdefault("SESSION_COOKIE_SECURE", False)
 
 
 def _get_profile_dir() -> Path:
@@ -126,13 +162,13 @@ def _positive_env_int(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
-def _rate_limit_response(path: str):
+def _rate_limit_response(kind: str):
     """Return a 429 response when this client has exhausted the endpoint quota."""
-    limit = _positive_env_int(_RATE_LIMIT_ENV_VARS[path], _RATE_LIMIT_DEFAULTS[path])
+    limit = _positive_env_int(_RATE_LIMIT_ENV_VARS[kind], _RATE_LIMIT_DEFAULTS[kind])
     window = _positive_env_int("WEB_LOGIN_RATE_WINDOW_SECONDS", _DEFAULT_RATE_WINDOW_SECONDS)
     client = request.remote_addr or "unknown"
     now = time.monotonic()
-    bucket_key = (path, client)
+    bucket_key = (kind, client)
 
     with _rate_limit_lock:
         bucket = _rate_limit_buckets.setdefault(bucket_key, deque())
@@ -149,18 +185,77 @@ def _rate_limit_response(path: str):
     return None
 
 
-@app.before_request
-def _protect_api_routes():
-    if request.path not in _RATE_LIMIT_ENV_VARS:
+def _login_api_kind(path: str) -> str | None:
+    for kind in ("unlock", "qr", "status", "logout"):
+        if path == f"/api/{kind}" or path.endswith(f"/api/web-login/{kind}"):
+            return kind
+    return None
+
+
+def _unauthorized(message="请先验证登录密码"):
+    response = jsonify({"success": False, "message": message})
+    response.headers["Cache-Control"] = "no-store"
+    return response, 401
+
+
+def _service_unavailable():
+    response = jsonify({"success": False, "message": "Web Login 未配置密码"})
+    response.headers["Cache-Control"] = "no-store"
+    return response, 503
+
+
+def _protect_login_request():
+    kind = _login_api_kind(request.path)
+    if kind is None:
         return None
     if not _has_allowed_source():
         response = jsonify({"success": False, "message": "请求来源不被允许"})
         response.headers["Cache-Control"] = "no-store"
         return response, 403
-    return _rate_limit_response(request.path)
+    if kind in {"unlock", "qr", "status"} and not _password():
+        return _service_unavailable()
+    if kind in _RATE_LIMIT_ENV_VARS:
+        limited = _rate_limit_response(kind)
+        if limited:
+            return limited
+    if kind in {"qr", "status"} and not session.get("web_login_unlocked"):
+        return _unauthorized()
+    return None
+
+
+_configure_app(app)
+app.before_request(_protect_login_request)
 
 
 # ── Routes ─────────────────────────────────────────────────────────
+
+@app.route("/api/unlock", methods=["POST"])
+def api_unlock():
+    """Unlock the QR controls for a short-lived browser session."""
+    configured = _password()
+    if not configured:
+        return _service_unavailable()
+    payload = request.get_json(silent=True) or {}
+    candidate = payload.get("password", "")
+    if not isinstance(candidate, str):
+        candidate = ""
+    if not hmac.compare_digest(candidate.encode("utf-8"), configured.encode("utf-8")):
+        return _unauthorized("密码错误")
+    session.clear()
+    session.permanent = True
+    session["web_login_unlocked"] = True
+    response = jsonify({"success": True, "message": "验证成功"})
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.route("/api/logout", methods=["POST"])
+def api_logout():
+    """Relock the QR controls and invalidate the current session."""
+    session.clear()
+    response = jsonify({"success": True})
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 @app.route("/")
 def index():
@@ -225,6 +320,96 @@ def api_status():
     return response
 
 
+def register_web_login(target_app: Flask, url_prefix: str = "") -> None:
+    """Attach the password-gated QR API to another Flask application.
+
+    The file browser embeds these routes under ``/api/web-login`` while this
+    module keeps the standalone local CLI fallback at ``/api``.
+    """
+    _configure_app(target_app)
+    target_app.before_request(_protect_login_request)
+    prefix = url_prefix.rstrip("/")
+    for suffix, view, methods in (
+        ("/unlock", api_unlock, ["POST"]),
+        ("/qr", api_qr, ["GET"]),
+        ("/status", api_status, ["GET"]),
+        ("/logout", api_logout, ["POST"]),
+    ):
+        target_app.add_url_rule(
+            f"{prefix}{suffix}",
+            endpoint=f"web_login_{suffix[1:]}",
+            view_func=view,
+            methods=methods,
+        )
+
+
+# ── Embedded panel (used by file_browser's Login tab) ─────────────────
+
+WEB_LOGIN_PANEL_HTML = r"""
+<div id="webLoginPanelBody" class="web-login-panel">
+  <div id="webLoginUnlock">
+    <p class="web-login-hint">请输入 Web Login 密码以开始抖音扫码登录。</p>
+    <form id="webLoginUnlockForm" class="web-login-form">
+      <input id="webLoginPassword" type="password" autocomplete="current-password" placeholder="Web Login 密码" required>
+      <button class="btn" id="webLoginUnlockButton" type="submit">验证并开始</button>
+    </form>
+    <div id="webLoginUnlockStatus" class="web-login-status">请输入密码后开始</div>
+  </div>
+  <div id="webLoginControls" style="display:none">
+    <div id="webLoginQrBox" class="web-login-qr-box"><span id="webLoginQrPlaceholder">输入密码后生成二维码</span><img id="webLoginQrImage" alt="抖音完整登录页面" style="display:none"></div>
+    <div id="webLoginStatus" class="web-login-status">尚未验证</div>
+    <button class="btn" id="webLoginRefresh" type="button">🔄 刷新二维码</button>
+    <button class="setting-action" id="webLoginLogout" type="button">🔒 锁定</button>
+    <p class="web-login-hint">使用抖音 App 扫描二维码，Cookie 将自动保存到运行时设置。</p>
+  </div>
+</div>
+<script>
+(function() {
+  var timer = null, inFlight = false;
+  var api = '/api/web-login';
+  var status = document.getElementById('webLoginStatus');
+  var unlockStatus = document.getElementById('webLoginUnlockStatus');
+  function stop() { if (timer) { clearInterval(timer); timer = null; } }
+  function setStatus(text, cls) { status.textContent = text; status.className = 'web-login-status ' + (cls || ''); }
+  async function loadQr() {
+    stop();
+    var image = document.getElementById('webLoginQrImage');
+    var placeholder = document.getElementById('webLoginQrPlaceholder');
+    placeholder.textContent = '⏳ 生成二维码...'; image.style.display = 'none';
+    try {
+      var response = await fetch(api + '/qr', {cache: 'no-store'}); var data = await response.json();
+      if (!response.ok || !data.success) throw new Error(data.message || '生成二维码失败');
+      image.src = data.qr_image; image.style.display = 'block'; placeholder.textContent = '';
+      setStatus('请使用抖音 App 扫描二维码', 'wait'); timer = setInterval(poll, 10000);
+    } catch (error) { placeholder.textContent = '❌ 生成失败'; setStatus(error.message, 'err'); }
+  }
+  async function poll() {
+    if (inFlight) return; inFlight = true;
+    try {
+      var response = await fetch(api + '/status', {cache: 'no-store'}); var data = await response.json();
+      if (!response.ok) { stop(); setStatus(data.message || '会话已锁定', 'err'); return; }
+      if (data.status === 'logged_in') { stop(); setStatus('✅ 登录成功！Cookie 已保存 (' + data.auth_count + ' 个认证 token)', 'ok'); }
+      else if (data.status === 'expired') { setStatus('二维码已过期，正在刷新...', 'wait'); setTimeout(loadQr, 1000); }
+      else if (data.status === 'pending') setStatus('⏳ ' + (data.message || '等待扫码...'), 'wait');
+      else setStatus(data.message || '检查失败', 'err');
+    } catch (error) { /* keep polling after transient network failures */ }
+    finally { inFlight = false; }
+  }
+  document.getElementById('webLoginUnlockForm').onsubmit = async function(event) {
+    event.preventDefault(); var button = document.getElementById('webLoginUnlockButton'); button.disabled = true;
+    try {
+      var response = await fetch(api + '/unlock', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({password: document.getElementById('webLoginPassword').value})});
+      var data = await response.json(); if (!response.ok) throw new Error(data.message || '验证失败');
+      document.getElementById('webLoginUnlock').style.display = 'none'; document.getElementById('webLoginControls').style.display = 'block'; loadQr();
+    } catch (error) { unlockStatus.textContent = error.message; unlockStatus.className = 'web-login-status err'; button.disabled = false; }
+  };
+  document.getElementById('webLoginRefresh').onclick = loadQr;
+  document.getElementById('webLoginLogout').onclick = async function() { stop(); await fetch(api + '/logout', {method: 'POST'}); document.getElementById('webLoginControls').style.display = 'none'; document.getElementById('webLoginUnlock').style.display = 'block'; document.getElementById('webLoginUnlockButton').disabled = false; };
+})();
+</script>
+"""
+
+
 # ── Single-page frontend (inline template — no separate file needed) ──
 
 LOGIN_HTML = r"""<!DOCTYPE html>
@@ -269,6 +454,9 @@ LOGIN_HTML = r"""<!DOCTYPE html>
   }
   .btn:hover { opacity: 0.85; }
   .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .unlock-form { display:flex; justify-content:center; gap:8px; margin:22px 0; }
+  .unlock-form input { min-width:240px; border:1px solid #555; border-radius:8px; padding:10px; background:#252525; color:#fff; }
+  #login-panel { margin-top: 18px; }
 </style>
 </head>
 <body>
@@ -276,6 +464,16 @@ LOGIN_HTML = r"""<!DOCTYPE html>
   <h1>抖音扫码登录</h1>
   <p class="subtitle">Douyin Email Bot — Cookie 获取</p>
 
+  <div id="unlock-panel">
+    <p class="hint">请输入部署配置的 Web Login 密码以开始抖音扫码登录</p>
+    <form class="unlock-form" onsubmit="unlock(event)">
+      <input id="password" type="password" autocomplete="current-password" placeholder="Web Login 密码" required>
+      <button class="btn" id="unlock-btn" type="submit">验证并开始</button>
+    </form>
+    <div id="unlock-status" class="status wait">请输入密码后开始</div>
+  </div>
+
+  <div id="login-panel" style="display:none">
   <div id="qr-box">
     <a id="qr-link" href="#" target="_blank" title="点击打开原尺寸截图">
       <img id="qr-img" src="" alt="抖音完整登录页面" style="display:none">
@@ -293,11 +491,46 @@ LOGIN_HTML = r"""<!DOCTYPE html>
     使用 <b>抖音 App</b> 扫描二维码<br>
     扫码成功后 Cookie 将自动保存到运行时设置
   </p>
+  <button id="logout-btn" class="btn" onclick="logout()">🔒 锁定</button>
+  </div>
 </div>
 
 <script>
 let _pollTimer = null;
 let _pollInFlight = false;
+
+async function unlock(event) {
+  event.preventDefault();
+  const status = document.getElementById('unlock-status');
+  const button = document.getElementById('unlock-btn');
+  button.disabled = true;
+  status.textContent = '正在验证...';
+  try {
+    const resp = await fetch('/api/unlock', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({password: document.getElementById('password').value})
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.message || '验证失败');
+    document.getElementById('unlock-panel').style.display = 'none';
+    document.getElementById('login-panel').style.display = 'block';
+    loadQR();
+  } catch (e) {
+    status.textContent = e.message;
+    status.className = 'status err';
+    button.disabled = false;
+  }
+}
+
+async function logout() {
+  stopPolling();
+  await fetch('/api/logout', {method: 'POST'});
+  document.getElementById('login-panel').style.display = 'none';
+  document.getElementById('unlock-panel').style.display = 'block';
+  document.getElementById('status').textContent = '已锁定，请重新验证';
+  document.getElementById('status').className = 'status wait';
+  document.getElementById('unlock-btn').disabled = false;
+}
 
 async function loadQR() {
   const img = document.getElementById('qr-img');
@@ -382,8 +615,7 @@ async function pollStatus() {
   }
 }
 
-// Kick off on page load
-loadQR();
+// QR capture intentionally starts only after password verification.
 </script>
 </body>
 </html>"""

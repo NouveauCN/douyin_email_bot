@@ -6,7 +6,7 @@ Repository instructions for coding agents. They apply to the whole repository.
 
 This Python service polls IMAP for Douyin or Bilibili links, downloads media,
 and replies over SMTP. It also includes Firefox cookie acquisition, a QR login
-service on port 8080, and a trusted-LAN file browser on port 8081.
+password-gated Web Login subtab in the trusted-LAN file browser on port 8081.
 An optional standalone Node.js QQ C2C gateway accepts links through an
 authenticated internal bridge.
 
@@ -27,14 +27,14 @@ url_extractor.py        Supported URL extraction
 config_loader.py        YAML/env configuration dataclasses
 cookie_extractor.py     Persistent Playwright Firefox cookie handling
 get_cookie.py           Interactive/headless cookie CLI
-web_login.py            Flask QR login service
+web_login.py            Password-gated Flask QR login controller and local fallback
 file_browser.py         Flask browser, playlist, upload, dedup, and delete UI
 play.py                 Local shuffled MP4 player
 migrate_downloads.py    One-shot slideshow layout migration
 smoke_download.py       Live Douyin smoke download
 config.yaml             Non-secret runtime configuration
 Dockerfile              Python 3.12 image with FFmpeg, Playwright, and yutto
-docker-compose.yml      bot, web_login, and file_browser services
+docker-compose.yml      bot, file_browser, and optional QQ gateway services
 qq_gateway/              Node.js QQ C2C gateway (optional, single instance)
 qq_bridge.py             Authenticated internal bridge and QQ outbox HTTP API
 ```
@@ -71,11 +71,12 @@ QQ C2C -> qq_gateway -> authenticated qq_bridge -> DownloadTaskService
   limited to loopback plus the explicitly configured trusted home-LAN address
   and restricted Tailscale ACL/Serve path; do not bind all interfaces or treat
   guest Wi-Fi, IoT networks, or Funnel as trusted.
-- `web_login.py` also has no application login by design. Its Docker host port
-  must remain limited to loopback plus the explicitly configured trusted
-  home-LAN address, its API must enforce same-origin/allowed-origin checks and
-  QR/status rate limits, and Tailscale policy must restrict access to the
-  intended user or devices.
+- Web Login is embedded in `file_browser.py` as a password-gated subtab. Its
+  `WEB_LOGIN_PASSWORD` is an explicit deployment secret; when absent, unlock,
+  QR, and status APIs are disabled. All login endpoints enforce exact
+  Origin/Referer checks, password attempts/QR/status are rate limited, sessions
+  are short-lived HttpOnly SameSite cookies, and no standalone Docker Web Login
+  port or bypass service is exposed.
 - The file browser reads `/app/comics/pics` as a separate read-only comics
   gallery source. Its `/comics/raw/...` and `/comics/image/...` routes must
   validate resolved paths within that source and must never pass comics paths
@@ -249,8 +250,8 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   keyword, downloader, retry, media, and the managed Douyin Cookie secret;
   email Cookie commands have been removed and are not settings.
 - Managed settings are persisted in the dedicated `runtime_settings` volume at
-  `/app/runtime-settings/settings.sqlite3`; it is shared only by `bot`,
-  `file_browser`, and `web_login`. `file_browser` must never receive the bot's
+  `/app/runtime-settings/settings.sqlite3`; it is shared only by `bot` and
+  `file_browser`. `file_browser` must never receive the bot's
   `/app/state` volume or Docker socket.
 - Secret values (mail credentials, Douyin Cookie, Bilibili auth) are write-only
   in the UI: responses, logs, and errors may report only configured/unconfigured
@@ -323,7 +324,7 @@ remain the highest-priority, read-only overrides in the UI.
 ```bash
 uv sync --frozen
 uv run python main.py
-uv run python web_login.py
+uv run python web_login.py  # local fallback; requires WEB_LOGIN_PASSWORD
 uv run python file_browser.py
 uv run python play.py --dry-run --download-dir /srv/nas_data/douyin_downloads
 uv run python get_cookie.py
@@ -339,7 +340,7 @@ Verification baseline:
 ```bash
 git diff --check
 uv run python -m compileall .
-docker compose --profile login config --quiet
+docker compose config --quiet
 ```
 
 Documentation-only changes need `git diff --check`. Python changes need at least
@@ -360,15 +361,13 @@ routine test.
 - After merging a functional code, dependency, configuration, or runtime change,
   sync local `main` and rebuild/restart the affected Docker services without
   waiting for a separate request. Verify container status afterward.
-- Documentation-only changes do not require a container rebuild. Keep
-  profile-only services such as `web_login` stopped unless they are needed; if
-  they changed, rebuild the profile image without leaving it running.
+- Documentation-only changes do not require a container rebuild. Web Login is
+  embedded in the file browser and has no separate Compose service.
 
 ## Docker Deployment
 
 ```bash
 sudo docker compose up -d --build bot qq_gateway file_browser
-sudo docker compose --profile login up web_login
 sudo docker compose down
 ```
 
@@ -379,17 +378,19 @@ sudo docker compose down
   delivery state in the independent `qq_gateway_state` volume. The bot's bridge
   listens on `0.0.0.0:8082` inside the Compose network only; both services must
   receive the same `QQ_BRIDGE_TOKEN`.
-  Bot and `web_login` share the Firefox-profile volume.
+  Bot and `file_browser` share the Firefox-profile volume for the embedded Login
+  tab's lazy QR capture.
 - `runtime_settings` is an independent named volume mounted at
-  `/app/runtime-settings` in `bot`, `file_browser`, and `web_login`, with
+  `/app/runtime-settings` in `bot` and `file_browser`, with
   `RUNTIME_SETTINGS_DB=/app/runtime-settings/settings.sqlite3`. It is not the
   mail state volume and is never mounted into unrelated services.
 - Bot and `file_browser` bind the host NAS root to `/app/downloads`.
 - `file_browser` also mounts `/srv/nas_data/comics` read-only at `/app/comics`
   and uses `COMICS_PICS_PATH=/app/comics/pics` for the in-site comics gallery.
-- All services bind `config.yaml` read-only; only bot and `web_login` bind the
-  legacy `.env` for compatibility. Managed settings are the normal mutable
-  control-plane source.
+- All services bind `config.yaml` read-only. The bot has a writable legacy
+  `.env` bind for compatibility, while `file_browser` receives it read-only for
+  bootstrap fallback and Compose injects `WEB_LOGIN_PASSWORD` explicitly.
+  Managed settings are the normal mutable control-plane source.
 - `file_browser` also receives the legacy `.env` as read-only bootstrap input;
   it must not write that file. The bot Compose environment must not reintroduce
   default `BOT_WORKER_COUNT`, `BOT_DOUYIN_WORKER_COUNT`,
