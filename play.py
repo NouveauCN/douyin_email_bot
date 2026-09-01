@@ -51,6 +51,29 @@ def find_videos(download_dir: Path) -> list[Path]:
     return videos
 
 
+def build_random_queue(videos: list[Path], seed: int | None = None) -> list[Path]:
+    """Build one pseudo-random queue containing each video at most once.
+
+    The input list is treated as a snapshot for this playback run.  Resolve
+    paths before de-duplicating so a symlink cannot make the same file appear
+    twice, then shuffle a copy with a local seeded generator.
+    """
+    queue: list[Path] = []
+    seen: set[Path] = set()
+    for video in videos:
+        try:
+            identity = video.resolve()
+        except OSError:
+            identity = video.absolute()
+        if identity in seen:
+            continue
+        seen.add(identity)
+        queue.append(video)
+
+    random.Random(_SEED if seed is None else seed).shuffle(queue)
+    return queue
+
+
 # ── Preloader ───────────────────────────────────────────────────────
 
 class VideoPreloader:
@@ -275,10 +298,10 @@ def play_all(
     dry_run: bool = False,
     resolution: str = _DEFAULT_RESOLUTION,
 ) -> None:
-    """Play all videos in order.
+    """Play every video from one pseudo-random, non-repeating queue.
 
     Args:
-        videos: Ordered list of .mp4 files to play.
+        videos: Snapshot of .mp4 files available for this playback run.
         player_cmd: Override player command.  None = auto-detect.
         preload_count: Number of upcoming videos to preload into OS cache
                        (sequential mode only; playlist mode handles its own buffer).
@@ -286,6 +309,7 @@ def play_all(
         resolution: Fixed window size as WxH (e.g. "1280x720"). Prevents
                     the player window from resizing across videos.
     """
+    videos = build_random_queue(videos)
     total = len(videos)
     if total == 0:
         print(f"{Fore.YELLOW}没有找到可播放的视频 (.mp4)")
@@ -603,10 +627,6 @@ def main() -> None:
         print(f"{Fore.YELLOW}下载目录中未找到 .mp4 文件: {download_dir}")
         print("提示：视频下载到 config.yaml 中 douyin.download_path 指定的目录")
         return
-
-    # ── Shuffle with fresh per-run seed ─────────────────────────────
-    rng = random.Random(_SEED)
-    rng.shuffle(videos)
 
     # ── Play ────────────────────────────────────────────────────────
     play_all(

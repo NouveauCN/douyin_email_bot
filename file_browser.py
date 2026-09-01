@@ -2800,7 +2800,7 @@ PLAYLIST_HTML = (
     </div>
     <div id="playlist">
       {% for v in videos %}
-      <div class="playlist-item" id="item-{{ loop.index0 }}" onclick="playIndex({{ loop.index0 }}, true)">
+      <div class="playlist-item" id="item-{{ loop.index0 }}" onclick="playVideo({{ loop.index0 }}, true)">
         <span class="idx">{{ loop.index }}</span>
         <div class="info">
           <div class="vname">{{ v.name }}</div>
@@ -2824,7 +2824,7 @@ PLAYLIST_HTML = (
 <script>
 // ── State ──
 const VIDEOS = {{ videos_json | safe }};
-let queue = VIDEOS.map((v, i) => i);
+let queue = [];
 let currentQueueIdx = 0;
 let shuffleOn = true;
 
@@ -2837,12 +2837,17 @@ function shuffleArray(arr) {
 }
 
 function buildQueue() {
-  const currentVidIdx = currentVideoIndex();
+  const currentVidIdx = queue.length > 0 ? currentVideoIndex() : null;
   queue = VIDEOS.map((v, i) => i);
   if (shuffleOn) {
-    const cur = queue.splice(currentVidIdx, 1)[0];
     shuffleArray(queue);
-    queue.unshift(cur);
+  }
+  if (currentVidIdx !== null) {
+    const currentPos = queue.indexOf(currentVidIdx);
+    if (currentPos > 0) {
+      queue.splice(currentPos, 1);
+      queue.unshift(currentVidIdx);
+    }
   }
   currentQueueIdx = 0;
 }
@@ -2870,6 +2875,13 @@ function playIndex(queueIdx, scroll) {
   }
 }
 
+function playVideo(videoIdx, scroll) {
+  const queueIdx = queue.indexOf(videoIdx);
+  if (queueIdx >= 0) {
+    playIndex(queueIdx, scroll);
+  }
+}
+
 function nextVideo() {
   if (currentQueueIdx < queue.length - 1) {
     playIndex(currentQueueIdx + 1);
@@ -2889,7 +2901,13 @@ function prevVideo() {
 
 function toggleShuffle() {
   shuffleOn = !shuffleOn;
-  buildQueue();
+  const remaining = queue.slice(currentQueueIdx + 1);
+  if (shuffleOn) {
+    shuffleArray(remaining);
+  } else {
+    remaining.sort((a, b) => a - b);
+  }
+  queue = queue.slice(0, currentQueueIdx + 1).concat(remaining);
   updateUI();
 }
 
@@ -2958,11 +2976,9 @@ document.addEventListener('keydown', function(e) {
 });
 
 // ── Init ──
-if (shuffleOn) shuffleArray(queue);
+buildQueue();
 if (queue.length > 0) {
-  var firstV = VIDEOS[queue[0]];
-  player.src = "{{ url_for('raw_file', filepath='') }}" + firstV.relpath;
-  updateUI();
+  playIndex(0);
 }
 </script>
 </body>
