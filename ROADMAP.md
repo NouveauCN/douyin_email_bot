@@ -18,15 +18,14 @@ message queues remain deferred until the local workflow needs them.
 
 Protect both Flask applications before expanding their network exposure.
 
-- Require network-layer authentication for `file_browser` and `web_login`.
-  Application login is intentionally omitted for the personal LAN + Tailscale
-  deployment, but only when the services are reachable through the controlled
-  Tailscale boundary.
+- Require network-layer authentication for `file_browser`, and password-gate
+  its embedded Web Login tab with a separately managed deployment secret.
 - Require CSRF protection and validate `Origin`/`Referer` on every mutating
   file-browser request, including upload, delete, crop, and duplicate actions.
 - Keep read-only comics paths outside every mutating download operation.
 - Add upload size, processing timeout, and bounded-concurrency limits.
-- Bind `web_login` to loopback or an explicit management address by default.
+- Keep the embedded Web Login reachable only through the file browser's
+  loopback/trusted-LAN/Tailscale boundary; do not expose a separate port.
 - Add rate limits to QR generation and login-status polling.
 - Keep QR and status responses non-cacheable and never return cookie contents.
 
@@ -51,23 +50,23 @@ Acceptance criteria:
 
 Implementation status (2026-08-23; PRs #16, #17, #18, and #19):
 
-- `web_login.py` now defaults to loopback, validates exact same-origin or
-  configured origins, limits QR generation to 5 requests/minute and status
-  polling to 120 requests/minute by default, and keeps `no-store` plus cookie
-  redaction.
+- `web_login.py` provides a reusable password-gated controller for the file
+  browser plus a loopback local fallback. It validates exact sources, limits
+  password attempts, QR generation, and status polling, and keeps `no-store`
+  plus cookie redaction.
 - `file_browser.py` now rejects missing/cross-origin mutating requests,
   limits uploads to 2 GiB and 10 files by default, and bounds media-changing
   work to two concurrent jobs. Existing FFmpeg and thumbnail subprocess
   timeouts remain in force.
-- `docker-compose.yml` publishes 8080/8081 only to loopback plus the explicit
-  `LAN_BIND_ADDRESS` (default `192.168.1.94`); it never binds `0.0.0.0`.
-- The host's Tailscale Serve entries for 8080/8081 forward to the loopback
-  ports and remain tailnet-only. Tailscale ACL/Grants are managed outside this
+- `docker-compose.yml` publishes only the file browser on 8081 to loopback plus
+  the explicit `LAN_BIND_ADDRESS` (default `192.168.1.94`); it never publishes
+  a separate Web Login port or binds `0.0.0.0`.
+- The host's Tailscale Serve entry for 8081 forwards to the loopback file
+  browser port and remains tailnet-only. Tailscale ACL/Grants are managed outside this
   repository because the local CLI cannot edit tailnet policy.
-- Application login was intentionally not added for the personal trusted-LAN
-  plus Tailscale deployment. If the LAN boundary widens beyond the trusted
-  home network, add an authenticated proxy or application session before
-  exposing these writable services.
+- The embedded Web Login tab requires `WEB_LOGIN_PASSWORD`; without it, QR
+  capture is disabled. Password verification creates a short-lived HttpOnly
+  SameSite session and all login APIs retain exact Origin/Referer checks.
 
 ### Phase 2: Short-Link Transport Security (P0/P1)
 
@@ -294,7 +293,7 @@ LAN file browser while keeping deployment boundaries and secrets explicit.
 
 - Persist managed settings and revision metadata in an independent
   `runtime_settings` named volume at `/app/runtime-settings/settings.sqlite3`.
-  Mount it only into `bot`, `file_browser`, and `web_login`; never share the bot
+  Mount it only into `bot` and `file_browser`; never share the bot
   mail-state volume or Docker socket with `file_browser`.
 - Keep `config.yaml` read-only and retain `.env` for bootstrap, legacy reads, and
   Compose interpolation. Resolve supported values as
@@ -387,7 +386,7 @@ git diff --check
 uv run pytest -q
 uv run python -m compileall -q .
 uv lock --check
-docker compose --profile login config --quiet
+docker compose config --quiet
 ```
 
 Do not use live email, browser, or media downloads as routine CI checks. Use

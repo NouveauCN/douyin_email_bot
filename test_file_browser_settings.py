@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import file_browser
+import web_login
 from settings_store import SettingsStore
 
 
@@ -158,6 +159,10 @@ class FileBrowserSettingsTests(unittest.TestCase):
     def test_home_contains_settings_tab_and_dynamic_renderer(self):
         page = self.client.get("/").get_data(as_text=True)
         self.assertIn('id="settingsTab"', page)
+        self.assertIn('id="webLoginTab"', page)
+        self.assertIn('id="webLoginUnlockForm"', page)
+        self.assertIn("var api = '/api/web-login'", page)
+        self.assertIn("loadQr();", page)
         self.assertIn('id="settingsGroups"', page)
         self.assertIn("function renderSettings", page)
         self.assertIn("field.label", page)
@@ -167,6 +172,21 @@ class FileBrowserSettingsTests(unittest.TestCase):
         self.assertIn("只读部署项", page)
         self.assertIn("option.textContent = item[1]", page)
         self.assertIn("恢复默认", page)
+
+    def test_embedded_web_login_requires_unlock_before_qr(self):
+        with patch.dict("os.environ", {"WEB_LOGIN_PASSWORD": "test-password"}):
+            with patch.object(web_login, "screenshot_qr_code", return_value=("base64", "ok")) as screenshot:
+                locked = self.client.get("/api/web-login/qr")
+                self.assertEqual(locked.status_code, 401)
+                unlocked = self.client.post(
+                    "/api/web-login/unlock",
+                    json={"password": "test-password"},
+                )
+                self.assertEqual(unlocked.status_code, 200)
+                response = self.client.get("/api/web-login/qr")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        screenshot.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -161,13 +161,13 @@ outbox 清空，再设置
 备份仍需按既有秘密轮换策略处理。
 
 设置 Tab 的 SQLite 数据保存在独立的 `runtime_settings` named volume，容器内路径为
-`/app/runtime-settings/settings.sqlite3`。该卷只挂载给 `bot`、`file_browser` 和
-`web_login`；`file_browser` 不挂载 `/app/state`，也不挂载 Docker socket。`config.yaml`
+`/app/runtime-settings/settings.sqlite3`。该卷只挂载给 `bot` 和 `file_browser`；
+`file_browser` 不挂载 `/app/state`，也不挂载 Docker socket。`config.yaml`
 继续以只读方式挂载，旧 `.env` 继续保留用于兼容读取。
 
 ## 局域网 + Tailscale Web 访问
 
-`file_browser` 和 `web_login` 不显示应用登录页，访问边界由 Docker
+`file_browser` 通过“抖音登录”子 Tab 提供密码保护的二维码登录，访问边界仍由 Docker
 主机端口和 Tailscale 控制：Compose 同时提供本机回环、明确的可信家庭
 LAN 地址和 Tailscale Serve 路径。`LAN_BIND_ADDRESS` 默认是
 `192.168.1.94`，请按实际服务器地址修改，不要改成 `0.0.0.0`。
@@ -175,7 +175,9 @@ Tailscale 侧请用 Serve（不要用 Funnel）并用 ACL/Grants 只允许自己
 或用户访问。
 
 服务仍会拒绝缺少或不匹配 Origin/Referer 的写请求，并限制上传大小、文件
-数量、媒体并发、二维码生成和状态轮询；这些保护不需要额外登录操作。
+数量、媒体并发、密码验证、二维码生成和状态轮询。二维码浏览器会话在验证后
+仅保留 15 分钟，可随时点击“锁定”。未配置 `WEB_LOGIN_PASSWORD` 时二维码登录
+API 安全禁用，不会启动 Firefox。
 出于设置接口会修改邮箱凭据和 Cookie，`PATCH /api/settings` 还要求显式配置
 `FILE_BROWSER_ALLOWED_ORIGINS`；未配置时即使请求来自同源也返回 `403`。
 如 Tailscale Serve 使用的地址与请求 Host 不同，可在 `.env` 中配置精确的
@@ -184,13 +186,11 @@ Tailscale 侧请用 Serve（不要用 Funnel）并用 ACL/Grants 只允许自己
 ```env
 # Replace 192.168.1.94 with the trusted LAN address when needed.
 FILE_BROWSER_ALLOWED_ORIGINS=http://127.0.0.1:8081,http://localhost:8081,http://192.168.1.94:8081
-WEB_LOGIN_ALLOWED_ORIGINS=http://127.0.0.1:8080,http://localhost:8080,http://192.168.1.94:8080
 # Append (do not wildcard) the exact HTTPS Tailscale Serve origin:
 # FILE_BROWSER_ALLOWED_ORIGINS=http://127.0.0.1:8081,http://localhost:8081,http://192.168.1.94:8081,https://your-machine.your-tailnet.ts.net
-# WEB_LOGIN_ALLOWED_ORIGINS=http://127.0.0.1:8080,http://localhost:8080,http://192.168.1.94:8080,https://your-machine.your-tailnet.ts.net
 ```
 
-不要把这两个服务绑定到 `0.0.0.0`、访客/IoT 网段或公网 Funnel；可信家庭
+不要把服务绑定到 `0.0.0.0`、访客/IoT 网段或公网 Funnel；可信家庭
 LAN 地址由 `LAN_BIND_ADDRESS` 显式指定。
 
 ## B站下载
@@ -241,8 +241,10 @@ uv run python process_media.py "/path/to/video.mp4" --apply --force-review
 ## Cookie 管理
 
 抖音 cookie 有效期通常 **24-48 小时**，过期后下载会失败。Cookie 不再通过邮件命令
-更新。推荐启动 `web_login` 后使用二维码登录；首次部署或故障恢复也可以运行
-`uv run python get_cookie.py`。两种入口都把 Cookie 保存到托管 settings，运行中的
+更新。推荐打开 file browser 的“抖音登录”子 Tab，输入 `.env` 中配置的
+`WEB_LOGIN_PASSWORD` 后使用二维码登录；首次部署或故障恢复也可以运行
+`uv run python web_login.py`（本地回环，同样需要密码）或 `uv run python get_cookie.py`。
+这些入口都把 Cookie 保存到托管 settings，运行中的
 Bot 会通过 `douyin.cookie` 的 hot reload 立即读取，Cookie 内容不会回显到页面、日志
 或邮件任务状态。
 
@@ -279,7 +281,11 @@ Bot 会通过 `douyin.cookie` 的 hot reload 立即读取，Cookie 内容不会�
 | `bot.lease_seconds` / `heartbeat_seconds` | int | `300` / `30` | worker 租约与心跳周期；由 managed settings/YAML 控制，只有显式外部环境变量注入时锁定 |
 | `bot.outbox_retry_attempts` | int | `5` | SMTP outbox 最大重试次数；由 managed settings/YAML 控制，只有显式外部环境变量注入时锁定 |
 | `FILE_BROWSER_ALLOWED_ORIGINS` | str | 当前请求 origin | 文件浏览器精确允许来源（逗号分隔） |
-| `WEB_LOGIN_ALLOWED_ORIGINS` | str | 当前请求 origin | QR 服务精确允许来源（逗号分隔） |
+| `WEB_LOGIN_PASSWORD` | str | 未配置 | file browser 抖音登录 Tab 的密码；留空则禁用二维码登录 |
+| `WEB_LOGIN_PASSWORD_RATE_LIMIT` | int | `5` | 每个来源在窗口内允许的密码验证次数 |
+| `WEB_LOGIN_QR_RATE_LIMIT` | int | `5` | 每个来源在窗口内允许的二维码生成次数 |
+| `WEB_LOGIN_STATUS_RATE_LIMIT` | int | `120` | 每个来源在窗口内允许的状态查询次数 |
+| `WEB_LOGIN_RATE_WINDOW_SECONDS` | int | `60` | 上述 Web Login 限流窗口（秒） |
 | `DOUYIN_SHORT_LINK_CA_BUNDLE` | str | 系统 CA | 私有 CA bundle 路径；不配置时使用正常证书校验 |
 
 ## 常见问题

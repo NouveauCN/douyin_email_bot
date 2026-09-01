@@ -47,6 +47,7 @@ from media_processor import (  # noqa: E402
     process_media,
 )
 from settings_store import SETTING_REGISTRY, SettingsStore  # noqa: E402
+from web_login import WEB_LOGIN_PANEL_HTML, register_web_login  # noqa: E402
 
 _config = load_config(_PROJECT_DIR / "config.yaml")
 _CONFIG_PATH = _PROJECT_DIR / "config.yaml"
@@ -78,6 +79,11 @@ _MEDIA_MAX_CONCURRENCY = _positive_int_env(
 app.config["MAX_CONTENT_LENGTH"] = _MAX_UPLOAD_BYTES
 app.config["FILE_BROWSER_MAX_UPLOAD_BYTES"] = _MAX_UPLOAD_BYTES
 app.config["FILE_BROWSER_MAX_UPLOAD_FILES"] = _MAX_UPLOAD_FILES
+
+# Web Login is an in-process, password-gated subtab.  It shares the persistent
+# Firefox profile and runtime settings store with the bot; no second service or
+# exposed port is needed.
+register_web_login(app, url_prefix="/api/web-login")
 
 
 def _configured_origins() -> tuple[str, ...]:
@@ -727,6 +733,7 @@ def index():
     data["empty"] = data["empty"] and not data["comics_images"]
     data["upload_success"] = request.args.get("upload_success", "")
     data["upload_error"] = request.args.get("upload_error", "")
+    data["web_login_panel"] = WEB_LOGIN_PANEL_HTML
     resp = make_response(render_template_string(INDEX_HTML, **data))
     resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return resp
@@ -1643,6 +1650,14 @@ INDEX_HTML = (
   .top-tab { border:1px solid #ddd; border-radius:8px; padding:8px 18px; background:#fff; color:#777; cursor:pointer; font-size:13px; }
   .top-tab.active { background:#fe2c55; border-color:#fe2c55; color:#fff; }
   .tab-panel.hidden { display:none; }
+  .web-login-panel { background:#fff; border-radius:12px; padding:24px; color:#444; }
+  .web-login-form { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:16px 0; }
+  .web-login-form input { min-width:240px; border:1px solid #ddd; border-radius:6px; padding:9px; font:inherit; }
+  .web-login-qr-box { width:min(960px,90vw); aspect-ratio:16/9; margin:0 auto 16px; border-radius:10px; overflow:hidden; background:#f1f1f1; display:flex; align-items:center; justify-content:center; color:#888; }
+  .web-login-qr-box img { width:100%; height:100%; object-fit:contain; }
+  .web-login-status { min-height:20px; margin:10px 0; color:#777; }
+  .web-login-status.ok { color:#278a4b; } .web-login-status.wait { color:#b36b00; } .web-login-status.err { color:#c0392b; }
+  .web-login-hint { color:#777; font-size:12px; line-height:1.6; }
   .settings-toolbar { display:flex; align-items:center; gap:10px; margin-bottom:16px; flex-wrap:wrap; }
   .settings-status { color:#777; font-size:13px; }
   .settings-group { background:#fff; border-radius:12px; padding:16px 20px; margin-bottom:14px; box-shadow:0 1px 4px rgba(0,0,0,.05); }
@@ -1669,6 +1684,7 @@ INDEX_HTML = (
   <nav class="top-tabs" aria-label="主导航">
     <button class="top-tab active" id="browseTab" type="button">📦 浏览</button>
     <button class="top-tab" id="settingsTab" type="button">⚙️ 设置</button>
+    <button class="top-tab" id="webLoginTab" type="button">🔐 抖音登录</button>
   </nav>
 
   <section id="settingsPanel" class="tab-panel hidden" aria-label="系统设置">
@@ -1678,6 +1694,10 @@ INDEX_HTML = (
       <span class="settings-status" id="settingsStatus">尚未读取设置</span>
     </div>
     <div id="settingsGroups"></div>
+  </section>
+
+  <section id="webLoginPanel" class="tab-panel hidden" aria-label="抖音登录">
+    {{ web_login_panel|safe }}
   </section>
 
   <section id="browsePanel" class="tab-panel">
@@ -1948,13 +1968,17 @@ function saveSettings() {
     }).catch(function(error) { settingsStatus('保存失败：' + error.message, '#c0392b'); });
 }
 document.getElementById('browseTab').onclick = function() {
-  document.getElementById('browseTab').classList.add('active'); document.getElementById('settingsTab').classList.remove('active');
-  document.getElementById('browsePanel').classList.remove('hidden'); document.getElementById('settingsPanel').classList.add('hidden');
+  document.getElementById('browseTab').classList.add('active'); document.getElementById('settingsTab').classList.remove('active'); document.getElementById('webLoginTab').classList.remove('active');
+  document.getElementById('browsePanel').classList.remove('hidden'); document.getElementById('settingsPanel').classList.add('hidden'); document.getElementById('webLoginPanel').classList.add('hidden');
 };
 document.getElementById('settingsTab').onclick = function() {
-  document.getElementById('settingsTab').classList.add('active'); document.getElementById('browseTab').classList.remove('active');
-  document.getElementById('settingsPanel').classList.remove('hidden'); document.getElementById('browsePanel').classList.add('hidden');
+  document.getElementById('settingsTab').classList.add('active'); document.getElementById('browseTab').classList.remove('active'); document.getElementById('webLoginTab').classList.remove('active');
+  document.getElementById('settingsPanel').classList.remove('hidden'); document.getElementById('browsePanel').classList.add('hidden'); document.getElementById('webLoginPanel').classList.add('hidden');
   if (!settingsData) loadSettings();
+};
+document.getElementById('webLoginTab').onclick = function() {
+  document.getElementById('webLoginTab').classList.add('active'); document.getElementById('browseTab').classList.remove('active'); document.getElementById('settingsTab').classList.remove('active');
+  document.getElementById('webLoginPanel').classList.remove('hidden'); document.getElementById('browsePanel').classList.add('hidden'); document.getElementById('settingsPanel').classList.add('hidden');
 };
 document.getElementById('settingsSave').onclick = saveSettings;
 document.getElementById('settingsReload').onclick = loadSettings;
