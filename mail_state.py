@@ -21,7 +21,7 @@ from typing import Any, Iterator, Mapping
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 DEFAULT_LEASE_SECONDS = 300.0
 logger = logging.getLogger("MailStateStore")
@@ -174,6 +174,38 @@ class MailStateStore:
                     CREATE INDEX IF NOT EXISTS outbox_claim_idx
                         ON smtp_outbox(status, next_attempt_at, id);
 
+                    CREATE TABLE IF NOT EXISTS qq_outbox (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        task_id INTEGER NOT NULL REFERENCES tasks(id),
+                        open_id TEXT NOT NULL,
+                        reply_to_message_id TEXT NOT NULL,
+                        event TEXT NOT NULL,
+                        msg_seq INTEGER NOT NULL CHECK (msg_seq > 0),
+                        payload_json TEXT NOT NULL DEFAULT '{}',
+                        status TEXT NOT NULL DEFAULT 'pending'
+                            CHECK (status IN ('pending', 'leased', 'sent', 'failed', 'expired')),
+                        attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+                        next_attempt_at REAL,
+                        lease_token TEXT,
+                        lease_expires_at REAL,
+                        expires_at REAL NOT NULL,
+                        last_error TEXT,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL,
+                        sent_at REAL,
+                        UNIQUE (task_id, event),
+                        UNIQUE (task_id, msg_seq)
+                    );
+                    CREATE INDEX IF NOT EXISTS qq_outbox_claim_idx
+                        ON qq_outbox(status, next_attempt_at, expires_at, id);
+
+                    CREATE TABLE IF NOT EXISTS qq_task_bindings (
+                        task_id INTEGER PRIMARY KEY REFERENCES tasks(id),
+                        open_id TEXT NOT NULL,
+                        message_id TEXT NOT NULL,
+                        UNIQUE (open_id, message_id)
+                    );
+
                     CREATE TABLE IF NOT EXISTS task_events (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         task_id INTEGER NOT NULL REFERENCES tasks(id),
@@ -258,18 +290,12 @@ class MailStateStore:
                     "partially_succeeded" in task_sql
                     or "CHECK (status" not in task_sql
                 )
-                cookie_tasks_exist = self._conn.execute(
-                    "SELECT 1 FROM tasks WHERE platform = 'cookie' LIMIT 1"
-                ).fetchone() is not None
-                if version < SCHEMA_VERSION or cookie_tasks_exist:
-                    # Also sanitize a v3 database left behind by an interrupted
-                    # rollout; cookie tasks must never re-enter a worker.
+                # Legacy cookie payload migration belongs to the pre-v3
+                # upgrade only.  The v4 QQ schema addition must not rerun a
+                # destructive legacy migration against an already-migrated v3
+                # database.
+                if version < 3:
                     self._migrate_legacy_state_locked()
-                    if cookie_tasks_exist:
-                        # A v3 database can still contain secret pages when a
-                        # previous startup was interrupted after the logical
-                        # redaction. Repeat the physical cleanup in that case.
-                        secure_cleanup_required = True
                 if version < SCHEMA_VERSION:
                     secure_cleanup_required = secure_cleanup_required or version < 2
             if secure_cleanup_required:
@@ -544,8 +570,12 @@ class MailStateStore:
                 "WHERE status IN ('pending', 'leased')"
             ).fetchone()[0]
             outbox_count = self._conn.execute(
-                "SELECT COUNT(*) FROM smtp_outbox "
-                "WHERE status IN ('pending', 'leased', 'failed')"
+                "SELECT "
+                "(SELECT COUNT(*) FROM smtp_outbox "
+                " WHERE status IN ('pending', 'leased', 'failed')) + "
+                "(SELECT COUNT(*) FROM qq_outbox "
+                " WHERE status IN ('pending', 'leased') "
+                "    OR (status = 'failed' AND next_attempt_at IS NOT NULL))"
             ).fetchone()[0]
             return {
                 "intake": int(intake_count),
@@ -1251,6 +1281,12 @@ class MailStateStore:
                 "updated_at = ? WHERE status = 'leased' AND lease_expires_at <= ?",
                 (timestamp, timestamp),
             ).rowcount
+            self._conn.execute(
+                "UPDATE qq_outbox SET status = 'pending', lease_token = NULL, lease_expires_at = NULL, "
+                "updated_at = ? WHERE status = 'leased' AND lease_expires_at <= ? AND expires_at > ?",
+                (timestamp, timestamp, timestamp),
+            )
+            self._expire_qq_outbox_locked(timestamp)
             return {"tasks": task_count, "outbox": outbox_count}
 
     def _insert_event_locked(
@@ -1316,6 +1352,9 @@ class MailStateStore:
             self._ensure_open()
             params: list[Any] = []
             query = "SELECT e.* FROM task_events e"
+            source_kind = {"email": "mail", "qq": "qq"}.get(consumer)
+            if source_kind is not None:
+                query += " JOIN tasks t ON t.id = e.task_id"
             if consumer is not None and not include_consumed:
                 query += (
                     " LEFT JOIN task_event_consumptions c "
@@ -1323,6 +1362,9 @@ class MailStateStore:
                 )
                 params.append(consumer)
             query += " WHERE 1=1"
+            if source_kind is not None:
+                query += " AND t.source_kind = ?"
+                params.append(source_kind)
             if after_id is not None:
                 query += " AND e.id > ?"
                 params.append(int(after_id))
@@ -1444,6 +1486,17 @@ class MailStateStore:
                     if isinstance(payload, dict) and payload.get("sender"):
                         count += 1
                 return count
+            if consumer == "qq":
+                return int(
+                    self._conn.execute(
+                        "SELECT COUNT(*) FROM task_events e "
+                        "JOIN tasks t ON t.id = e.task_id "
+                        "LEFT JOIN task_event_consumptions c "
+                        "ON c.event_id = e.id AND c.consumer = ? "
+                        "WHERE c.event_id IS NULL AND t.source_kind = 'qq'",
+                        (consumer,),
+                    ).fetchone()[0]
+                )
             return int(
                 self._conn.execute(
                     "SELECT COUNT(*) FROM task_events e "
@@ -1637,6 +1690,408 @@ class MailStateStore:
                 (error, scheduled, timestamp, outbox_id, lease_token, timestamp),
             )
             return self._row(self._conn.execute("SELECT * FROM smtp_outbox WHERE id = ?", (outbox_id,)).fetchone()) if cursor.rowcount == 1 else None
+
+    # QQ C2C replies have a separate outbox because their delivery target and
+    # passive-reply expiry semantics are not compatible with SMTP delivery.
+    @staticmethod
+    def stable_qq_msg_seq(task_id: int, event: str) -> int:
+        """Return a deterministic positive QQ ``msg_seq`` for one reply."""
+        # QQ passive replies are ordered per incoming message.  Keeping the
+        # phase numbers fixed makes retries safe and lets the gateway reuse
+        # the exact same payload after a process restart.
+        normalized = str(event).strip().lower()
+        return 1 if normalized in {"accepted", "ack", "accepted_ack"} else 2
+
+    def _insert_qq_outbox_locked(
+        self,
+        task_id: int,
+        open_id: str,
+        reply_to_message_id: str,
+        event: str,
+        payload: Any,
+        timestamp: float,
+        *,
+        expires_at: float,
+        msg_seq: int | None = None,
+        next_attempt_at: float | None = None,
+    ) -> dict[str, Any]:
+        event = str(event).strip()
+        if not event:
+            raise ValueError("event must not be empty")
+        sequence = int(msg_seq or self.stable_qq_msg_seq(task_id, event))
+        if sequence <= 0:
+            raise ValueError("msg_seq must be positive")
+        self._conn.execute(
+            "INSERT INTO qq_outbox "
+            "(task_id, open_id, reply_to_message_id, event, msg_seq, payload_json, "
+            "next_attempt_at, expires_at, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(task_id, event) DO NOTHING",
+            (
+                task_id,
+                open_id,
+                reply_to_message_id,
+                event,
+                sequence,
+                self._json(payload),
+                next_attempt_at,
+                float(expires_at),
+                timestamp,
+                timestamp,
+            ),
+        )
+        row = self._conn.execute(
+            "SELECT * FROM qq_outbox WHERE task_id = ? AND event = ?",
+            (task_id, event),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("QQ outbox insert did not produce a row")
+        return self._row(row)  # type: ignore[return-value]
+
+    def accept_qq_message(
+        self,
+        open_id: str,
+        message_id: str,
+        url: str,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+        platform: str | None = None,
+        max_attempts: int | None = None,
+        confirmation_payload: Any = None,
+        expires_at: float | None = None,
+        reply_ttl: float = 3600.0,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Atomically accept one QQ message, task, and acknowledgement.
+
+        The QQ message ID is the idempotency key in the ``qq`` namespace.
+        Replaying the same message returns its existing task and outbox row;
+        a replay with a different URL is rejected rather than creating a
+        second task for one incoming message.
+        """
+        open_id = str(open_id).strip()
+        message_id = str(message_id).strip()
+        if not open_id or not message_id:
+            raise ValueError("open_id and message_id must not be empty")
+        if reply_ttl <= 0:
+            raise ValueError("reply_ttl must be positive")
+        if expires_at is None:
+            expires_at = self._now(now) + float(reply_ttl)
+        if float(expires_at) <= self._now(now):
+            raise ValueError("expires_at must be in the future")
+        normalized = self.normalize_url(url)
+        original = str(url).strip()
+        source_external_id = f"{open_id}:{message_id}"
+        source_message_id = f"qq:{source_external_id}"
+        timestamp = self._now(now)
+        safe_metadata = dict(metadata or {})
+        def contains_secret(value: Any) -> bool:
+            if isinstance(value, Mapping):
+                return any(
+                    any(part in str(key).lower() for part in ("cookie", "password", "passwd", "secret", "auth", "token"))
+                    or contains_secret(nested)
+                    for key, nested in value.items()
+                )
+            if isinstance(value, (list, tuple)):
+                return any(contains_secret(item) for item in value)
+            return False
+        if contains_secret(safe_metadata):
+            raise ValueError("QQ metadata must not contain secret-like fields")
+        safe_metadata.update({"open_id": open_id, "message_id": message_id})
+        with self._lock, self._transaction():
+            self._ensure_open()
+            existing_source = self._conn.execute(
+                "SELECT source_message_id FROM source_messages WHERE source_message_id = ?",
+                (source_message_id,),
+            ).fetchone()
+            existing_task = self._conn.execute(
+                "SELECT * FROM tasks WHERE source_message_id = ? ORDER BY id LIMIT 1",
+                (source_message_id,),
+            ).fetchone()
+            if existing_task is not None and existing_task["normalized_url"] != normalized:
+                raise ValueError("one QQ message may contain only one URL")
+            self._conn.execute(
+                "INSERT INTO source_messages "
+                "(source_message_id, mailbox, uidvalidity, uid, metadata_json, "
+                "intake_complete, created_at, updated_at) VALUES (?, '', 0, 0, ?, 1, ?, ?) "
+                "ON CONFLICT(source_message_id) DO UPDATE SET updated_at = excluded.updated_at",
+                (source_message_id, self._json(safe_metadata), timestamp, timestamp),
+            )
+            task = self._insert_task_locked(
+                source_message_id,
+                normalized,
+                original,
+                safe_metadata,
+                timestamp,
+                platform,
+                source_kind="qq",
+                external_source_id=source_external_id,
+                max_attempts=max_attempts,
+            )
+            self._conn.execute(
+                "INSERT INTO qq_task_bindings (task_id, open_id, message_id) VALUES (?, ?, ?) "
+                "ON CONFLICT(task_id) DO UPDATE SET open_id = excluded.open_id, message_id = excluded.message_id",
+                (task["id"], open_id, message_id),
+            )
+            confirmation = confirmation_payload
+            if confirmation is None:
+                confirmation = {"body": "已接收，开始下载。"}
+            ack = self._insert_qq_outbox_locked(
+                task["id"],
+                open_id,
+                message_id,
+                "accepted",
+                confirmation,
+                timestamp,
+                expires_at=float(expires_at),
+            )
+            return {
+                "source_message_id": source_message_id,
+                "external_source_id": source_external_id,
+                "task_id": int(task["id"]),
+                "created": existing_source is None or task["created"],
+                "duplicate": existing_task is not None,
+                "task": self._row(self._conn.execute("SELECT * FROM tasks WHERE id = ?", (task["id"],)).fetchone()),
+                "outbox": ack,
+            }
+
+    def claim_qq_outbox(
+        self,
+        limit: int = 1,
+        *,
+        lease_seconds: float | None = None,
+        worker_id: str | None = None,
+        now: float | None = None,
+    ) -> list[dict[str, Any]]:
+        if limit < 1:
+            return []
+        lease = self.default_lease_seconds if lease_seconds is None else float(lease_seconds)
+        if lease <= 0:
+            raise ValueError("lease_seconds must be positive")
+        timestamp = self._now(now)
+        with self._lock, self._transaction():
+            self._ensure_open()
+            self._expire_qq_outbox_locked(timestamp)
+            rows = self._conn.execute(
+                "SELECT id FROM qq_outbox WHERE "
+                "(status = 'pending' OR (status = 'failed' AND next_attempt_at IS NOT NULL "
+                "AND next_attempt_at <= ?)) AND expires_at > ? "
+                "AND (event = 'accepted' OR EXISTS (SELECT 1 FROM qq_outbox a "
+                "WHERE a.task_id = qq_outbox.task_id AND a.event = 'accepted' AND a.status = 'sent')) "
+                "ORDER BY id LIMIT ?",
+                (timestamp, timestamp, int(limit)),
+            ).fetchall()
+            claimed: list[dict[str, Any]] = []
+            for row in rows:
+                token = self._token()
+                self._conn.execute(
+                    "UPDATE qq_outbox SET status = 'leased', attempts = attempts + 1, "
+                    "lease_token = ?, lease_expires_at = ?, next_attempt_at = NULL, updated_at = ? "
+                    "WHERE id = ? AND (status = 'pending' OR status = 'failed') AND expires_at > ? "
+                    "AND (event = 'accepted' OR EXISTS (SELECT 1 FROM qq_outbox a "
+                    "WHERE a.task_id = qq_outbox.task_id AND a.event = 'accepted' AND a.status = 'sent'))",
+                    (token, timestamp + lease, timestamp, row["id"], timestamp),
+                )
+                item = self._conn.execute("SELECT * FROM qq_outbox WHERE id = ?", (row["id"],)).fetchone()
+                result = self._row(item)
+                if result is not None and result["status"] == "leased":
+                    result["worker_id"] = worker_id
+                    claimed.append(result)
+            return claimed
+
+    def heartbeat_qq_outbox(
+        self,
+        outbox_id: int,
+        lease_token: str,
+        *,
+        lease_seconds: float | None = None,
+        now: float | None = None,
+    ) -> dict[str, Any] | None:
+        lease = self.default_lease_seconds if lease_seconds is None else float(lease_seconds)
+        timestamp = self._now(now)
+        with self._lock, self._transaction():
+            self._ensure_open()
+            cursor = self._conn.execute(
+                "UPDATE qq_outbox SET lease_expires_at = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'leased' AND lease_token = ? "
+                "AND lease_expires_at > ?",
+                (timestamp + lease, timestamp, outbox_id, lease_token, timestamp),
+            )
+            if cursor.rowcount != 1:
+                return None
+            return self._row(self._conn.execute("SELECT * FROM qq_outbox WHERE id = ?", (outbox_id,)).fetchone())
+
+    def ack_qq_outbox(
+        self, outbox_id: int, lease_token: str, *, now: float | None = None
+    ) -> dict[str, Any] | None:
+        timestamp = self._now(now)
+        with self._lock, self._transaction():
+            self._ensure_open()
+            cursor = self._conn.execute(
+                "UPDATE qq_outbox SET status = 'sent', lease_token = NULL, lease_expires_at = NULL, "
+                "last_error = NULL, sent_at = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'leased' AND lease_token = ?",
+                (timestamp, timestamp, outbox_id, lease_token),
+            )
+            if cursor.rowcount != 1:
+                return None
+            return self._row(self._conn.execute("SELECT * FROM qq_outbox WHERE id = ?", (outbox_id,)).fetchone())
+
+    def fail_qq_outbox(
+        self,
+        outbox_id: int,
+        lease_token: str,
+        error: str | None = None,
+        *,
+        retryable: bool = True,
+        retry_at: float | None = None,
+        next_attempt_at: float | None = None,
+        now: float | None = None,
+    ) -> dict[str, Any] | None:
+        timestamp = self._now(now)
+        with self._lock, self._transaction():
+            self._ensure_open()
+            row = self._conn.execute(
+                "SELECT attempts FROM qq_outbox "
+                "WHERE id = ? AND status = 'leased' AND lease_token = ?",
+                (outbox_id, lease_token),
+            ).fetchone()
+            if row is None:
+                return None
+            if next_attempt_at is not None or retry_at is not None:
+                # Kept for direct administrative/test callers.  The HTTP
+                # bridge never accepts a client-provided retry timestamp.
+                scheduled = next_attempt_at if next_attempt_at is not None else retry_at
+            elif retryable and int(row["attempts"]) < 5:
+                delay = min(3600.0, 60.0 * (2 ** min(max(int(row["attempts"]) - 1, 0), 6)))
+                scheduled = timestamp + delay
+            else:
+                scheduled = None
+            cursor = self._conn.execute(
+                "UPDATE qq_outbox SET status = 'failed', lease_token = NULL, lease_expires_at = NULL, "
+                "last_error = ?, next_attempt_at = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'leased' AND lease_token = ?",
+                (error, scheduled, timestamp, outbox_id, lease_token),
+            )
+            return self._row(self._conn.execute("SELECT * FROM qq_outbox WHERE id = ?", (outbox_id,)).fetchone()) if cursor.rowcount == 1 else None
+
+    def _expire_qq_outbox_locked(self, timestamp: float) -> int:
+        return self._conn.execute(
+            "UPDATE qq_outbox SET status = 'expired', lease_token = NULL, lease_expires_at = NULL, "
+            "next_attempt_at = NULL, updated_at = ? WHERE status IN ('pending', 'failed', 'leased') "
+            "AND expires_at <= ?",
+            (timestamp, timestamp),
+        ).rowcount
+
+    def expire_qq_outbox(self, *, now: float | None = None) -> int:
+        timestamp = self._now(now)
+        with self._lock, self._transaction():
+            self._ensure_open()
+            return self._expire_qq_outbox_locked(timestamp)
+
+    def list_qq_outbox(self, *, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock:
+            self._ensure_open()
+            query = "SELECT * FROM qq_outbox"
+            params: list[Any] = []
+            if status is not None:
+                query += " WHERE status = ?"
+                params.append(status)
+            query += " ORDER BY id LIMIT ?"
+            params.append(max(0, int(limit)))
+            return [self._row(row) for row in self._conn.execute(query, params).fetchall()]  # type: ignore[list-item]
+
+    def project_qq_task_event(
+        self,
+        event_id: int,
+        *,
+        consumer: str = "qq",
+        payload: Any = None,
+        expires_at: float | None = None,
+        reply_ttl: float = 3600.0,
+        now: float | None = None,
+    ) -> bool:
+        """Materialize a terminal task event into QQ outbox and consume it."""
+        if reply_ttl <= 0:
+            raise ValueError("reply_ttl must be positive")
+        consumer = str(consumer).strip()
+        if not consumer:
+            raise ValueError("consumer must not be empty")
+        timestamp = self._now(now)
+        with self._lock, self._transaction():
+            self._ensure_open()
+            event = self._conn.execute(
+                "SELECT e.*, t.source_kind FROM task_events e JOIN tasks t ON t.id = e.task_id WHERE e.id = ?",
+                (event_id,),
+            ).fetchone()
+            if event is None:
+                raise ValueError(f"unknown task event id: {event_id}")
+            if event["source_kind"] != "qq":
+                raise ValueError("task event is not a QQ task")
+            if str(event["event_type"]) not in {"task.succeeded", "task.partially_succeeded", "task.failed"}:
+                raise ValueError("task event is not terminal")
+            consumed = self._conn.execute(
+                "SELECT 1 FROM task_event_consumptions WHERE event_id = ? AND consumer = ?",
+                (event_id, consumer),
+            ).fetchone()
+            if consumed is not None:
+                return False
+            target = self._conn.execute(
+                "SELECT open_id, message_id FROM qq_task_bindings WHERE task_id = ?",
+                (event["task_id"],),
+            ).fetchone()
+            if target is None:
+                raise ValueError("QQ task has no reply target")
+            if expires_at is None:
+                accepted_reply = self._conn.execute(
+                    "SELECT expires_at FROM qq_outbox "
+                    "WHERE task_id = ? AND event = 'accepted'",
+                    (event["task_id"],),
+                ).fetchone()
+                if accepted_reply is None:
+                    raise ValueError("QQ task has no accepted reply")
+                deadline = float(accepted_reply["expires_at"])
+            else:
+                deadline = float(expires_at)
+            event_name = {
+                "task.succeeded": "completed",
+                "task.partially_succeeded": "partially_completed",
+                "task.failed": "failed",
+            }[str(event["event_type"])]
+            if payload is not None:
+                body = payload
+            else:
+                event_payload = self._decode(event["payload_json"])
+                if not isinstance(event_payload, dict):
+                    event_payload = {}
+                safe_result = event_payload.get("result")
+                if isinstance(safe_result, dict):
+                    safe_result = {
+                        key: value for key, value in safe_result.items()
+                        if key not in {"error", "cookie", "password", "auth", "token"}
+                    }
+                body = {
+                    "event": event_name,
+                    "task_id": int(event["task_id"]),
+                    "result": safe_result,
+                }
+                if event_name == "failed":
+                    body["error_code"] = event_payload.get("error_code") or "download_failed"
+                    body["error"] = "下载失败，请稍后重试。"
+            self._insert_qq_outbox_locked(
+                int(event["task_id"]),
+                str(target["open_id"]),
+                str(target["message_id"]),
+                event_name,
+                body,
+                timestamp,
+                expires_at=deadline,
+            )
+            self._conn.execute(
+                "INSERT INTO task_event_consumptions(event_id, consumer, consumed_at) VALUES (?, ?, ?)",
+                (event_id, consumer, timestamp),
+            )
+            return True
 
 
 __all__ = ["MailStateStore", "SCHEMA_VERSION"]

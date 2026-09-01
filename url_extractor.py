@@ -41,8 +41,34 @@ class UrlExtractor:
     """
 
     def extract(self, text: str) -> str | None:
-        """Scan text for a supported URL and return the first match."""
+        """Scan text for a supported URL and return the first match.
+
+        ``extract`` intentionally retains the historical first-match
+        behaviour.  New entry points that need to reject a message containing
+        more than one link should use :meth:`extract_all`.
+        """
+        urls = self.extract_all(text)
+        return urls[0] if urls else None
+
+    def extract_all(self, text: str) -> list[str]:
+        """Return all distinct supported URLs in their source order.
+
+        URL cleanup happens before de-duplication so punctuation copied after
+        a link does not produce a second logical URL.  The method accepts the
+        same arbitrary text inputs as :meth:`extract` and returns an empty
+        list for false-y values.
+        """
         if not text:
-            return None
-        m = SUPPORTED_URL_PATTERN.search(text)
-        return clean_url(m.group(0)) if m else None
+            return []
+        urls: list[str] = []
+        seen: set[str] = set()
+        for match in SUPPORTED_URL_PATTERN.finditer(text):
+            url = clean_url(match.group(0))
+            if url and url not in seen:
+                seen.add(url)
+                urls.append(url)
+        return urls
+
+    # ``extract_many`` is a descriptive alias for callers that do not use
+    # the older ``extract`` naming convention.
+    extract_many = extract_all

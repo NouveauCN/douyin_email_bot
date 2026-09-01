@@ -7,6 +7,8 @@ Repository instructions for coding agents. They apply to the whole repository.
 This Python service polls IMAP for Douyin or Bilibili links, downloads media,
 and replies over SMTP. It also includes Firefox cookie acquisition, a QR login
 service on port 8080, and a trusted-LAN file browser on port 8081.
+An optional standalone Node.js QQ C2C gateway accepts links through an
+authenticated internal bridge.
 
 ```text
 main.py                 Bot entry point and order-sensitive F2 bootstrap
@@ -33,6 +35,8 @@ smoke_download.py       Live Douyin smoke download
 config.yaml             Non-secret runtime configuration
 Dockerfile              Python 3.12 image with FFmpeg, Playwright, and yutto
 docker-compose.yml      bot, web_login, and file_browser services
+qq_gateway/              Node.js QQ C2C gateway (optional, single instance)
+qq_bridge.py             Authenticated internal bridge and QQ outbox HTTP API
 ```
 
 Main flow:
@@ -40,6 +44,8 @@ Main flow:
 ```text
 IMAP -> EmailBot -> UrlExtractor -> DownloadTaskService -> platform adapter
                                               -> task event -> email outbox -> SMTP reply
+QQ C2C -> qq_gateway -> authenticated qq_bridge -> DownloadTaskService
+                                              -> task event -> QQ outbox reply
 ```
 
 ## Safety And Boundaries
@@ -52,6 +58,9 @@ IMAP -> EmailBot -> UrlExtractor -> DownloadTaskService -> platform adapter
   credentials, network access, and the configured download destination.
 - Network, IMAP, SMTP, browser, and download failures must be logged and handled
   without terminating the long-running poll loop.
+- QQ is an optional C2C-only entry point. Keep the gateway on one instance,
+  restrict it to explicit OpenIDs, and expose only its internal bridge; never
+  publish the bridge port or accept wildcard allowlists.
 - Preserve `_safe_subpath()` checks around every `file_browser.py` route that
   accepts a user path.
 - Destructive file-browser routes must reject any path that resolves to the
@@ -147,6 +156,22 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   durable service.
 - Firefox cookie extraction remains process-serialized; Douyin and Bilibili
   worker capacity is independently bounded by bot configuration.
+
+### QQ gateway
+
+- The Node gateway accepts only C2C messages from `QQBOT_ALLOWED_OPENIDS` and
+  submits messages through the authenticated `QQ_BRIDGE_TOKEN` bridge at
+  `http://bot:8082`; group/channel messages and unauthorized OpenIDs never enter
+  the download service.
+- A QQ message must contain exactly one supported Douyin/Bilibili URL. The
+  bridge deduplicates the message, queues an immediate acknowledgement, and
+  projects the terminal task result to the QQ outbox idempotently.
+- QQ replies are passive replies only. `QQBOT_REPLY_WINDOW_SECONDS` defaults to
+  3600 seconds; an expired item is retained as a delivery failure and must not
+  be converted into an unsolicited proactive message.
+- The gateway stores its session/outbox delivery state in the independent
+  `qq_gateway_state` volume. Credentials and bridge tokens belong only in the
+  untracked `.env`; do not log App Secrets, cookies, or server paths.
 
 ### Douyin downloads
 
@@ -254,7 +279,10 @@ deliberately supplied, in which case the field is locked in the Settings tab.
 
 `config_loader.py` is the source of truth for environment-variable mappings.
 Sensitive variables include `EMAIL_ADDRESS`, `EMAIL_PASSWORD`, `DOUYIN_COOKIE`,
-and `BILIBILI_AUTH`; `BILIBILI_AUTH_FILE` may reference sensitive login state.
+`BILIBILI_AUTH`, `QQBOT_APP_SECRET`, and `QQ_BRIDGE_TOKEN`;
+`BILIBILI_AUTH_FILE` may reference sensitive login state. `QQBOT_APP_ID` and
+`QQBOT_ALLOWED_OPENIDS` are deployment configuration and should remain in the
+untracked `.env` when possible.
 `EMAIL_SEND_REPLIES` controls SMTP result notifications and defaults to enabled;
 it does not disable mail intake or downloads. `SENDER_ADDRESS` and
 `SENDER_PASSWORD` are test-driver-only credentials and must not be added to
@@ -339,13 +367,18 @@ routine test.
 ## Docker Deployment
 
 ```bash
-sudo docker compose up -d --build bot file_browser
+sudo docker compose up -d --build bot qq_gateway file_browser
 sudo docker compose --profile login up web_login
 sudo docker compose down
 ```
 
 - The bot owns the `logs` and `state` volumes; `state` persists
   `pending_retries.json` and `failed_links.txt` across bot container rebuilds.
+- `qq_gateway` is a single-instance optional service built from `./qq_gateway`.
+  It depends on `bot`, has no published host ports, and stores SDK/session and
+  delivery state in the independent `qq_gateway_state` volume. The bot's bridge
+  listens on `0.0.0.0:8082` inside the Compose network only; both services must
+  receive the same `QQ_BRIDGE_TOKEN`.
   Bot and `web_login` share the Firefox-profile volume.
 - `runtime_settings` is an independent named volume mounted at
   `/app/runtime-settings` in `bot`, `file_browser`, and `web_login`, with

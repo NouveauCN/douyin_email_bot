@@ -19,7 +19,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from email.header import decode_header
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -37,7 +37,8 @@ from mail_state import MailStateStore
 from migrate_mail_state import import_pending_retries
 from settings_store import SettingsStore, default_database_path
 from task_store import TaskStore
-from url_extractor import UrlExtractor, detect_platform
+from url_extractor import SUPPORTED_URL_PATTERN, UrlExtractor, clean_url, detect_platform
+from qq_bridge import QQBridgeServer
 
 logger = logging.getLogger("EmailBot")
 
@@ -89,6 +90,18 @@ def _download_failure_hint() -> str:
     )
 
 
+def _safe_qq_error(value: object, error_code: object = None) -> str:
+    """Map downloader diagnostics to a small non-sensitive user message."""
+    category = f"{error_code or ''} {value or ''}".lower()
+    if any(marker in category for marker in ("cookie", "login", "auth", "credential")):
+        return "登录状态可能失效，请更新对应平台的登录信息。"
+    if any(marker in category for marker in ("timeout", "network", "connect", "dns", "http")):
+        return "网络请求失败，请稍后重试。"
+    if any(marker in category for marker in ("unsupported", "invalid_url", "not found", "unavailable")):
+        return "链接不受支持，或对应内容目前不可用。"
+    return "下载失败，请稍后重试。"
+
+
 def _success_subject_status(result: dict, refreshed_cookie: bool = False) -> str:
     """Build a short status phrase for reply subjects."""
     if result.get("partial"):
@@ -138,6 +151,7 @@ class EmailBot:
         self._settings_revision = self._settings.get_revision()
         self._managed_settings = self._settings.managed_values()
         self._lifecycle_thread: threading.Thread | None = None
+        self._qq_bridge: QQBridgeServer | None = None
         self._lifecycle_stop = threading.Event()
         self._run_thread: threading.Thread | None = None
         self._run_finished = threading.Event()
@@ -149,6 +163,7 @@ class EmailBot:
         self._active_lock = threading.Lock()
         self._active_tasks = 0
         self._active_outbox = 0
+        self._qq_active = 0
         self._restart_id: str | None = None
         self._restart_started_at: float | None = None
         self._restart_timeout = float(
@@ -272,7 +287,10 @@ class EmailBot:
 
         with MailStateStore(state_db_path) as rollback_state:
             unfinished = rollback_state.unfinished_work_counts()
-            unfinished["events"] = rollback_state.unfinished_event_count("email")
+            unfinished["events"] = (
+                rollback_state.unfinished_event_count("email")
+                + rollback_state.unfinished_event_count("qq")
+            )
             terminal_legacy_keys = rollback_state.terminal_legacy_retry_keys(strict=True)
         if any(unfinished.values()):
             raise RuntimeError(
@@ -316,6 +334,8 @@ class EmailBot:
                 }:
                     continue
                 task = self._state.get_task_by_id(int(event["task_id"]))
+                if task is not None and task.get("source_kind") != "mail":
+                    continue
                 consumed = self._state.task_event_consumed(int(event["id"]), "email")
                 if task is None or not self._project_terminal_failure(
                     task, event, allow_legacy_unkeyed=consumed
@@ -362,6 +382,13 @@ class EmailBot:
 
     def shutdown(self) -> None:
         """Stop intake and let bounded runtime threads finish their current work."""
+        # Close the HTTP intake before quiescing/closing SQLite.  This avoids a
+        # request racing the restart drain and makes shutdown safe for the QQ
+        # gateway, which may still be polling while the bot exits.
+        qq_bridge = getattr(self, "_qq_bridge", None)
+        if qq_bridge is not None:
+            qq_bridge.stop()
+            self._qq_bridge = None
         service = getattr(self, "_task_service", None)
         if service is not None:
             service.quiesce()
@@ -398,6 +425,7 @@ class EmailBot:
                 self._lifecycle_thread = None
 
     def _start_runtime(self) -> None:
+        self._start_qq_bridge()
         if self._state is None or self._runtime_threads:
             return
         service = getattr(self, "_task_service", None)
@@ -410,6 +438,18 @@ class EmailBot:
             )
             events.start()
             self._runtime_threads.append(events)
+            qq_store = service.store
+            qq_projector = getattr(qq_store, "project_qq_task_event", None)
+            if not callable(qq_projector):
+                qq_projector = getattr(getattr(qq_store, "state", None), "project_qq_task_event", None)
+            if callable(qq_projector):
+                qq_events = threading.Thread(
+                    target=self._qq_task_event_worker_loop,
+                    name="qq-task-events",
+                    daemon=True,
+                )
+                qq_events.start()
+                self._runtime_threads.append(qq_events)
             # The DownloadTaskService owns download workers.  SMTP and event
             # projection remain entry-specific and stay with EmailBot.
             if self._notifications_enabled():
@@ -453,6 +493,276 @@ class EmailBot:
         )
         maintenance.start()
         self._runtime_threads.append(maintenance)
+
+    def _qq_task_event_worker_loop(self) -> None:
+        """Project terminal QQ events into the QQ-specific durable outbox."""
+        service = getattr(self, "_task_service", None)
+        state = getattr(service, "store", None) if service is not None else None
+        projector = getattr(state, "project_qq_task_event", None)
+        raw_state = getattr(state, "state", state)
+        if not callable(projector):
+            projector = getattr(raw_state, "project_qq_task_event", None)
+        if not callable(projector):
+            return
+        while not self._stop_event.is_set():
+            try:
+                list_events = getattr(state, "events", None)
+                if callable(list_events):
+                    events = list_events(consumer="qq", limit=25)
+                else:
+                    events = raw_state.list_task_events(consumer="qq", limit=25)
+                if not events:
+                    self._stop_event.wait(0.25)
+                    continue
+                for event in events:
+                    event_type = str(event.get("event_type") or "")
+                    if event_type not in {
+                        "task.succeeded",
+                        "task.partially_succeeded",
+                        "task.failed",
+                    }:
+                        # There is no user-visible reply for non-terminal
+                        # events, but they must not block the QQ consumer.
+                        consume = getattr(state, "consume_event", None)
+                        if callable(consume):
+                            consume(int(event["id"]), "qq")
+                        else:
+                            raw_state.consume_task_event(int(event["id"]), "qq")
+                        continue
+                    # TaskStore returns TaskSnapshot; use its underlying
+                    # MailStateStore here because notification formatting
+                    # needs the raw payload/source binding fields.
+                    get_task = getattr(raw_state, "get_task_by_id", None)
+                    get_snapshot = getattr(state, "get", None)
+                    task = get_task(int(event["task_id"])) if callable(get_task) else get_snapshot(int(event["task_id"]))
+                    if task is None:
+                        continue
+                    body = self._qq_task_notification(task, event)
+                    projector(int(event["id"]), payload={"body": body})
+            except Exception:
+                logger.exception("QQ task event projector failed")
+                self._stop_event.wait(1)
+
+    @staticmethod
+    def _qq_task_notification(task: dict, event: dict) -> str:
+        event_payload = event.get("payload") or {}
+        if not isinstance(event_payload, dict):
+            event_payload = {}
+        result = event_payload.get("result") or task.get("result") or {}
+        if not isinstance(result, dict):
+            result = {}
+        event_type = str(event.get("event_type") or "")
+        if event_type == "task.failed" and not result.get("success"):
+            error = event_payload.get("error") or task.get("last_error") or result.get("error") or "未知错误"
+            error_code = event_payload.get("error_code") or task.get("error_code")
+            return f"下载失败：{_safe_qq_error(error, error_code)}" + _download_failure_hint()
+        title = result.get("title") or "未知标题"
+        files = result.get("files") or []
+        if not files and result.get("filepath"):
+            files = [result["filepath"]]
+        # QQ is not a trusted shell or filesystem UI.  Return names only, not
+        # absolute server paths that may disclose deployment details.
+        names = [Path(str(path)).name for path in files[:10] if str(path)]
+        prefix = "部分下载完成。" if result.get("partial") else "下载完成！"
+        lines = [prefix, f"标题：{title}", f"文件数量：{result.get('file_count') or len(files)}"]
+        if names:
+            lines.append("文件：")
+            lines.extend(f"- {name}" for name in names)
+        if result.get("partial"):
+            lines.append(f"有 {int(result.get('failed_count') or 0)} 个资源下载失败。")
+        return "\n".join(lines)
+
+    def _start_qq_bridge(self) -> None:
+        """Start the internal QQ HTTP bridge when explicitly configured.
+
+        The bridge is disabled unless a token is present.  In particular, an
+        empty token never starts an unauthenticated listener.
+        """
+        if self._state is None or self._task_service is None:
+            return
+        if getattr(self, "_qq_bridge", None) is not None:
+            return
+        token = os.getenv("QQ_BRIDGE_TOKEN", "").strip()
+        if not token:
+            logger.info("QQ bridge disabled: QQ_BRIDGE_TOKEN is not configured")
+            return
+        try:
+            self._qq_bridge = QQBridgeServer(self, token=token)
+            self._qq_bridge.start()
+            logger.info("QQ bridge listening on %s:%d", self._qq_bridge.host, self._qq_bridge.port)
+        except Exception:
+            self._qq_bridge = None
+            logger.exception("Could not start QQ bridge; continuing without QQ intake")
+
+    def accept_qq_message(self, payload: dict) -> dict:
+        """Validate and atomically submit one QQ message through the task store."""
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be a JSON object")
+        open_id = str(payload.get("open_id") or payload.get("sender_id") or "").strip()
+        message_id = str(payload.get("message_id") or "").strip()
+        text = str(payload.get("text") or payload.get("content") or "")
+        if not open_id or len(open_id) > 256 or any(char.isspace() for char in open_id):
+            raise ValueError("open_id is invalid")
+        if not message_id or len(message_id) > 1024 or any(char.isspace() for char in message_id):
+            raise ValueError("message_id is invalid")
+        if len(text) > 64 * 1024:
+            raise ValueError("text is too long")
+        urls = self._extract_qq_urls(text)
+        if not urls:
+            return {
+                "accepted": False,
+                "reason": "no_supported_url",
+                "reply": "未找到支持的抖音或 B 站链接。请每条消息只发送一个链接。",
+            }
+        if len(urls) != 1:
+            return {
+                "accepted": False,
+                "reason": "multiple_urls",
+                "reply": "一条消息只能发送一个抖音或 B 站链接，请拆分后重试。",
+            }
+        url = urls[0]
+        platform = detect_platform(url)
+        metadata = {
+            "channel": "qq",
+            "open_id": open_id,
+            "message_id": message_id,
+        }
+        service = self._task_service
+        if service is None:
+            raise RuntimeError("durable download service is unavailable")
+        accept = getattr(service, "accept_qq_message", None)
+        if not callable(accept):
+            raise RuntimeError("QQ task intake is unavailable")
+        confirmation = "已收到链接，开始下载。完成后会在本条 QQ 消息中回复结果。"
+        # Serialize intake with the settings restart gate.  A restart cannot
+        # clear the gate between this check and the atomic SQLite transaction.
+        with self._claim_gate:
+            if not self._intake_is_enabled():
+                raise RuntimeError("QQ intake is paused while the bot is restarting")
+            accepted = accept(
+                open_id=open_id,
+                message_id=message_id,
+                url=url,
+                platform=platform,
+                metadata=metadata,
+                confirmation_payload={"body": confirmation},
+                max_attempts=getattr(self.config.bot, "transient_retry_attempts", 3),
+                reply_ttl=self._qq_reply_window_seconds(),
+            )
+        result = dict(accepted) if isinstance(accepted, dict) else {"task": accepted}
+        result.update({"accepted": True, "url": url, "platform": platform})
+        return result
+
+    def _extract_qq_urls(self, text: str) -> list[str]:
+        extractor = getattr(self, "extractor", None)
+        extract_all = getattr(extractor, "extract_all", None)
+        if callable(extract_all):
+            values = extract_all(text)
+        else:
+            values = [match.group(0) for match in SUPPORTED_URL_PATTERN.finditer(text)]
+        result: list[str] = []
+        seen: set[str] = set()
+        for value in values or ():
+            url = clean_url(str(value))
+            if url and url not in seen and detect_platform(url):
+                result.append(url)
+                seen.add(url)
+        return result
+
+    @staticmethod
+    def _qq_reply_window_seconds() -> float:
+        raw = os.getenv("QQBOT_REPLY_WINDOW_SECONDS", "3600")
+        try:
+            return max(60.0, min(86400.0, float(raw)))
+        except (TypeError, ValueError):
+            return 3600.0
+
+    def claim_qq_outbox(self, *, limit: int = 10, worker_id=None):
+        service = self._task_service
+        claim = getattr(service, "claim_qq_outbox", None) if service is not None else None
+        if not callable(claim) and service is not None:
+            claim = getattr(getattr(service.store, "state", None), "claim_qq_outbox", None)
+        if not callable(claim):
+            raise RuntimeError("QQ outbox is unavailable")
+        items = claim(
+            limit=limit,
+            worker_id=worker_id,
+            lease_seconds=self._qq_outbox_lease_seconds(),
+        )
+        # The SQLite row uses explicit ``reply_to_message_id`` and a generic
+        # JSON ``payload``.  Normalize those fields for the Node gateway's
+        # deliberately small protocol without exposing any other DB details.
+        normalized = []
+        for item in items or ():
+            row = dict(item) if isinstance(item, dict) else item
+            if not isinstance(row, dict):
+                normalized.append(row)
+                continue
+            row.setdefault("message_id", row.get("reply_to_message_id"))
+            expires_at = row.get("expires_at")
+            if isinstance(expires_at, (int, float)):
+                row["expires_at"] = datetime.fromtimestamp(
+                    float(expires_at), tz=timezone.utc
+                ).isoformat()
+            payload = row.get("payload")
+            if isinstance(payload, dict):
+                content = payload.get("body") or payload.get("content") or payload.get("text")
+                if content is not None:
+                    row["content"] = str(content)
+            elif payload is not None:
+                row["content"] = str(payload)
+            normalized.append(row)
+        return normalized
+
+    @staticmethod
+    def _qq_outbox_lease_seconds() -> float:
+        raw = os.getenv("QQBOT_OUTBOX_LEASE_SECONDS", "120")
+        try:
+            return max(30.0, min(600.0, float(raw)))
+        except (TypeError, ValueError):
+            return 120.0
+
+    def ack_qq_outbox(self, outbox_id: int, lease_token: str):
+        service = self._task_service
+        ack = getattr(service, "ack_qq_outbox", None) if service is not None else None
+        if not callable(ack) and service is not None:
+            ack = getattr(getattr(service.store, "state", None), "ack_qq_outbox", None)
+        if not callable(ack):
+            raise RuntimeError("QQ outbox is unavailable")
+        return ack(outbox_id, lease_token)
+
+    def fail_qq_outbox(self, outbox_id: int, lease_token: str, error: str, *, retryable: bool = True):
+        service = self._task_service
+        fail = getattr(service, "fail_qq_outbox", None) if service is not None else None
+        if not callable(fail) and service is not None:
+            fail = getattr(getattr(service.store, "state", None), "fail_qq_outbox", None)
+        if not callable(fail):
+            raise RuntimeError("QQ outbox is unavailable")
+        try:
+            # New stores own retry policy and accept the retryable outcome.
+            return fail(outbox_id, lease_token, error, retryable=retryable)
+        except TypeError as exc:
+            # Compatibility with the initial v4 store: calculate bounded
+            # backoff here until that store is upgraded.  The HTTP caller
+            # never controls the resulting timestamp.
+            if "retryable" not in str(exc):
+                raise
+            retry_at = None
+            if retryable:
+                state = getattr(service.store, "state", None) if service is not None else None
+                rows = state.list_qq_outbox(limit=100) if state is not None else []
+                item = next((row for row in rows if int(row.get("id", -1)) == int(outbox_id)), None)
+                attempts = int(item.get("attempts", 0)) if item else 0
+                configured_max = getattr(getattr(self.config, "bot", None), "outbox_retry_attempts", 5)
+                max_attempts = max(1, min(20, int(configured_max)))
+                if attempts < max_attempts:
+                    configured_delay = getattr(getattr(self.config, "bot", None), "outbox_retry_delay_seconds", 60)
+                    delay = max(1.0, min(3600.0, float(configured_delay)))
+                    retry_at = time.time() + delay * (2 ** min(attempts - 1, 6))
+            return fail(outbox_id, lease_token, error, retry_at=retry_at)
+
+    def qq_health(self) -> dict:
+        return {"status": "ok", "service": "bot"} if self._task_service is not None else {"status": "degraded"}
 
     def _start_lifecycle_watcher(self) -> None:
         if self._lifecycle_thread is not None:
@@ -512,7 +822,11 @@ class EmailBot:
 
     def _lifecycle_detail(self) -> str:
         with self._active_lock:
-            return f"active_tasks={self._active_tasks},active_outbox={self._active_outbox}"
+            return (
+                f"active_tasks={self._active_tasks},"
+                f"active_outbox={self._active_outbox},"
+                f"active_qq={getattr(self, '_qq_active', 0)}"
+            )
 
     def _intake_is_enabled(self) -> bool:
         """Return intake state; tolerate lightweight test doubles/old callers."""
@@ -648,11 +962,23 @@ class EmailBot:
 
     def _active_count(self) -> int:
         with self._active_lock:
-            active = self._active_tasks + self._active_outbox
+            active = (
+                getattr(self, "_active_tasks", 0)
+                + getattr(self, "_active_outbox", 0)
+                + getattr(self, "_qq_active", 0)
+            )
         service = getattr(self, "_task_service", None)
         if service is not None:
             active += service.active_count()
         return active
+
+    def qq_request_started(self) -> None:
+        with self._active_lock:
+            self._qq_active += 1
+
+    def qq_request_finished(self) -> None:
+        with self._active_lock:
+            self._qq_active = max(0, self._qq_active - 1)
 
     def _update_restart(self, request_id: str, status: str, error=None, **details) -> None:
         """Call the richer lifecycle API while tolerating an old store."""

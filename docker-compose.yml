@@ -22,6 +22,12 @@ services:
       - BOT_STATE_DB=/app/state/mail_state.sqlite3
       - RUNTIME_SETTINGS_DB=/app/runtime-settings/settings.sqlite3
       - BOT_DURABLE_MAIL_ENABLED=${BOT_DURABLE_MAIL_ENABLED:-1}
+      # Internal-only QQ bridge; the gateway reaches this over the Compose network.
+      - QQ_BRIDGE_HOST=0.0.0.0
+      - QQ_BRIDGE_PORT=8082
+      - QQ_BRIDGE_TOKEN=${QQ_BRIDGE_TOKEN:-}
+      - QQBOT_REPLY_WINDOW_SECONDS=${QQBOT_REPLY_WINDOW_SECONDS:-3600}
+      - QQBOT_OUTBOX_LEASE_SECONDS=${QQBOT_OUTBOX_LEASE_SECONDS:-120}
       - TZ=Asia/Shanghai
       # Keep Douyin traffic direct even when the Docker host has proxy vars set.
       - HTTP_PROXY=
@@ -89,6 +95,26 @@ services:
       - FILE_BROWSER_MEDIA_MAX_CONCURRENCY=${FILE_BROWSER_MEDIA_MAX_CONCURRENCY:-2}
     command: ["python3", "file_browser.py"]
 
+  qq_gateway:
+    build: ./qq_gateway
+    container_name: douyin_qq_gateway
+    restart: unless-stopped
+    depends_on:
+      - bot
+    volumes:
+      - qq_gateway_state:/app/qq-gateway-state
+    environment:
+      - QQBOT_APP_ID=${QQBOT_APP_ID:-}
+      - QQBOT_APP_SECRET=${QQBOT_APP_SECRET:-}
+      - QQBOT_ALLOWED_OPENIDS=${QQBOT_ALLOWED_OPENIDS:-}
+      - QQ_BRIDGE_URL=${QQ_BRIDGE_URL:-http://bot:8082}
+      - QQ_BRIDGE_TOKEN=${QQ_BRIDGE_TOKEN:-}
+      - QQBOT_STATE_DIR=/app/qq-gateway-state
+      - QQBOT_OUTBOX_POLL_MS=${QQBOT_OUTBOX_POLL_MS:-1000}
+      - QQBOT_OUTBOX_CLAIM_SIZE=${QQBOT_OUTBOX_CLAIM_SIZE:-10}
+      - QQBOT_REQUEST_TIMEOUT_MS=${QQBOT_REQUEST_TIMEOUT_MS:-15000}
+      - TZ=Asia/Shanghai
+
 volumes:
   logs:
     driver: local
@@ -97,4 +123,6 @@ volumes:
   state:
     driver: local
   runtime_settings:
+    driver: local
+  qq_gateway_state:
     driver: local
