@@ -195,7 +195,6 @@ class MailStore:
         lease_token: str,
         error: str | None = None,
         *,
-        retryable: bool = True,
         retry_at: float | None = None,
         now: float | None = None,
     ) -> dict[str, Any] | None:
@@ -203,7 +202,6 @@ class MailStore:
             outbox_id,
             lease_token,
             error,
-            retryable=retryable,
             retry_at=retry_at,
             now=now,
         )

@@ -223,7 +223,9 @@ class UploadFormTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.get_json()["candidate"])
         self.assertTrue(response.get_json()["requires_review"])
-        process.assert_called_once_with(path, dry_run=True)
+        process.assert_called_once_with(
+            path, dry_run=True, lock_root=self.download_dir
+        )
 
     def test_crop_apply_passes_explicit_manual_confirmation(self):
         video_dir = self.download_dir / "author"
@@ -250,7 +252,9 @@ class UploadFormTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.get_json()["changed"])
-        process.assert_called_once_with(path, force_review=True)
+        process.assert_called_once_with(
+            path, force_review=True, lock_root=self.download_dir
+        )
 
     def test_crop_api_rejects_path_traversal(self):
         response = self.client.post(

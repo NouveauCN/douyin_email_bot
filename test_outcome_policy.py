@@ -26,6 +26,7 @@ def test_partial_transient_result_retries_until_attempt_limit():
     )
     assert decision.action == "retry"
     assert decision.retry_at == 110
+    assert decision.error == "item: timeout"
 
     terminal = decide_outcome(
         result,

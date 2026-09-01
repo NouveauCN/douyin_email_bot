@@ -38,7 +38,23 @@ class BilibiliDownloader:
         """
         download_dir = Path(self.config.download_path)
         download_dir.mkdir(parents=True, exist_ok=True)
+        shared_root = download_dir.parent
+        transaction_lock = media_file_lock(
+            download_dir / ".yutto-transaction",
+            root=shared_root,
+            timeout=max(5.0, float(self.config.timeout)),
+        )
+        try:
+            transaction_lock.acquire()
+        except MediaFileLockBusy:
+            return self._error("B站下载等待媒体目录锁超时，请稍后重试")
+        try:
+            return self._download_locked(url, download_dir, shared_root)
+        finally:
+            transaction_lock.release()
 
+    def _download_locked(self, url: str, download_dir: Path, shared_root: Path) -> dict:
+        """Run yutto and publish results while browser media writes are paused."""
         started_at = time.time()
         command = self._build_command(url, download_dir)
         logger.info("Running yutto for Bilibili URL: %s", url)
@@ -73,7 +89,7 @@ class BilibiliDownloader:
 
         covers = _move_cover_files(download_dir, started_at)
         files = _collect_downloaded_files(download_dir, started_at)
-        _process_downloaded_media([*files, *covers], download_dir)
+        _process_downloaded_media([*files, *covers], shared_root)
         filepath = _format_file_result(files, download_dir)
         title = _extract_title(output) or "Bilibili Video"
 
@@ -196,7 +212,7 @@ def _move_cover_files(download_dir: Path, started_at: float) -> list[Path]:
         try:
             # yutto has already exited; lock only the source-to-slides
             # publication, never the subprocess itself.
-            with media_file_lock(cover, root=download_dir, timeout=5):
+            with media_file_lock(cover, root=download_dir.parent, timeout=5):
                 shutil.move(str(cover), str(target))
         except MediaFileLockBusy:
             logger.warning("Bilibili cover is busy, leaving it in place: %s", cover)

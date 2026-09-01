@@ -638,7 +638,9 @@ def process_media(
     suffix = path.suffix.lower()
     if suffix not in IMAGE_EXTENSIONS and suffix not in VIDEO_EXTENSIONS:
         return ProcessResult(path, False, reason="unsupported media type")
-    with media_file_lock(path, root=lock_root, timeout=lock_timeout):
+    with media_file_lock(path, root=lock_root, timeout=lock_timeout), media_file_lock(
+        _backup_path(path), root=lock_root, timeout=lock_timeout
+    ):
         if suffix in IMAGE_EXTENSIONS:
             return _process_image(path, dry_run=dry_run, force_review=force_review)
         return _process_video(path, dry_run=dry_run, force_review=force_review)
@@ -654,7 +656,9 @@ def process_image(
 ) -> ProcessResult:
     """Detect and optionally crop an image under its per-file lock."""
     path = Path(path)
-    with media_file_lock(path, root=lock_root, timeout=lock_timeout):
+    with media_file_lock(path, root=lock_root, timeout=lock_timeout), media_file_lock(
+        _backup_path(path), root=lock_root, timeout=lock_timeout
+    ):
         return _process_image(path, dry_run=dry_run, force_review=force_review)
 
 
@@ -668,7 +672,9 @@ def process_video(
 ) -> ProcessResult:
     """Detect and optionally crop a video under its per-file lock."""
     path = Path(path)
-    with media_file_lock(path, root=lock_root, timeout=lock_timeout):
+    with media_file_lock(path, root=lock_root, timeout=lock_timeout), media_file_lock(
+        _backup_path(path), root=lock_root, timeout=lock_timeout
+    ):
         return _process_video(path, dry_run=dry_run, force_review=force_review)
 
 

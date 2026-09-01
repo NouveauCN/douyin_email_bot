@@ -346,6 +346,61 @@ Acceptance criteria:
 - Make the thumbnail cache path configurable and verify cache permissions and
   atomic generation.
 
+### Phase 8: Architecture Boundaries and Decoupling (P0/P1)
+
+Status: **Completed (2026-09-01)**.  The
+architecture contract is recorded in [ARCHITECTURE.md](ARCHITECTURE.md).
+
+Delivered in this phase: explicit Task/Mail/QQ facades over the shared SQLite
+kernel, lightweight Email/QQ event projectors, one outcome policy shared by
+durable and rollback execution, and a cooperative tree-and-target `flock`
+covering bot, file-browser, yutto, cleanup, and offline media processing.
+
+Design position: this is a private, single-instance extensibility change.  The
+target is a lightweight modular monolith with one Compose deployment and one
+SQLite task/state database.  The QQ gateway and file browser remain separate
+runtime boundaries for dependency and trust reasons, not independently
+scalable services.
+
+Non-goals are high availability, horizontal scaling, service discovery,
+external message queues, distributed transactions, complex dependency
+injection, a separate scheduler, or splitting the SQLite database.  Keep the
+small necessary safety boundaries: atomic outbox projection, idempotency,
+leases where already required for restart recovery, and a lightweight shared
+`flock` for concurrent media writers.
+
+This phase tightens the existing modular-monolith seams without changing the
+public download flow.
+
+- Keep `MailStateStore` as the shared transactional kernel, but expose it
+  through explicit Task, Mail, and QQ facades.  Callers must not reach through
+  a facade to `service.store.state` or raw tables.
+- Keep `EmailBot` as composition/lifecycle owner.  Isolate IMAP/QQ intake and
+  email/QQ terminal-event projection behind entry/sink adapters and projectors;
+  `DownloadTaskService` remains responsible for claims, leases, execution,
+  retries, and task events.
+- Preserve atomic intake and terminal-event-to-outbox projection, including
+  idempotency keys, stable SMTP Message-IDs, and passive QQ reply windows.
+- Treat the legacy JSON path as a rollback source only.  It remains available
+  until durable work is drained and must not receive new business behavior.
+- Use one shared-root cooperative tree-and-target media lock across bot and
+  file-browser writers, with bounded acquisition and atomic publish.  Document
+  and test the limitation that non-cooperating NAS clients are outside this
+  guarantee.
+
+Acceptance criteria:
+
+- Focused facade tests prove task, mail, and QQ callers do not require raw
+  store access and preserve existing transaction/idempotency behavior.
+- Projector replay produces at most one sink outbox item per task/event, and a
+  failed provider call remains recoverable through its leased outbox row.
+- Lifecycle tests show intake stops before drain, workers remain recoverable,
+  and legacy rollback is refused while durable work is present.
+- Concurrent bot/file-browser media operations serialize on the same shared
+  tree; timeout/conflict is surfaced without partial replacement.
+- `ARCHITECTURE.md`, this roadmap, and the stable invariants in `AGENTS.md`
+  agree on ownership and the remaining risks.
+
 ## Decisions Required Before Implementation
 
 1. Decided for the current deployment: use

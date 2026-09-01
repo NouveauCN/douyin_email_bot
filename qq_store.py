@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Mapping
 
+from download_types import validate_metadata
 from mail_state import MailStateStore
 
 
@@ -49,8 +50,6 @@ class QQStore:
         safe_metadata = dict(metadata or {})
         # MailStateStore performs the final validation too; keep this facade
         # explicit so all public intake paths reject secret-shaped context.
-        from download_types import validate_metadata
-
         return self._state.accept_qq_message(
             open_id,
             message_id,
@@ -163,6 +162,14 @@ class QQStore:
             include_consumed=include_consumed,
             after_id=after_id,
         )
+
+    def consume_event(
+        self, event_id: int, consumer: str = "qq", *, now: float | None = None
+    ) -> bool:
+        return self._state.consume_task_event(event_id, consumer, now=now)
+
+    def get_task_by_id(self, task_id: int) -> dict[str, Any] | None:
+        return self._state.get_task_by_id(task_id)
 
     def list_outbox(
         self, *, status: str | None = None, limit: int = 100

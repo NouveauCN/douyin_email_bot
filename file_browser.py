@@ -1073,7 +1073,7 @@ def api_crop_preview():
     if not _try_acquire_media_slot():
         return _media_busy_response()
     try:
-        result = process_media(target, dry_run=True)
+        result = process_media(target, dry_run=True, lock_root=_DOWNLOAD_DIR)
         return _crop_result_payload(result)
     except MediaFileLockBusy:
         return {"success": False, "error": "媒体文件正在处理中，请稍后重试"}, 409
@@ -1093,7 +1093,9 @@ def api_crop_apply():
     if not _try_acquire_media_slot():
         return _media_busy_response()
     try:
-        result = process_media(target, force_review=force_review)
+        result = process_media(
+            target, force_review=force_review, lock_root=_DOWNLOAD_DIR
+        )
         payload = _crop_result_payload(result)
         if result.requires_review:
             payload["success"] = False
@@ -1208,6 +1210,19 @@ def _process_uploaded_file(file) -> tuple[dict, int]:
     else:
         tmp_path = None
 
+    file_lock = media_file_lock(dest, root=_DOWNLOAD_DIR, timeout=0.25)
+    try:
+        file_lock.acquire()
+    except MediaFileLockBusy:
+        return (
+            {
+                "success": False,
+                "original_filename": original_name,
+                "error": "目标媒体文件正在处理中，请稍后重试",
+            },
+            409,
+        )
+
     try:
         save_path = tmp_path if needs_convert else dest
         file.save(str(save_path))
@@ -1294,6 +1309,8 @@ def _process_uploaded_file(file) -> tuple[dict, int]:
             "original_filename": original_name,
             "error": str(e),
         }, 500
+    finally:
+        file_lock.release()
 
 
 @app.route("/api/upload", methods=["POST"])

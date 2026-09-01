@@ -323,19 +323,6 @@ class TaskSnapshot:
         )
 
 
-@dataclass(frozen=True, slots=True)
-class TaskDetails:
-    """Typed entry-point context retained with a task.
-
-    Details intentionally contain only validated, non-secret metadata.  The
-    task worker can pass this object to a projector without knowing whether
-    the task originated in mail, QQ, or another adapter.
-    """
-
-    source: SourceRef | None
-    metadata: Metadata = field(default_factory=dict)
-
-
 __all__ = [
     "DownloadResult",
     "ErrorCode",
@@ -344,7 +331,6 @@ __all__ = [
     "RetryClass",
     "SourceRef",
     "TaskRequest",
-    "TaskDetails",
     "TaskSnapshot",
     "TaskStatus",
     "validate_metadata",

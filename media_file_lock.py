@@ -1,9 +1,10 @@
-"""Small cross-process locks for individual files in the media tree.
+"""Small cooperative cross-process locks for the shared media tree.
 
-The lock is deliberately a sidecar in a hidden directory below the shared
-download root.  It protects short publish/modify/delete transactions while
-callers remain free to perform network or subprocess work without holding a
-global media-tree lock.
+Each operation takes one coarse tree lock plus its target lock.  The coarse
+lock is intentionally simple for this private, single-instance deployment: it
+makes directory deletion conflict with child-file work without introducing a
+hierarchical lock manager.  Sidecars live in a hidden directory below the
+shared download root.
 """
 
 from __future__ import annotations
@@ -37,6 +38,25 @@ class MediaFileLockBusy(TimeoutError):
 # process_media -> process_image.
 _LOCAL_STATE_LOCK = threading.RLock()
 _LOCAL_LOCKS: dict[Path, tuple[int, int, int, int]] = {}
+
+
+def _after_fork_in_child() -> None:
+    """Drop descriptors inherited from a parent that owns process-local locks."""
+    global _LOCAL_STATE_LOCK
+    # Only the forking thread survives in the child.  Avoid acquiring a
+    # user-created lock here because another vanished parent thread may have
+    # owned it at the instant of fork.
+    descriptors = {entry[2] for entry in _LOCAL_LOCKS.values()}
+    _LOCAL_LOCKS.clear()
+    _LOCAL_STATE_LOCK = threading.RLock()
+    for fd in descriptors:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+os.register_at_fork(after_in_child=_after_fork_in_child)
 
 
 def _root_and_relative(path: Path, root: Path | None) -> tuple[Path, str]:
@@ -157,11 +177,49 @@ class MediaFileLock(AbstractContextManager["MediaFileLock"]):
         self.release()
 
 
+class MediaOperationLock(AbstractContextManager["MediaOperationLock"]):
+    """Acquire the shared-tree lock and then the per-target lock."""
+
+    def __init__(self, path: Path, *, root: Path | None, timeout: float) -> None:
+        resolved_root, _relative = _root_and_relative(Path(path), root)
+        self._tree = MediaFileLock(
+            resolved_root / ".media-tree-transaction",
+            root=resolved_root,
+            timeout=timeout,
+        )
+        self._target = MediaFileLock(path, root=resolved_root, timeout=timeout)
+        self._acquired = False
+
+    def acquire(self) -> "MediaOperationLock":
+        self._tree.acquire()
+        try:
+            self._target.acquire()
+        except BaseException:
+            self._tree.release()
+            raise
+        self._acquired = True
+        return self
+
+    def release(self) -> None:
+        if not self._acquired:
+            return
+        try:
+            self._target.release()
+        finally:
+            self._tree.release()
+            self._acquired = False
+
+    def __enter__(self) -> "MediaOperationLock":
+        return self.acquire()
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.release()
+
 def media_file_lock(
     path: Path,
     *,
     root: Path | None = None,
     timeout: float = DEFAULT_LOCK_TIMEOUT,
-) -> MediaFileLock:
-    """Create a reentrant, cross-process lock for one media path."""
-    return MediaFileLock(path, root=root, timeout=timeout)
+) -> MediaOperationLock:
+    """Create a reentrant tree-and-target lock for one media operation."""
+    return MediaOperationLock(path, root=root, timeout=timeout)

@@ -71,10 +71,11 @@ def decide_outcome(
             status="partially_succeeded" if result.partial else "succeeded",
         )
     if result.retryable and attempts < max_attempts:
+        detail = result.error or "；".join(result.failed_items)
         return OutcomeDecision(
             action="retry",
             result=result,
-            error=result.error or ("partial download" if result.partial else "download failed"),
+            error=detail or ("partial download" if result.partial else "download failed"),
             retry_at=float(now) + max(0.0, float(retry_delay_seconds)),
         )
     if result.success:
