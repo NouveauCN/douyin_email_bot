@@ -214,6 +214,14 @@ def test_remote_desktop_requires_unlock_and_forwards_bounded_input(monkeypatch):
     )
     assert accepted.status_code == 200
     assert fake.events[-1]["kind"] == "click"
+    text = "  验证码  "
+    accepted_text = client.post(
+        "/api/desktop/input",
+        json={"kind": "text", "text": text},
+        headers=SAME_ORIGIN_HEADERS,
+    )
+    assert accepted_text.status_code == 200
+    assert fake.events[-1] == {"kind": "text", "text": text}
     rejected = client.post(
         "/api/desktop/input",
         json={"kind": "click", "x": 99999, "y": 30},
@@ -222,6 +230,25 @@ def test_remote_desktop_requires_unlock_and_forwards_bounded_input(monkeypatch):
     assert rejected.status_code == 400
     assert client.post("/api/desktop/lock", headers=SAME_ORIGIN_HEADERS).status_code == 200
     assert fake.locked
+
+
+def test_remote_text_input_preserves_bounded_text_and_panel_supports_submit():
+    value = "  验证码  "
+    assert web_login._validate_desktop_input({"kind": "text", "text": value}) == {
+        "kind": "text",
+        "text": value,
+    }
+    assert len(web_login._validate_desktop_input({"kind": "text", "text": "x" * 2048})["text"]) == 2048
+    with pytest.raises(web_login.RemoteBrowserError):
+        web_login._validate_desktop_input({"kind": "text", "text": "x" * 2049})
+
+    panel = web_login.WEB_LOGIN_PANEL_HTML
+    assert 'id="webLoginTextForm"' in panel
+    assert 'id="webLoginTextInput"' in panel
+    assert 'maxlength="2048"' in panel
+    assert "kind: 'text'" in panel
+    assert "focus({preventScroll: true})" in panel
+    assert "setInterval(frame, 2500)" in panel
 
 
 def test_remote_save_redacts_cookie_and_requires_auth(monkeypatch):

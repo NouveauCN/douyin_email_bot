@@ -805,6 +805,11 @@ def register_web_login(target_app: Flask, url_prefix: str = "") -> None:
 # ── Embedded panel (used by file_browser's Login tab) ─────────────────
 
 WEB_LOGIN_PANEL_HTML = r"""
+<style>
+  .web-login-text-form { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:10px 0 14px; }
+  .web-login-text-form label { color:#666; font-size:13px; white-space:nowrap; }
+  .web-login-text-form input { flex:1 1 240px; min-width:180px; border:1px solid #ddd; border-radius:6px; padding:9px; font:inherit; }
+</style>
 <div id="webLoginPanelBody" class="web-login-panel">
   <div id="webLoginUnlock">
     <p class="web-login-hint">请输入 Web Login 密码以开始抖音扫码登录。</p>
@@ -819,6 +824,12 @@ WEB_LOGIN_PANEL_HTML = r"""
       <span id="webLoginDesktopPlaceholder">正在启动远程桌面...</span>
       <img id="webLoginDesktopFrame" alt="抖音 Firefox 远程桌面" draggable="false" style="display:none">
     </div>
+    <form id="webLoginTextForm" class="web-login-text-form">
+      <label for="webLoginTextInput">验证码/文字输入</label>
+      <input id="webLoginTextInput" type="text" maxlength="2048" autocomplete="off"
+             placeholder="在此输入验证码或文字">
+      <button class="btn" id="webLoginTextButton" type="submit">发送到 Firefox</button>
+    </form>
     <div id="webLoginStatus" class="web-login-status">尚未验证</div>
     <button class="btn" id="webLoginSave" type="button">💾 保存登录状态</button>
     <button class="btn" id="webLoginReload" type="button">🔄 刷新页面</button>
@@ -828,7 +839,7 @@ WEB_LOGIN_PANEL_HTML = r"""
 </div>
 <script>
 (function() {
-  var timer = null, inFlight = false, started = false;
+  var timer = null, frameInFlight = false, started = false;
   var api = '/api/web-login';
   var status = document.getElementById('webLoginStatus');
   var unlockStatus = document.getElementById('webLoginUnlockStatus');
@@ -843,6 +854,8 @@ WEB_LOGIN_PANEL_HTML = r"""
     return {message: '服务器返回了非 JSON 响应（HTTP ' + response.status + '）'};
   }
   async function frame() {
+    if (!started || frameInFlight) return;
+    frameInFlight = true;
     var image = document.getElementById('webLoginDesktopFrame');
     var placeholder = document.getElementById('webLoginDesktopPlaceholder');
     try {
@@ -851,6 +864,7 @@ WEB_LOGIN_PANEL_HTML = r"""
       image.src = data.frame; image.style.display = 'block'; placeholder.style.display = 'none';
       setStatus('🖱️ 可直接操作服务器 Firefox 页面', 'wait');
     } catch (error) { placeholder.style.display = 'flex'; placeholder.textContent = '❌ ' + error.message; setStatus(error.message, 'err'); }
+    finally { frameInFlight = false; }
   }
   async function start() {
     stop();
@@ -860,17 +874,18 @@ WEB_LOGIN_PANEL_HTML = r"""
       var response = await fetch(api + '/desktop/start', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'}); var data = await responseData(response);
       if (!response.ok || !data.success) throw new Error(data.message || '启动远程桌面失败');
       started = true; document.getElementById('webLoginDesktopFrame').src = data.frame; document.getElementById('webLoginDesktopFrame').style.display = 'block'; placeholder.style.display = 'none';
-      setStatus('🖱️ 可直接操作服务器 Firefox 页面', 'wait'); timer = setInterval(frame, 1500);
+      setStatus('🖱️ 可直接操作服务器 Firefox 页面', 'wait'); timer = setInterval(frame, 2500);
     } catch (error) { setStatus(error.message, 'err'); placeholder.textContent = '❌ 启动失败，请重试'; }
   }
   // Compatibility name retained for older embedded-page automation.
   function loadQr() { return start(); }
   async function sendInput(event) {
-    if (!started) return;
+    if (!started) return false;
     try {
       var response = await fetch(api + '/desktop/input', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(event)}); var data = await responseData(response);
-      if (!response.ok || !data.success) setStatus(data.message || '输入发送失败', 'err'); else frame();
-    } catch (error) { setStatus('输入发送失败', 'err'); }
+      if (!response.ok || !data.success) { setStatus(data.message || '输入发送失败', 'err'); return false; }
+      return true;
+    } catch (error) { setStatus('输入发送失败', 'err'); return false; }
   }
   function point(event) {
     var image = document.getElementById('webLoginDesktopFrame'), rect = image.getBoundingClientRect();
@@ -884,9 +899,10 @@ WEB_LOGIN_PANEL_HTML = r"""
       document.getElementById('webLoginUnlock').style.display = 'none'; document.getElementById('webLoginControls').style.display = 'block'; loadQr();
     } catch (error) { unlockStatus.textContent = error.message; unlockStatus.className = 'web-login-status err'; button.disabled = false; }
   };
-  document.getElementById('webLoginDesktopFrame').onclick = function(event) { var p = point(event); sendInput({kind: 'click', x: p.x, y: p.y, button: 'left', click_count: 1}); };
+  document.getElementById('webLoginDesktopFrame').onclick = function(event) { document.getElementById('webLoginDesktopBox').focus({preventScroll: true}); var p = point(event); sendInput({kind: 'click', x: p.x, y: p.y, button: 'left', click_count: 1}); };
   document.getElementById('webLoginDesktopFrame').onwheel = function(event) { event.preventDefault(); sendInput({kind: 'wheel', delta_x: Math.max(-2000, Math.min(2000, event.deltaX)), delta_y: Math.max(-2000, Math.min(2000, event.deltaY))}); };
   document.getElementById('webLoginDesktopBox').onkeydown = function(event) { if (event.key && event.key.length <= 64) { event.preventDefault(); sendInput({kind: 'key', key: event.key}); } };
+  document.getElementById('webLoginTextForm').onsubmit = async function(event) { event.preventDefault(); var input = document.getElementById('webLoginTextInput'); var value = input.value; if (!value || value.length > 2048) { setStatus('请输入不超过 2048 个字符的验证码或文字', 'err'); return; } var button = document.getElementById('webLoginTextButton'); button.disabled = true; if (await sendInput({kind: 'text', text: value})) input.value = ''; button.disabled = false; };
   document.getElementById('webLoginSave').onclick = async function() { var response = await fetch(api + '/desktop/save', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'}); var data = await responseData(response); setStatus(data.message || (data.success ? '登录状态已保存' : '保存失败'), data.success ? 'ok' : 'err'); };
   document.getElementById('webLoginReload').onclick = async function() { var response = await fetch(api + '/desktop/reload', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'}); var data = await responseData(response); if (response.ok && data.frame) { document.getElementById('webLoginDesktopFrame').src = data.frame; setStatus('页面已刷新', 'wait'); } else setStatus(data.message || '刷新失败', 'err'); };
   document.getElementById('webLoginLogout').onclick = async function() { stop(); started = false; await fetch(api + '/desktop/lock', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'}); document.getElementById('webLoginControls').style.display = 'none'; document.getElementById('webLoginUnlock').style.display = 'block'; document.getElementById('webLoginUnlockButton').disabled = false; };
