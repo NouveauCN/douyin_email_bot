@@ -73,10 +73,16 @@ QQ C2C -> qq_gateway -> authenticated qq_bridge -> DownloadTaskService
   guest Wi-Fi, IoT networks, or Funnel as trusted.
 - Web Login is embedded in `file_browser.py` as a password-gated subtab. Its
   `WEB_LOGIN_PASSWORD` is an explicit deployment secret; when absent, unlock,
-  QR, and status APIs are disabled. All login endpoints enforce exact
-  Origin/Referer checks, password attempts/QR/status are rate limited, sessions
-  are short-lived HttpOnly SameSite cookies, and no standalone Docker Web Login
-  port or bypass service is exposed.
+  QR, status, and remote-desktop APIs are disabled. After unlock it starts one
+  15-minute, server-owned Firefox viewport mirror that relays bounded mouse,
+  wheel, keyboard, refresh, and resize events; users operate the rendered
+  page directly rather than relying on a Douyin selector. The Playwright
+  context owns the shared profile until explicit lock or expiry, then closes;
+  Cookie saving reads that context and never returns cookie content. All login
+  endpoints enforce exact Origin/Referer checks, password/QR/status/desktop
+  requests are rate limited, sessions are short-lived HttpOnly SameSite
+  cookies, and no standalone Docker Web Login port or bypass service is
+  exposed.
 - The file browser reads `/app/comics/pics` as a separate read-only comics
   gallery source. Its `/comics/raw/...` and `/comics/image/...` routes must
   validate resolved paths within that source and must never pass comics paths

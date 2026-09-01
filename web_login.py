@@ -109,7 +109,7 @@ class RemoteBrowserSession:
             self._commands = queue.Queue()
             self._thread = threading.Thread(
                 target=self._browser_worker,
-                args=(owner, ready, result),
+                args=(owner, ready, result, time.monotonic() + _SESSION_SECONDS),
                 name="web-login-firefox",
                 daemon=True,
             )
@@ -121,7 +121,13 @@ class RemoteBrowserSession:
                 raise RemoteBrowserError("浏览器启动失败，请稍后重试")
             return True, "远程桌面已连接"
 
-    def _browser_worker(self, owner: str, ready: threading.Event, result: dict):
+    def _browser_worker(
+        self,
+        owner: str,
+        ready: threading.Event,
+        result: dict,
+        deadline: float,
+    ):
         """Own the sync Playwright objects on one stable thread."""
         context = playwright = None
         try:
@@ -147,7 +153,13 @@ class RemoteBrowserSession:
             ready.set()
             commands = self._commands
             while True:
-                command = commands.get()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    command = commands.get(timeout=remaining)
+                except queue.Empty:
+                    break
                 if command is None:
                     break
                 callback, event, holder = command
@@ -281,7 +293,11 @@ class RemoteBrowserSession:
             all_cookies = self._call(read_cookies)
             selected = [
                 c for c in all_cookies
-                if str(c.get("domain", "")).lstrip(".").lower().endswith("douyin.com")
+                if (
+                    (domain := str(c.get("domain", "")).lstrip(".").lower())
+                    == "douyin.com"
+                    or domain.endswith(".douyin.com")
+                )
             ]
             cookie_str = "; ".join(
                 f"{c.get('name', '')}={c.get('value', '')}" for c in selected
