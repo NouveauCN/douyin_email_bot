@@ -371,13 +371,21 @@ WEB_LOGIN_PANEL_HTML = r"""
   var unlockStatus = document.getElementById('webLoginUnlockStatus');
   function stop() { if (timer) { clearInterval(timer); timer = null; } }
   function setStatus(text, cls) { status.textContent = text; status.className = 'web-login-status ' + (cls || ''); }
+  async function responseData(response) {
+    var contentType = response.headers.get('content-type') || '';
+    if (contentType.indexOf('application/json') >= 0) return response.json();
+    // Flask's generic 403/404 pages are HTML.  Keep that implementation
+    // detail out of the UI and point the operator at the useful remediation.
+    if (response.status === 403) return {message: '请求被来源保护拒绝：请确认 FILE_BROWSER_ALLOWED_ORIGINS 包含当前访问地址。'};
+    return {message: '服务器返回了非 JSON 响应（HTTP ' + response.status + '）'};
+  }
   async function loadQr() {
     stop();
     var image = document.getElementById('webLoginQrImage');
     var placeholder = document.getElementById('webLoginQrPlaceholder');
     placeholder.textContent = '⏳ 生成二维码...'; image.style.display = 'none';
     try {
-      var response = await fetch(api + '/qr', {cache: 'no-store'}); var data = await response.json();
+      var response = await fetch(api + '/qr', {cache: 'no-store'}); var data = await responseData(response);
       if (!response.ok || !data.success) throw new Error(data.message || '生成二维码失败');
       image.src = data.qr_image; image.style.display = 'block'; placeholder.textContent = '';
       setStatus('请使用抖音 App 扫描二维码', 'wait'); timer = setInterval(poll, 10000);
@@ -386,7 +394,7 @@ WEB_LOGIN_PANEL_HTML = r"""
   async function poll() {
     if (inFlight) return; inFlight = true;
     try {
-      var response = await fetch(api + '/status', {cache: 'no-store'}); var data = await response.json();
+      var response = await fetch(api + '/status', {cache: 'no-store'}); var data = await responseData(response);
       if (!response.ok) { stop(); setStatus(data.message || '会话已锁定', 'err'); return; }
       if (data.status === 'logged_in') { stop(); setStatus('✅ 登录成功！Cookie 已保存 (' + data.auth_count + ' 个认证 token)', 'ok'); }
       else if (data.status === 'expired') { setStatus('二维码已过期，正在刷新...', 'wait'); setTimeout(loadQr, 1000); }
@@ -399,7 +407,7 @@ WEB_LOGIN_PANEL_HTML = r"""
     event.preventDefault(); var button = document.getElementById('webLoginUnlockButton'); button.disabled = true;
     try {
       var response = await fetch(api + '/unlock', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({password: document.getElementById('webLoginPassword').value})});
-      var data = await response.json(); if (!response.ok) throw new Error(data.message || '验证失败');
+      var data = await responseData(response); if (!response.ok) throw new Error(data.message || '验证失败');
       document.getElementById('webLoginUnlock').style.display = 'none'; document.getElementById('webLoginControls').style.display = 'block'; loadQr();
     } catch (error) { unlockStatus.textContent = error.message; unlockStatus.className = 'web-login-status err'; button.disabled = false; }
   };
