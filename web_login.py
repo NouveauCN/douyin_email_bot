@@ -9,12 +9,14 @@ Usage:
 """
 
 import argparse
+import base64
 from collections import deque
 import hashlib
 import hmac
 import logging
 import math
 import os
+import queue
 import secrets
 import threading
 import time
@@ -50,16 +52,262 @@ app = Flask(__name__)
 log = logging.getLogger("web_login")
 _browser_lock = threading.Lock()
 _STATUS_RESPONSE_FIELDS = ("status", "auth_count", "message")
-_RATE_LIMIT_DEFAULTS = {"unlock": 5, "qr": 5, "status": 120}
+_RATE_LIMIT_DEFAULTS = {"unlock": 5, "qr": 5, "status": 120, "desktop": 240}
 _RATE_LIMIT_ENV_VARS = {
     "unlock": "WEB_LOGIN_PASSWORD_RATE_LIMIT",
     "qr": "WEB_LOGIN_QR_RATE_LIMIT",
     "status": "WEB_LOGIN_STATUS_RATE_LIMIT",
+    "desktop": "WEB_LOGIN_DESKTOP_RATE_LIMIT",
 }
 _DEFAULT_RATE_WINDOW_SECONDS = 60
 _SESSION_SECONDS = 15 * 60
 _rate_limit_lock = threading.Lock()
 _rate_limit_buckets: dict[tuple[str, str], deque[float]] = {}
+_DESKTOP_WIDTH = 1280
+_DESKTOP_HEIGHT = 720
+_MAX_DESKTOP_JSON_BYTES = 16 * 1024
+
+
+class RemoteBrowserError(RuntimeError):
+    """A safe, user-facing browser-controller error."""
+
+
+class RemoteBrowserSession:
+    """One server-owned, password-gated Playwright Firefox session.
+
+    The context is deliberately kept alive between requests.  Every browser
+    operation is serialized with ``_browser_lock`` because Firefox profiles
+    must never be opened concurrently by the QR/status fallback or by another
+    remote session.
+    """
+
+    def __init__(self):
+        self._context = None
+        self._playwright = None
+        self._owner: str | None = None
+        self._thread = None
+        self._commands = None
+        self._width = _DESKTOP_WIDTH
+        self._height = _DESKTOP_HEIGHT
+
+    def active_for(self, owner: str | None) -> bool:
+        return bool(self._context is not None and owner and self._owner == owner)
+
+    def active(self) -> bool:
+        return self._context is not None
+
+    def start(self, owner: str) -> tuple[bool, str]:
+        if not owner:
+            raise RemoteBrowserError("远程桌面会话无效")
+        with _browser_lock:
+            if self._context is not None:
+                if self._owner != owner:
+                    return False, "已有远程桌面会话正在使用，请先锁定原会话"
+                return True, "远程桌面已连接"
+            ready = threading.Event()
+            result: dict = {}
+            self._commands = queue.Queue()
+            self._thread = threading.Thread(
+                target=self._browser_worker,
+                args=(owner, ready, result, time.monotonic() + _SESSION_SECONDS),
+                name="web-login-firefox",
+                daemon=True,
+            )
+            self._thread.start()
+            ready.wait(35)
+            if not result.get("ok"):
+                self._thread = None
+                self._commands = None
+                raise RemoteBrowserError("浏览器启动失败，请稍后重试")
+            return True, "远程桌面已连接"
+
+    def _browser_worker(
+        self,
+        owner: str,
+        ready: threading.Event,
+        result: dict,
+        deadline: float,
+    ):
+        """Own the sync Playwright objects on one stable thread."""
+        context = playwright = None
+        try:
+            from playwright.sync_api import sync_playwright
+
+            profile_dir = _get_profile_dir()
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            playwright = sync_playwright().start()
+            context = playwright.firefox.launch_persistent_context(
+                user_data_dir=str(profile_dir),
+                headless=True,
+                viewport={"width": self._width, "height": self._height},
+            )
+            page = context.pages[0] if context.pages else context.new_page()
+            try:
+                page.goto(DOUYIN_HOMEPAGE, wait_until="domcontentloaded", timeout=30000)
+            except Exception:
+                pass
+            self._playwright = playwright
+            self._context = context
+            self._owner = owner
+            result["ok"] = True
+            ready.set()
+            commands = self._commands
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    command = commands.get(timeout=remaining)
+                except queue.Empty:
+                    break
+                if command is None:
+                    break
+                callback, event, holder = command
+                try:
+                    holder["value"] = callback()
+                except Exception as exc:
+                    holder["error"] = exc
+                finally:
+                    event.set()
+        except Exception:
+            result["ok"] = False
+            ready.set()
+        finally:
+            try:
+                if context is not None:
+                    context.close()
+            except Exception:
+                pass
+            try:
+                if playwright is not None:
+                    playwright.stop()
+            except Exception:
+                pass
+            self._context = None
+            self._playwright = None
+            self._owner = None
+
+    def _call(self, callback):
+        if self._thread is threading.current_thread():
+            return callback()
+        if self._commands is None or self._thread is None:
+            raise RemoteBrowserError("远程桌面未启动或已被锁定")
+        event, holder = threading.Event(), {}
+        self._commands.put((callback, event, holder))
+        if not event.wait(35):
+            raise RemoteBrowserError("浏览器响应超时，请重试")
+        if "error" in holder:
+            raise holder["error"]
+        return holder.get("value")
+
+    def stop(self, owner: str | None = None) -> bool:
+        with _browser_lock:
+            if self._context is None:
+                return False
+            if owner is not None and owner != self._owner:
+                return False
+            thread, commands = self._thread, self._commands
+            self._context = None
+            self._playwright = None
+            self._owner = None
+            self._thread = None
+            self._commands = None
+            if commands is not None:
+                commands.put(None)
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(35)
+            return True
+
+    def _page_locked(self, owner: str):
+        if self._context is None or self._owner != owner:
+            raise RemoteBrowserError("远程桌面未启动或已被锁定")
+        pages = self._context.pages
+        if not pages:
+            return self._context.new_page()
+        return pages[0]
+
+    def frame(self, owner: str) -> tuple[str, int, int]:
+        with _browser_lock:
+            def capture():
+                page = self._page_locked(owner)
+                try:
+                    return page.screenshot(type="jpeg", quality=65, full_page=False)
+                except Exception:
+                    raise RemoteBrowserError("截图失败，请刷新远程桌面")
+            screenshot = self._call(capture)
+            encoded = base64.b64encode(screenshot).decode("ascii")
+            return f"data:image/jpeg;base64,{encoded}", self._width, self._height
+
+    def input(self, owner: str, event: dict) -> None:
+        with _browser_lock:
+            def send():
+                page = self._page_locked(owner)
+                kind = event.get("kind")
+                try:
+                    if kind == "click":
+                        page.mouse.click(event["x"], event["y"], button=event["button"], click_count=event["click_count"])
+                    elif kind == "wheel":
+                        page.mouse.wheel(event["delta_x"], event["delta_y"])
+                    elif kind == "key":
+                        page.keyboard.press(event["key"])
+                    elif kind == "text":
+                        page.keyboard.insert_text(event["text"])
+                    else:
+                        raise RemoteBrowserError("不支持的输入类型")
+                except RemoteBrowserError:
+                    raise
+                except Exception:
+                    raise RemoteBrowserError("输入发送失败，请重试")
+            self._call(send)
+
+    def resize(self, owner: str, width: int, height: int) -> None:
+        with _browser_lock:
+            def resize_page():
+                page = self._page_locked(owner)
+                try:
+                    page.set_viewport_size({"width": width, "height": height})
+                except Exception:
+                    raise RemoteBrowserError("调整远程桌面大小失败")
+            self._call(resize_page)
+            self._width, self._height = width, height
+
+    def reload(self, owner: str) -> None:
+        with _browser_lock:
+            def reload_page():
+                page = self._page_locked(owner)
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=30000)
+                except Exception:
+                    pass
+            self._call(reload_page)
+
+    def cookies(self, owner: str) -> tuple[str | None, int]:
+        with _browser_lock:
+            def read_cookies():
+                if self._context is None or self._owner != owner:
+                    raise RemoteBrowserError("远程桌面未启动或已被锁定")
+                try:
+                    return self._context.cookies()
+                except Exception:
+                    raise RemoteBrowserError("读取登录状态失败，请重试")
+            all_cookies = self._call(read_cookies)
+            selected = [
+                c for c in all_cookies
+                if (
+                    (domain := str(c.get("domain", "")).lstrip(".").lower())
+                    == "douyin.com"
+                    or domain.endswith(".douyin.com")
+                )
+            ]
+            cookie_str = "; ".join(
+                f"{c.get('name', '')}={c.get('value', '')}" for c in selected
+                if c.get("name")
+            ) or None
+            auth_count = sum(1 for c in selected if c.get("name") in _AUTH_COOKIE_NAMES)
+            return cookie_str, auth_count
+
+
+_remote_browser = RemoteBrowserSession()
 
 
 def _password() -> str:
@@ -186,9 +434,13 @@ def _rate_limit_response(kind: str):
 
 
 def _login_api_kind(path: str) -> str | None:
-    for kind in ("unlock", "qr", "status", "logout"):
+    for kind in (
+        "unlock", "qr", "status", "logout", "desktop/start", "desktop/frame",
+        "desktop/input", "desktop/resize", "desktop/reload", "desktop/save",
+        "desktop/lock",
+    ):
         if path == f"/api/{kind}" or path.endswith(f"/api/web-login/{kind}"):
-            return kind
+            return "desktop" if kind.startswith("desktop/") else kind
     return None
 
 
@@ -204,6 +456,20 @@ def _service_unavailable():
     return response, 503
 
 
+def _session_is_unlocked() -> bool:
+    """Validate the short-lived session and tear down expired browser state."""
+    if not session.get("web_login_unlocked"):
+        return False
+    unlocked_at = session.get("web_login_unlocked_at")
+    if not isinstance(unlocked_at, (int, float)) or time.time() - unlocked_at > _SESSION_SECONDS:
+        owner = session.get("web_login_owner")
+        if isinstance(owner, str):
+            _remote_browser.stop(owner)
+        session.clear()
+        return False
+    return True
+
+
 def _protect_login_request():
     kind = _login_api_kind(request.path)
     if kind is None:
@@ -212,13 +478,13 @@ def _protect_login_request():
         response = jsonify({"success": False, "message": "请求来源不被允许"})
         response.headers["Cache-Control"] = "no-store"
         return response, 403
-    if kind in {"unlock", "qr", "status"} and not _password():
+    if kind in {"unlock", "qr", "status", "desktop"} and not _password():
         return _service_unavailable()
     if kind in _RATE_LIMIT_ENV_VARS:
         limited = _rate_limit_response(kind)
         if limited:
             return limited
-    if kind in {"qr", "status"} and not session.get("web_login_unlocked"):
+    if kind in {"qr", "status", "desktop"} and not _session_is_unlocked():
         return _unauthorized()
     return None
 
@@ -244,6 +510,8 @@ def api_unlock():
     session.clear()
     session.permanent = True
     session["web_login_unlocked"] = True
+    session["web_login_unlocked_at"] = time.time()
+    session["web_login_owner"] = secrets.token_urlsafe(24)
     response = jsonify({"success": True, "message": "验证成功"})
     response.headers["Cache-Control"] = "no-store"
     return response
@@ -252,10 +520,171 @@ def api_unlock():
 @app.route("/api/logout", methods=["POST"])
 def api_logout():
     """Relock the QR controls and invalidate the current session."""
+    owner = session.get("web_login_owner")
+    _remote_browser.stop(owner if isinstance(owner, str) else None)
     session.clear()
     response = jsonify({"success": True})
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+def _desktop_owner() -> str:
+    owner = session.get("web_login_owner")
+    if not isinstance(owner, str) or not owner:
+        raise RemoteBrowserError("远程桌面会话无效")
+    return owner
+
+
+def _desktop_response(payload: dict, status: int = 200):
+    response = jsonify(payload)
+    response.headers["Cache-Control"] = "no-store"
+    return response, status
+
+
+def _desktop_failure(exc: RemoteBrowserError, status: int = 409):
+    return _desktop_response({"success": False, "message": str(exc)}, status)
+
+
+def _desktop_payload() -> dict:
+    if request.content_length is not None and request.content_length > _MAX_DESKTOP_JSON_BYTES:
+        raise RemoteBrowserError("请求过大")
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        raise RemoteBrowserError("请求格式无效")
+    return payload
+
+
+def _number(value, *, minimum: float, maximum: float, integer: bool = False):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RemoteBrowserError("输入参数无效")
+    if not math.isfinite(value) or value < minimum or value > maximum:
+        raise RemoteBrowserError("输入参数超出范围")
+    if integer and int(value) != value:
+        raise RemoteBrowserError("输入参数无效")
+    return int(value) if integer else float(value)
+
+
+def _validate_desktop_input(payload: dict) -> dict:
+    kind = payload.get("kind")
+    if kind == "click":
+        button = payload.get("button", "left")
+        if button not in {"left", "middle", "right"}:
+            raise RemoteBrowserError("鼠标按键无效")
+        clicks = _number(payload.get("click_count", 1), minimum=1, maximum=3, integer=True)
+        return {
+            "kind": kind,
+            "x": _number(payload.get("x"), minimum=0, maximum=_DESKTOP_WIDTH),
+            "y": _number(payload.get("y"), minimum=0, maximum=_DESKTOP_HEIGHT),
+            "button": button,
+            "click_count": clicks,
+        }
+    if kind == "wheel":
+        return {
+            "kind": kind,
+            "delta_x": _number(payload.get("delta_x", 0), minimum=-2000, maximum=2000),
+            "delta_y": _number(payload.get("delta_y", 0), minimum=-2000, maximum=2000),
+        }
+    if kind == "key":
+        key = payload.get("key")
+        if not isinstance(key, str) or not key or len(key) > 64:
+            raise RemoteBrowserError("键盘输入无效")
+        return {"kind": kind, "key": key}
+    if kind == "text":
+        value = payload.get("text")
+        if not isinstance(value, str) or not value or len(value) > 2048:
+            raise RemoteBrowserError("文本输入无效")
+        return {"kind": kind, "text": value}
+    raise RemoteBrowserError("不支持的输入类型")
+
+
+@app.route("/api/desktop/start", methods=["POST"])
+def api_desktop_start():
+    try:
+        owner = _desktop_owner()
+        available, message = _remote_browser.start(owner)
+        if not available:
+            return _desktop_response({"success": False, "message": message}, 409)
+        frame, width, height = _remote_browser.frame(owner)
+        return _desktop_response({
+            "success": True, "frame": frame, "width": width, "height": height,
+            "message": message,
+        })
+    except RemoteBrowserError as exc:
+        return _desktop_failure(exc, 503)
+
+
+@app.route("/api/desktop/frame")
+def api_desktop_frame():
+    try:
+        owner = _desktop_owner()
+        frame, width, height = _remote_browser.frame(owner)
+        return _desktop_response({"success": True, "frame": frame, "width": width, "height": height})
+    except RemoteBrowserError as exc:
+        return _desktop_failure(exc)
+
+
+@app.route("/api/desktop/input", methods=["POST"])
+def api_desktop_input():
+    try:
+        owner = _desktop_owner()
+        event = _validate_desktop_input(_desktop_payload())
+        _remote_browser.input(owner, event)
+        return _desktop_response({"success": True})
+    except RemoteBrowserError as exc:
+        return _desktop_failure(exc, 400)
+
+
+@app.route("/api/desktop/resize", methods=["POST"])
+def api_desktop_resize():
+    try:
+        owner = _desktop_owner()
+        payload = _desktop_payload()
+        width = _number(payload.get("width"), minimum=320, maximum=1920, integer=True)
+        height = _number(payload.get("height"), minimum=200, maximum=1200, integer=True)
+        _remote_browser.resize(owner, width, height)
+        return _desktop_response({"success": True, "width": width, "height": height})
+    except RemoteBrowserError as exc:
+        return _desktop_failure(exc, 400)
+
+
+@app.route("/api/desktop/reload", methods=["POST"])
+def api_desktop_reload():
+    try:
+        owner = _desktop_owner()
+        _remote_browser.reload(owner)
+        frame, width, height = _remote_browser.frame(owner)
+        return _desktop_response({"success": True, "frame": frame, "width": width, "height": height})
+    except RemoteBrowserError as exc:
+        return _desktop_failure(exc)
+
+
+@app.route("/api/desktop/save", methods=["POST"])
+def api_desktop_save():
+    try:
+        owner = _desktop_owner()
+        cookie_str, auth_count = _remote_browser.cookies(owner)
+        if not cookie_str:
+            return _desktop_response({"success": False, "status": "pending", "auth_count": 0, "message": "尚未检测到抖音登录状态"}, 409)
+        grade, is_authenticated = _assess_quality(cookie_str)
+        if not is_authenticated:
+            return _desktop_response({"success": False, "status": "pending", "auth_count": auth_count, "message": f"尚未检测到完整登录状态（{grade}）"}, 409)
+        try:
+            _settings.apply([{"key": "douyin.cookie", "action": "set", "value": cookie_str}])
+        except Exception:
+            log.error("Remote login cookie could not be saved")
+            return _desktop_response({"success": False, "message": "Cookie 保存失败，请稍后重试"}, 500)
+        log.info("Remote login cookie saved (%d auth tokens)", auth_count)
+        return _desktop_response({"success": True, "status": "logged_in", "auth_count": auth_count, "message": f"登录状态已保存（{grade}）"})
+    except RemoteBrowserError as exc:
+        return _desktop_failure(exc)
+
+
+@app.route("/api/desktop/lock", methods=["POST"])
+def api_desktop_lock():
+    owner = session.get("web_login_owner")
+    _remote_browser.stop(owner if isinstance(owner, str) else None)
+    session.clear()
+    return _desktop_response({"success": True, "message": "远程桌面已结束并锁定"})
 
 @app.route("/")
 def index():
@@ -266,6 +695,13 @@ def index():
 @app.route("/api/qr")
 def api_qr():
     """Generate a fresh QR code screenshot."""
+    owner = session.get("web_login_owner")
+    if isinstance(owner, str) and _remote_browser.active_for(owner):
+        try:
+            frame, width, height = _remote_browser.frame(owner)
+            return _desktop_response({"success": True, "qr_image": frame, "frame": frame, "width": width, "height": height, "message": "完整登录页面已截取"})
+        except RemoteBrowserError as exc:
+            return _desktop_failure(exc)
     profile_dir = _get_profile_dir()
     with _browser_lock:
         b64, msg = screenshot_qr_code(profile_dir)
@@ -283,6 +719,22 @@ def api_qr():
 @app.route("/api/status")
 def api_status():
     """Check whether the user has scanned the QR and logged in."""
+    owner = session.get("web_login_owner")
+    if isinstance(owner, str) and _remote_browser.active_for(owner):
+        try:
+            cookie_str, auth_count = _remote_browser.cookies(owner)
+        except RemoteBrowserError as exc:
+            return _desktop_failure(exc)
+        if cookie_str:
+            grade, is_authenticated = _assess_quality(cookie_str)
+            if is_authenticated:
+                try:
+                    _settings.apply([{"key": "douyin.cookie", "action": "set", "value": cookie_str}])
+                except Exception:
+                    log.error("Login cookie detected but could not be saved to runtime settings")
+                    return _desktop_response({"status": "failure", "auth_count": auth_count, "message": "Cookie 保存失败，请稍后重试"}, 500)
+                return _desktop_response({"status": "logged_in", "auth_count": auth_count, "message": f"登录状态已检测并保存（{grade}）"})
+        return _desktop_response({"status": "pending", "auth_count": auth_count, "message": "等待扫码或登录"})
     profile_dir = _get_profile_dir()
     with _browser_lock:
         result = check_auth_cookies(profile_dir)
@@ -334,6 +786,13 @@ def register_web_login(target_app: Flask, url_prefix: str = "") -> None:
         ("/qr", api_qr, ["GET"]),
         ("/status", api_status, ["GET"]),
         ("/logout", api_logout, ["POST"]),
+        ("/desktop/start", api_desktop_start, ["POST"]),
+        ("/desktop/frame", api_desktop_frame, ["GET"]),
+        ("/desktop/input", api_desktop_input, ["POST"]),
+        ("/desktop/resize", api_desktop_resize, ["POST"]),
+        ("/desktop/reload", api_desktop_reload, ["POST"]),
+        ("/desktop/save", api_desktop_save, ["POST"]),
+        ("/desktop/lock", api_desktop_lock, ["POST"]),
     ):
         target_app.add_url_rule(
             f"{prefix}{suffix}",
@@ -356,16 +815,20 @@ WEB_LOGIN_PANEL_HTML = r"""
     <div id="webLoginUnlockStatus" class="web-login-status">请输入密码后开始</div>
   </div>
   <div id="webLoginControls" style="display:none">
-    <div id="webLoginQrBox" class="web-login-qr-box"><span id="webLoginQrPlaceholder">输入密码后生成二维码</span><img id="webLoginQrImage" alt="抖音完整登录页面" style="display:none"></div>
+    <div id="webLoginDesktopBox" class="web-login-qr-box" tabindex="0">
+      <span id="webLoginDesktopPlaceholder">正在启动远程桌面...</span>
+      <img id="webLoginDesktopFrame" alt="抖音 Firefox 远程桌面" draggable="false" style="display:none">
+    </div>
     <div id="webLoginStatus" class="web-login-status">尚未验证</div>
-    <button class="btn" id="webLoginRefresh" type="button">🔄 刷新二维码</button>
-    <button class="setting-action" id="webLoginLogout" type="button">🔒 锁定</button>
-    <p class="web-login-hint">使用抖音 App 扫描二维码，Cookie 将自动保存到运行时设置。</p>
+    <button class="btn" id="webLoginSave" type="button">💾 保存登录状态</button>
+    <button class="btn" id="webLoginReload" type="button">🔄 刷新页面</button>
+    <button class="setting-action" id="webLoginLogout" type="button">🔒 结束远程桌面/锁定</button>
+    <p class="web-login-hint">这是服务器上的 Firefox 远程桌面镜像。请直接点击抖音页面中的登录并完成扫码；不会依赖固定中文按钮。</p>
   </div>
 </div>
 <script>
 (function() {
-  var timer = null, inFlight = false;
+  var timer = null, inFlight = false, started = false;
   var api = '/api/web-login';
   var status = document.getElementById('webLoginStatus');
   var unlockStatus = document.getElementById('webLoginUnlockStatus');
@@ -379,29 +842,39 @@ WEB_LOGIN_PANEL_HTML = r"""
     if (response.status === 403) return {message: '请求被来源保护拒绝：请确认 FILE_BROWSER_ALLOWED_ORIGINS 包含当前访问地址。'};
     return {message: '服务器返回了非 JSON 响应（HTTP ' + response.status + '）'};
   }
-  async function loadQr() {
-    stop();
-    var image = document.getElementById('webLoginQrImage');
-    var placeholder = document.getElementById('webLoginQrPlaceholder');
-    placeholder.textContent = '⏳ 生成二维码...'; image.style.display = 'none';
+  async function frame() {
+    var image = document.getElementById('webLoginDesktopFrame');
+    var placeholder = document.getElementById('webLoginDesktopPlaceholder');
     try {
-      var response = await fetch(api + '/qr', {cache: 'no-store'}); var data = await responseData(response);
-      if (!response.ok || !data.success) throw new Error(data.message || '生成二维码失败');
-      image.src = data.qr_image; image.style.display = 'block'; placeholder.textContent = '';
-      setStatus('请使用抖音 App 扫描二维码', 'wait'); timer = setInterval(poll, 10000);
-    } catch (error) { placeholder.textContent = '❌ 生成失败'; setStatus(error.message, 'err'); }
+      var response = await fetch(api + '/desktop/frame', {cache: 'no-store'}); var data = await responseData(response);
+      if (!response.ok || !data.success) throw new Error(data.message || '截图失败');
+      image.src = data.frame; image.style.display = 'block'; placeholder.style.display = 'none';
+      setStatus('🖱️ 可直接操作服务器 Firefox 页面', 'wait');
+    } catch (error) { placeholder.style.display = 'flex'; placeholder.textContent = '❌ ' + error.message; setStatus(error.message, 'err'); }
   }
-  async function poll() {
-    if (inFlight) return; inFlight = true;
+  async function start() {
+    stop();
+    var placeholder = document.getElementById('webLoginDesktopPlaceholder');
+    placeholder.style.display = 'flex'; placeholder.textContent = '⏳ 正在启动远程桌面...';
     try {
-      var response = await fetch(api + '/status', {cache: 'no-store'}); var data = await responseData(response);
-      if (!response.ok) { stop(); setStatus(data.message || '会话已锁定', 'err'); return; }
-      if (data.status === 'logged_in') { stop(); setStatus('✅ 登录成功！Cookie 已保存 (' + data.auth_count + ' 个认证 token)', 'ok'); }
-      else if (data.status === 'expired') { setStatus('二维码已过期，正在刷新...', 'wait'); setTimeout(loadQr, 1000); }
-      else if (data.status === 'pending') setStatus('⏳ ' + (data.message || '等待扫码...'), 'wait');
-      else setStatus(data.message || '检查失败', 'err');
-    } catch (error) { /* keep polling after transient network failures */ }
-    finally { inFlight = false; }
+      var response = await fetch(api + '/desktop/start', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'}); var data = await responseData(response);
+      if (!response.ok || !data.success) throw new Error(data.message || '启动远程桌面失败');
+      started = true; document.getElementById('webLoginDesktopFrame').src = data.frame; document.getElementById('webLoginDesktopFrame').style.display = 'block'; placeholder.style.display = 'none';
+      setStatus('🖱️ 可直接操作服务器 Firefox 页面', 'wait'); timer = setInterval(frame, 1500);
+    } catch (error) { setStatus(error.message, 'err'); placeholder.textContent = '❌ 启动失败，请重试'; }
+  }
+  // Compatibility name retained for older embedded-page automation.
+  function loadQr() { return start(); }
+  async function sendInput(event) {
+    if (!started) return;
+    try {
+      var response = await fetch(api + '/desktop/input', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(event)}); var data = await responseData(response);
+      if (!response.ok || !data.success) setStatus(data.message || '输入发送失败', 'err'); else frame();
+    } catch (error) { setStatus('输入发送失败', 'err'); }
+  }
+  function point(event) {
+    var image = document.getElementById('webLoginDesktopFrame'), rect = image.getBoundingClientRect();
+    return {x: Math.max(0, Math.min(1280, (event.clientX - rect.left) * 1280 / rect.width)), y: Math.max(0, Math.min(720, (event.clientY - rect.top) * 720 / rect.height))};
   }
   document.getElementById('webLoginUnlockForm').onsubmit = async function(event) {
     event.preventDefault(); var button = document.getElementById('webLoginUnlockButton'); button.disabled = true;
@@ -411,8 +884,12 @@ WEB_LOGIN_PANEL_HTML = r"""
       document.getElementById('webLoginUnlock').style.display = 'none'; document.getElementById('webLoginControls').style.display = 'block'; loadQr();
     } catch (error) { unlockStatus.textContent = error.message; unlockStatus.className = 'web-login-status err'; button.disabled = false; }
   };
-  document.getElementById('webLoginRefresh').onclick = loadQr;
-  document.getElementById('webLoginLogout').onclick = async function() { stop(); await fetch(api + '/logout', {method: 'POST'}); document.getElementById('webLoginControls').style.display = 'none'; document.getElementById('webLoginUnlock').style.display = 'block'; document.getElementById('webLoginUnlockButton').disabled = false; };
+  document.getElementById('webLoginDesktopFrame').onclick = function(event) { var p = point(event); sendInput({kind: 'click', x: p.x, y: p.y, button: 'left', click_count: 1}); };
+  document.getElementById('webLoginDesktopFrame').onwheel = function(event) { event.preventDefault(); sendInput({kind: 'wheel', delta_x: Math.max(-2000, Math.min(2000, event.deltaX)), delta_y: Math.max(-2000, Math.min(2000, event.deltaY))}); };
+  document.getElementById('webLoginDesktopBox').onkeydown = function(event) { if (event.key && event.key.length <= 64) { event.preventDefault(); sendInput({kind: 'key', key: event.key}); } };
+  document.getElementById('webLoginSave').onclick = async function() { var response = await fetch(api + '/desktop/save', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'}); var data = await responseData(response); setStatus(data.message || (data.success ? '登录状态已保存' : '保存失败'), data.success ? 'ok' : 'err'); };
+  document.getElementById('webLoginReload').onclick = async function() { var response = await fetch(api + '/desktop/reload', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'}); var data = await responseData(response); if (response.ok && data.frame) { document.getElementById('webLoginDesktopFrame').src = data.frame; setStatus('页面已刷新', 'wait'); } else setStatus(data.message || '刷新失败', 'err'); };
+  document.getElementById('webLoginLogout').onclick = async function() { stop(); started = false; await fetch(api + '/desktop/lock', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'}); document.getElementById('webLoginControls').style.display = 'none'; document.getElementById('webLoginUnlock').style.display = 'block'; document.getElementById('webLoginUnlockButton').disabled = false; };
 })();
 </script>
 """

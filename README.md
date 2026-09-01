@@ -167,7 +167,7 @@ outbox 清空，再设置
 
 ## 局域网 + Tailscale Web 访问
 
-`file_browser` 通过“抖音登录”子 Tab 提供密码保护的二维码登录，访问边界仍由 Docker
+`file_browser` 通过“抖音登录”子 Tab 提供密码保护的 Firefox 远程桌面镜像，访问边界仍由 Docker
 主机端口和 Tailscale 控制：Compose 同时提供本机回环、明确的可信家庭
 LAN 地址和 Tailscale Serve 路径。`LAN_BIND_ADDRESS` 默认是
 `192.168.1.94`，请按实际服务器地址修改，不要改成 `0.0.0.0`。
@@ -175,9 +175,12 @@ Tailscale 侧请用 Serve（不要用 Funnel）并用 ACL/Grants 只允许自己
 或用户访问。
 
 服务仍会拒绝缺少或不匹配 Origin/Referer 的写请求，并限制上传大小、文件
-数量、媒体并发、密码验证、二维码生成和状态轮询。二维码浏览器会话在验证后
-仅保留 15 分钟，可随时点击“锁定”。未配置 `WEB_LOGIN_PASSWORD` 时二维码登录
-API 安全禁用，不会启动 Firefox。
+数量、媒体并发、密码验证、远程桌面截图和输入请求。输入密码后才会按需启动
+一个服务器端持久化 Firefox 上下文，页面以 1280×720 压缩截图显示，并转发受限的
+鼠标、滚轮、键盘、刷新和尺寸事件。请直接在镜像中点击抖音页面的登录并完成扫码，
+不依赖固定中文选择器；完成后点击“保存登录状态”读取上下文 Cookie 并保存到运行时设置。
+会话仅保留 15 分钟，点击“结束远程桌面/锁定”或会话过期会关闭 Firefox 上下文。
+未配置 `WEB_LOGIN_PASSWORD` 时远程桌面 API 安全禁用，不会启动 Firefox。
 出于设置接口会修改邮箱凭据和 Cookie，`PATCH /api/settings` 还要求显式配置
 `FILE_BROWSER_ALLOWED_ORIGINS`；未配置时即使请求来自同源也返回 `403`。
 如 Tailscale Serve 使用的地址与请求 Host 不同，可在 `.env` 中配置精确的
@@ -281,10 +284,11 @@ Bot 会通过 `douyin.cookie` 的 hot reload 立即读取，Cookie 内容不会�
 | `bot.lease_seconds` / `heartbeat_seconds` | int | `300` / `30` | worker 租约与心跳周期；由 managed settings/YAML 控制，只有显式外部环境变量注入时锁定 |
 | `bot.outbox_retry_attempts` | int | `5` | SMTP outbox 最大重试次数；由 managed settings/YAML 控制，只有显式外部环境变量注入时锁定 |
 | `FILE_BROWSER_ALLOWED_ORIGINS` | str | 当前请求 origin | 文件浏览器精确允许来源（逗号分隔） |
-| `WEB_LOGIN_PASSWORD` | str | 未配置 | file browser 抖音登录 Tab 的密码；留空则禁用二维码登录 |
+| `WEB_LOGIN_PASSWORD` | str | 未配置 | file browser 抖音登录 Tab 的密码；留空则禁用远程桌面登录 |
 | `WEB_LOGIN_PASSWORD_RATE_LIMIT` | int | `5` | 每个来源在窗口内允许的密码验证次数 |
 | `WEB_LOGIN_QR_RATE_LIMIT` | int | `5` | 每个来源在窗口内允许的二维码生成次数 |
 | `WEB_LOGIN_STATUS_RATE_LIMIT` | int | `120` | 每个来源在窗口内允许的状态查询次数 |
+| `WEB_LOGIN_DESKTOP_RATE_LIMIT` | int | `240` | 每个来源在窗口内允许的远程桌面截图/输入请求次数 |
 | `WEB_LOGIN_RATE_WINDOW_SECONDS` | int | `60` | 上述 Web Login 限流窗口（秒） |
 | `DOUYIN_SHORT_LINK_CA_BUNDLE` | str | 系统 CA | 私有 CA bundle 路径；不配置时使用正常证书校验 |
 
