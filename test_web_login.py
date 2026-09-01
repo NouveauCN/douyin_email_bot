@@ -170,6 +170,90 @@ def test_logout_relocks_qr_api(monkeypatch, tmp_path):
     assert client.get("/api/qr", headers=SAME_ORIGIN_HEADERS).status_code == 401
 
 
+def test_remote_desktop_requires_unlock_and_forwards_bounded_input(monkeypatch):
+    class FakeDesktop:
+        def __init__(self):
+            self.events = []
+            self.locked = False
+
+        def start(self, owner):
+            self.owner = owner
+            return True, "远程桌面已连接"
+
+        def active_for(self, owner):
+            return False
+
+        def frame(self, owner):
+            return "data:image/jpeg;base64,ZmFrZQ==", 1280, 720
+
+        def input(self, owner, event):
+            self.events.append(event)
+
+        def resize(self, owner, width, height):
+            self.events.append({"kind": "resize", "width": width, "height": height})
+
+        def reload(self, owner):
+            self.events.append({"kind": "reload"})
+
+        def stop(self, owner=None):
+            self.locked = True
+            return True
+
+    fake = FakeDesktop()
+    monkeypatch.setattr(web_login, "_remote_browser", fake)
+    client = web_login.app.test_client()
+    assert client.post("/api/desktop/start", headers=SAME_ORIGIN_HEADERS).status_code == 401
+    assert _unlock(client).status_code == 200
+    started = client.post("/api/desktop/start", json={}, headers=SAME_ORIGIN_HEADERS)
+    assert started.status_code == 200
+    assert started.get_json()["frame"].startswith("data:image/jpeg")
+    accepted = client.post(
+        "/api/desktop/input",
+        json={"kind": "click", "x": 20, "y": 30, "button": "left", "click_count": 1},
+        headers=SAME_ORIGIN_HEADERS,
+    )
+    assert accepted.status_code == 200
+    assert fake.events[-1]["kind"] == "click"
+    rejected = client.post(
+        "/api/desktop/input",
+        json={"kind": "click", "x": 99999, "y": 30},
+        headers=SAME_ORIGIN_HEADERS,
+    )
+    assert rejected.status_code == 400
+    assert client.post("/api/desktop/lock", headers=SAME_ORIGIN_HEADERS).status_code == 200
+    assert fake.locked
+
+
+def test_remote_save_redacts_cookie_and_requires_auth(monkeypatch):
+    class FakeDesktop:
+        def start(self, owner):
+            return True, "ok"
+
+        def frame(self, owner):
+            return "frame", 1280, 720
+
+        def cookies(self, owner):
+            return "sessionid=secret; uid=private", 2
+
+        def stop(self, owner=None):
+            return True
+
+    saved = {}
+    class FakeSettings:
+        def apply(self, changes):
+            saved["changes"] = changes
+
+    monkeypatch.setattr(web_login, "_remote_browser", FakeDesktop())
+    monkeypatch.setattr(web_login, "_settings", FakeSettings())
+    monkeypatch.setattr(web_login, "_assess_quality", lambda _: ("A", True))
+    client = web_login.app.test_client()
+    assert _unlock(client).status_code == 200
+    response = client.post("/api/desktop/save", json={}, headers=SAME_ORIGIN_HEADERS)
+    assert response.status_code == 200
+    assert "secret" not in response.get_data(as_text=True)
+    assert saved["changes"][0]["key"] == "douyin.cookie"
+
+
 def test_api_rejects_missing_and_cross_origin_requests(monkeypatch, tmp_path):
     monkeypatch.setattr(web_login, "_get_profile_dir", lambda: tmp_path)
     called = []

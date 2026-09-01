@@ -280,7 +280,7 @@ def screenshot_qr_code(
     profile_dir: Path,
     timeout: int = 30000,
 ) -> tuple[Optional[str], str]:
-    """Launch headless Firefox, navigate to douyin.com, screenshot the QR login element.
+    """Launch headless Firefox and screenshot the complete login viewport.
 
     Args:
         profile_dir: Firefox profile directory.
@@ -317,45 +317,22 @@ def screenshot_qr_code(
 
             page.wait_for_timeout(3000)  # let JS render the login modal
 
-            # The homepage does not open the login dialog automatically.  The
-            # old implementation searched the feed immediately and therefore
-            # fell back to returning a screenshot of the first video grid.
-            login_opened = False
-            login_selectors = [
-                "button:has-text('登录')",
-                "[role='button']:has-text('登录')",
-            ]
-            for sel in login_selectors:
-                try:
-                    login_button = page.locator(sel).first
-                    if login_button.is_visible(timeout=2000):
-                        login_button.click(force=True)
-                        login_opened = True
-                        logger.debug("Opened Douyin login dialog via selector: %s", sel)
-                        break
-                except Exception:
-                    continue
-
-            if not login_opened:
-                browser.close()
-                return None, "未找到抖音网页的登录按钮，请刷新后重试"
-
-            page.wait_for_timeout(4000)  # let the login QR render
-
-            # Return the complete viewport.  Douyin frequently changes the
-            # login modal's obfuscated classes, making element guessing prone
-            # to selecting square promotional cards instead of the QR code.
+            # Do not depend on Douyin's changing selectors.  The standalone
+            # fallback displays the page itself, while the embedded panel has
+            # richer mouse/keyboard forwarding through RemoteBrowserSession.
             screenshot_bytes = page.screenshot(type="png", full_page=False)
             logger.debug("Captured complete Douyin login viewport")
 
             browser.close()
 
         b64 = base64.b64encode(screenshot_bytes).decode("ascii")
-        return f"data:image/png;base64,{b64}", "完整登录页面已截取"
+        return f"data:image/png;base64,{b64}", "完整登录页面已截取，可手动点击登录"
 
-    except Exception as exc:
-        logger.error("QR screenshot failed: %s", exc)
-        return None, f"浏览器错误: {exc}"
+    except Exception:
+        # Browser exceptions can include profile paths or request details;
+        # keep them out of both the UI and logs exposed by the login service.
+        logger.error("QR screenshot failed")
+        return None, "浏览器错误，请稍后重试"
 
 
 def check_auth_cookies(profile_dir: Path) -> dict:
@@ -456,9 +433,9 @@ def check_auth_cookies(profile_dir: Path) -> dict:
             ),
         }
 
-    except Exception as exc:
-        logger.error("Auth cookie check failed: %s", exc)
+    except Exception:
+        logger.error("Auth cookie check failed")
         return {
             "status": "error", "cookie_str": None, "auth_count": 0,
-            "message": f"浏览器错误: {exc}",
+            "message": "浏览器错误，请稍后重试",
         }
