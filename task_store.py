@@ -10,24 +10,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Mapping
 
-from download_types import DownloadResult, TaskRequest, TaskSnapshot
+from download_types import DownloadResult, TaskRequest, TaskSnapshot, validate_metadata
 from mail_state import MailStateStore
-
-
-_SECRET_KEY_PARTS = ("cookie", "password", "passwd", "secret", "auth", "token")
-
-
-def _contains_secret_key(value: Any) -> bool:
-    if isinstance(value, Mapping):
-        for key, nested in value.items():
-            lowered = str(key).lower()
-            if any(part in lowered for part in _SECRET_KEY_PARTS):
-                return True
-            if _contains_secret_key(nested):
-                return True
-    elif isinstance(value, (list, tuple)):
-        return any(_contains_secret_key(item) for item in value)
-    return False
 
 
 class TaskStore:
@@ -40,10 +24,10 @@ class TaskStore:
         default_max_attempts: int | None = None,
     ) -> None:
         if isinstance(store, MailStateStore):
-            self.state = store
+            self._state = store
             self._owns_state = False
         else:
-            self.state = MailStateStore(store)
+            self._state = MailStateStore(store)
             self._owns_state = True
         if default_max_attempts is not None and default_max_attempts < 1:
             raise ValueError("default_max_attempts must be positive")
@@ -51,7 +35,7 @@ class TaskStore:
 
     def close(self) -> None:
         if self._owns_state:
-            self.state.close()
+            self._state.close()
 
     @staticmethod
     def _db_source_id(request: TaskRequest) -> str:
@@ -62,9 +46,7 @@ class TaskStore:
 
     @staticmethod
     def _safe_metadata(request: TaskRequest) -> dict:
-        if _contains_secret_key(request.metadata):
-            raise ValueError("task metadata must not contain secret-like fields")
-        return dict(request.metadata)
+        return validate_metadata(request.metadata)
 
     def submit(
         self,
@@ -78,7 +60,7 @@ class TaskStore:
         attempts = max_attempts if max_attempts is not None else self.default_max_attempts
         if attempts is not None and attempts < 1:
             raise ValueError("max_attempts must be positive")
-        row = self.state.enqueue_task(
+        row = self._state.enqueue_task(
             self._db_source_id(request),
             request.url,
             payload=metadata,
@@ -90,44 +72,8 @@ class TaskStore:
         )
         return TaskSnapshot.from_record(row)
 
-    def accept_mail_message(
-        self,
-        mailbox: str,
-        uidvalidity: int,
-        uid: int,
-        source_message_id: str,
-        urls: list[str] | tuple[str, ...] | None = None,
-        *,
-        metadata: Mapping[str, Any] | None = None,
-        platform: str | None = None,
-        max_attempts: int | None = None,
-        advance_position: bool = True,
-        now: float | None = None,
-    ) -> dict[str, Any]:
-        """Atomically persist mail intake and its task bindings.
-
-        This is intentionally the only mail-shaped method on the generic
-        facade.  It preserves the UID position/source transaction while the
-        service owns execution after the commit.
-        """
-        safe_metadata = dict(metadata or {})
-        if _contains_secret_key(safe_metadata):
-            raise ValueError("mail metadata must not contain secret-like fields")
-        return self.state.accept_message(
-            mailbox,
-            uidvalidity,
-            uid,
-            source_message_id,
-            urls,
-            metadata=safe_metadata,
-            platform=platform,
-            max_attempts=max_attempts,
-            advance_position=advance_position,
-            now=now,
-        )
-
     def get(self, task_id: int) -> TaskSnapshot | None:
-        row = self.state.get_task_by_id(task_id)
+        row = self._state.get_task_by_id(task_id)
         return TaskSnapshot.from_record(row) if row is not None else None
 
     def claim(
@@ -141,7 +87,7 @@ class TaskStore:
     ) -> list[TaskSnapshot]:
         return [
             TaskSnapshot.from_record(row)
-            for row in self.state.claim_tasks(
+            for row in self._state.claim_tasks(
                 limit,
                 platform=platform,
                 worker_id=worker_id,
@@ -158,7 +104,7 @@ class TaskStore:
         lease_seconds: float | None = None,
         now: float | None = None,
     ) -> TaskSnapshot | None:
-        row = self.state.heartbeat_task(
+        row = self._state.heartbeat_task(
             task_id, lease_token, lease_seconds=lease_seconds, now=now
         )
         return TaskSnapshot.from_record(row) if row is not None else None
@@ -171,7 +117,7 @@ class TaskStore:
         next_attempt_at: float | None = None,
         now: float | None = None,
     ) -> TaskSnapshot | None:
-        row = self.state.release_task(
+        row = self._state.release_task(
             task_id, lease_token, next_attempt_at=next_attempt_at, now=now
         )
         return TaskSnapshot.from_record(row) if row is not None else None
@@ -189,7 +135,7 @@ class TaskStore:
         final_status = status or (
             "partially_succeeded" if normalized.partial else "succeeded"
         )
-        row = self.state.complete_task(
+        row = self._state.complete_task(
             task_id,
             lease_token,
             result=normalized.to_dict(),
@@ -216,7 +162,7 @@ class TaskStore:
         result_payload = (
             DownloadResult.from_mapping(result).to_dict() if result is not None else None
         )
-        row = self.state.fail_task(
+        row = self._state.fail_task(
             task_id,
             lease_token,
             error,
@@ -230,7 +176,7 @@ class TaskStore:
         return TaskSnapshot.from_record(row) if row is not None else None
 
     def recover_expired(self, *, now: float | None = None) -> dict[str, int]:
-        return self.state.recover_expired(now=now)
+        return self._state.recover_expired(now=now)
 
     def events(
         self,
@@ -240,7 +186,7 @@ class TaskStore:
         include_consumed: bool = False,
         after_id: int | None = None,
     ) -> list[dict[str, Any]]:
-        return self.state.list_task_events(
+        return self._state.list_task_events(
             consumer=consumer,
             limit=limit,
             include_consumed=include_consumed,
@@ -250,7 +196,7 @@ class TaskStore:
     def consume_event(
         self, event_id: int, consumer: str, *, now: float | None = None
     ) -> bool:
-        return self.state.consume_task_event(event_id, consumer, now=now)
+        return self._state.consume_task_event(event_id, consumer, now=now)
 
     def project_event(
         self,
@@ -262,7 +208,14 @@ class TaskStore:
         outbox_message_id: str | None = None,
         now: float | None = None,
     ) -> bool:
-        return self.state.project_task_event(
+        """Atomically acknowledge an event after materializing its outbox.
+
+        The operation remains on the shared kernel transaction.  Entry-point
+        facades normally provide a more specific wrapper (``MailStore`` or
+        ``QQStore``), while this generic form keeps existing task consumers
+        compatible without exposing the underlying state object.
+        """
+        return self._state.project_task_event(
             event_id,
             consumer,
             outbox_event=outbox_event,

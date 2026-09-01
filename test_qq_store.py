@@ -80,13 +80,25 @@ def test_qq_delivery_failure_uses_server_side_retry_policy(tmp_path):
 
 def test_qq_claim_recovers_lease_but_expires_passive_window(tmp_path):
     store = QQStore(tmp_path / "state.sqlite")
+    assert not hasattr(store, "state")
     item = store.accept_qq_message(
         "openid", "message", "fake:1", reply_ttl=10, now=0
     )["outbox"]
     claim = store.claim(now=1, lease_seconds=2)[0]
     assert store.claim(now=3, lease_seconds=2) == []
-    store.state.recover_expired(now=3)
+    store.recover_expired(now=3)
     assert store.claim(now=3, lease_seconds=2)[0]["id"] == item["id"]
-    store.state.recover_expired(now=11)
+    store.recover_expired(now=11)
     assert store.claim(now=11) == []
+    store.close()
+
+
+def test_qq_facade_rejects_secret_metadata(tmp_path):
+    store = QQStore(tmp_path / "state.sqlite")
+    try:
+        store.accept_qq_message("openid", "message", "fake:1", metadata={"token": "x"})
+    except ValueError as exc:
+        assert "metadata" in str(exc)
+    else:
+        raise AssertionError("secret metadata was accepted")
     store.close()

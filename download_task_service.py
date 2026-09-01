@@ -17,6 +17,7 @@ from download_types import (
     TaskSnapshot,
     TaskStatus,
 )
+from outcome_policy import classify_result, decide_exception, decide_outcome
 from task_store import TaskStore
 
 logger = logging.getLogger("DownloadTaskService")
@@ -130,31 +131,6 @@ class DownloaderRegistry:
         )
 
 
-def _classify_result(result: DownloadResult) -> DownloadResult:
-    """Fill stable retry metadata for older platform adapters."""
-    if result.success:
-        return result
-    if result.error_code != ErrorCode.UNKNOWN or result.retry_class != RetryClass.NONE:
-        return result
-    text = (result.error or "").lower()
-    if any(part in text for part in ("timeout", "timed out", "超时")):
-        code, retry = ErrorCode.TIMEOUT, RetryClass.TRANSIENT
-    elif any(part in text for part in ("network", "connection", "网络", "连接")):
-        code, retry = ErrorCode.NETWORK, RetryClass.TRANSIENT
-    elif any(part in text for part in ("cookie", "登录", "私密", "删除")):
-        code, retry = ErrorCode.COOKIE_REQUIRED, RetryClass.TRANSIENT
-    else:
-        code, retry = ErrorCode.DOWNLOAD_FAILED, RetryClass.PERMANENT
-    return DownloadResult(
-        **{
-            **result.to_dict(),
-            "error_code": code,
-            "retry_class": retry,
-            "retryable": retry == RetryClass.TRANSIENT,
-        }
-    )
-
-
 class DownloadExecutor:
     """Stateless registry-backed executor shared by durable and legacy paths."""
 
@@ -165,7 +141,7 @@ class DownloadExecutor:
         return self.registry.resolve(url)
 
     def execute(self, url: str) -> DownloadResult:
-        return _classify_result(self.registry.execute(url))
+        return classify_result(self.registry.execute(url))
 
 
 class DownloadTaskService:
@@ -246,16 +222,6 @@ class DownloadTaskService:
 
     def get(self, task_id: int) -> TaskSnapshot | None:
         return self.store.get(task_id)
-
-    def accept_mail_message(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        """Preserve atomic IMAP source/task acceptance for the mail adapter."""
-        return self.store.accept_mail_message(*args, **kwargs)
-
-    def accept_qq_message(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        """Atomically persist one QQ source, task, and confirmation outbox."""
-        # TaskStore deliberately keeps its public facade source-agnostic; QQ
-        # intake is nevertheless part of the same SQLite transaction.
-        return self.store.state.accept_qq_message(*args, **kwargs)
 
     def start(self) -> None:
         with self._thread_lock:
@@ -366,47 +332,37 @@ class DownloadTaskService:
                     self.after_execute(task, result)
                 except Exception:
                     logger.exception("Post-download task hook failed for %d", task.task_id)
-            attempts = task.attempts
-            if result.success:
-                if result.partial and result.retryable and attempts < self._max_attempts(task):
-                    updated = self.store.fail(
-                        task.task_id,
-                        token,
-                        result.error or "partial download",
-                        result=result,
-                        retry_at=self.clock() + self.retry_delay_seconds,
-                        error_code=result.error_code.value,
-                        retry_class=result.retry_class.value,
-                        now=self.clock(),
-                    )
-                else:
-                    updated = self.store.complete(
-                        task.task_id,
-                        token,
-                        result,
-                        status=(
-                            TaskStatus.PARTIALLY_SUCCEEDED.value
-                            if result.partial
-                            else TaskStatus.SUCCEEDED.value
-                        ),
-                        now=self.clock(),
-                    )
-            elif result.retryable and attempts < self._max_attempts(task):
+            decision = decide_outcome(
+                result,
+                attempts=task.attempts,
+                max_attempts=self._max_attempts(task),
+                now=self.clock(),
+                retry_delay_seconds=self.retry_delay_seconds,
+            )
+            if decision.action == "retry":
                 updated = self.store.fail(
                     task.task_id,
                     token,
-                    result.error or "download failed",
+                    decision.error or "download failed",
                     result=result,
-                    retry_at=self.clock() + self.retry_delay_seconds,
+                    retry_at=decision.retry_at,
                     error_code=result.error_code.value,
                     retry_class=result.retry_class.value,
+                    now=self.clock(),
+                )
+            elif decision.action == "complete":
+                updated = self.store.complete(
+                    task.task_id,
+                    token,
+                    result,
+                    status=decision.status,
                     now=self.clock(),
                 )
             else:
                 updated = self.store.fail(
                     task.task_id,
                     token,
-                    result.error or "download failed",
+                    decision.error or "download failed",
                     result=result,
                     error_code=result.error_code.value,
                     retry_class=result.retry_class.value,
@@ -416,12 +372,19 @@ class DownloadTaskService:
                 self._notify(updated)
         except Exception as exc:
             logger.exception("Task %d execution failed", task.task_id)
-            if task.attempts < self._max_attempts(task):
+            decision = decide_exception(
+                exc,
+                attempts=task.attempts,
+                max_attempts=self._max_attempts(task),
+                now=self.clock(),
+                retry_delay_seconds=self.retry_delay_seconds,
+            )
+            if decision.action == "retry":
                 updated = self.store.fail(
                     task.task_id,
                     token,
-                    str(exc),
-                    retry_at=self.clock() + self.retry_delay_seconds,
+                    decision.error or str(exc),
+                    retry_at=decision.retry_at,
                     error_code=ErrorCode.UNKNOWN.value,
                     retry_class=RetryClass.TRANSIENT.value,
                     now=self.clock(),
@@ -430,7 +393,7 @@ class DownloadTaskService:
                 updated = self.store.fail(
                     task.task_id,
                     token,
-                    str(exc),
+                    decision.error or str(exc),
                     error_code=ErrorCode.UNKNOWN.value,
                     retry_class=RetryClass.PERMANENT.value,
                     now=self.clock(),
