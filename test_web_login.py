@@ -142,6 +142,7 @@ def test_stop_endpoint_is_not_available():
 
 def test_missing_password_disables_login(monkeypatch):
     monkeypatch.delenv("WEB_LOGIN_PASSWORD")
+    monkeypatch.setattr(web_login, "_password", lambda: "")
     client = web_login.app.test_client()
     assert client.post("/api/unlock", json={"password": "anything"}, headers=SAME_ORIGIN_HEADERS).status_code == 503
     assert client.get("/api/qr", headers=SAME_ORIGIN_HEADERS).status_code == 503

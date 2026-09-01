@@ -162,6 +162,8 @@ class FileBrowserSettingsTests(unittest.TestCase):
         self.assertIn('id="webLoginTab"', page)
         self.assertIn('id="webLoginUnlockForm"', page)
         self.assertIn("var api = '/api/web-login'", page)
+        self.assertIn("function responseData(response)", page)
+        self.assertIn("FILE_BROWSER_ALLOWED_ORIGINS 包含当前访问地址", page)
         self.assertIn("loadQr();", page)
         self.assertIn('id="settingsGroups"', page)
         self.assertIn("function renderSettings", page)
