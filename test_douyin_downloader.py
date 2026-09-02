@@ -17,6 +17,68 @@ bootstrap_f2()
 import douyin_downloader
 
 
+def _video_data(candidates):
+    return SimpleNamespace(
+        _to_raw=lambda: {"aweme_detail": {"video": {"bit_rate": candidates}}}
+    )
+
+
+class DouyinStreamSelectionTests(unittest.TestCase):
+    def test_selects_highest_bitrate_candidate_even_when_api_order_is_shuffled(self):
+        video_data = _video_data([
+            {
+                "bit_rate": 1_000_000,
+                "gear_name": "normal_720_0",
+                "play_addr": {"url_list": ["https://example.test/720"]},
+            },
+            {
+                "bit_rate": 2_500_000,
+                "gear_name": "normal_1080_0",
+                "play_addr": {"url_list": ["https://example.test/1080"]},
+            },
+        ])
+
+        self.assertEqual(
+            douyin_downloader._select_best_video_url(video_data, []),
+            "https://example.test/1080",
+        )
+
+    def test_uses_quality_and_resolution_as_tie_breakers(self):
+        video_data = _video_data([
+            {
+                "bit_rate": 2_000_000,
+                "gear_name": "normal_720_0",
+                "play_addr": {"url_list": ["https://example.test/normal"]},
+            },
+            {
+                "bit_rate": 2_000_000,
+                "gear_name": "low_1080_0",
+                "play_addr": {"url_list": ["https://example.test/low"]},
+            },
+        ])
+
+        self.assertEqual(
+            douyin_downloader._select_best_video_url(video_data, []),
+            "https://example.test/normal",
+        )
+
+    def test_falls_back_to_convenience_property_without_valid_raw_candidates(self):
+        video_data = _video_data([
+            {
+                "bit_rate": 0,
+                "gear_name": "normal_1080_0",
+                "play_addr": {"url_list": ["https://example.test/raw"]},
+            },
+        ])
+
+        self.assertEqual(
+            douyin_downloader._select_best_video_url(
+                video_data, ["", "https://example.test/fallback"]
+            ),
+            "https://example.test/fallback",
+        )
+
+
 class DouyinDownloadTests(unittest.IsolatedAsyncioTestCase):
     @contextmanager
     def _mock_client(self, handler):

@@ -14,6 +14,7 @@ import re
 import stat
 import sys
 import tempfile
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -155,8 +156,11 @@ class DouyinDownloader:
         video_data = await handler.fetch_one_video(aweme_id)
         data = video_data._to_dict()
 
-        # Step 3: Decide media type — video, slideshow, or error
+        # Step 3: Select the best available video stream before deciding the
+        # media type.  F2 exposes all bitrate entries in the raw response, but
+        # its convenience property only points at the first entry.
         play_urls = data.get("video_play_addr", [])
+        video_url = _select_best_video_url(video_data, play_urls)
         images = data.get("images", [])
         media_type = data.get("media_type", -1)
 
@@ -199,8 +203,6 @@ class DouyinDownloader:
             )
 
         # ── Regular video ──────────────────────────────────────────
-        video_url = play_urls[0]
-
         # Step 4: Build output filename
         title = data.get("desc") or data.get("nickname") or "Douyin Video"
 
@@ -457,6 +459,127 @@ class DouyinDownloader:
 def _normalize_share_url(url: str) -> str:
     """Keep share URLs as-is; short-link resolution enforces HTTPS."""
     return url.strip()
+
+
+def _positive_int(value) -> int:
+    """Return a positive integer value, or zero for missing/invalid data."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return number if number > 0 else 0
+
+
+def _candidate_resolution(candidate: Mapping) -> tuple[int, int]:
+    """Return (width, height), using the gear name when dimensions are absent."""
+    width = _positive_int(candidate.get("width") or candidate.get("video_width"))
+    height = _positive_int(candidate.get("height") or candidate.get("video_height"))
+    if height:
+        return width, height
+
+    gear_name = str(candidate.get("gear_name") or "")
+    match = re.search(r"(?<!\d)(\d{3,5})(?:p)?(?:_|$)", gear_name, re.IGNORECASE)
+    return width, _positive_int(match.group(1)) if match else 0
+
+
+def _candidate_quality_rank(candidate: Mapping) -> int:
+    """Rank explicit Douyin gear families for equal-bitrate tie-breaking."""
+    gear_name = str(candidate.get("gear_name") or "").strip().lower()
+    if gear_name.startswith("high_"):
+        return 4
+    if gear_name.startswith("normal_"):
+        return 3
+    if gear_name.startswith("low_"):
+        return 2
+    if gear_name.startswith("lower_"):
+        return 1
+    return 0
+
+
+def _candidate_codec_rank(candidate: Mapping) -> int:
+    """Prefer HEVC only as a final tie-break at equal quality and bitrate."""
+    codec = str(candidate.get("codec_type") or "").lower()
+    if candidate.get("is_h265") in (1, True) or codec in {"hevc", "h265"}:
+        return 1
+    return 0
+
+
+def _first_play_url(candidate: Mapping) -> str | None:
+    play_addr = candidate.get("play_addr")
+    if not isinstance(play_addr, Mapping):
+        return None
+    urls = play_addr.get("url_list")
+    if isinstance(urls, str):
+        urls = [urls]
+    if not isinstance(urls, (list, tuple)):
+        return None
+    return next((url.strip() for url in urls if isinstance(url, str) and url.strip()), None)
+
+
+def _select_best_video_url(video_data, fallback_urls) -> str | None:
+    """Select the highest-quality playable stream from F2's raw candidates.
+
+    Bitrate is the primary quality signal.  Gear family and dimensions make
+    equal-bitrate choices deterministic, while the original index is retained
+    as the final stable tie-break.  The convenience property remains a safe
+    fallback for older or unexpected F2 response shapes.
+    """
+    candidates: list[tuple[tuple[int, int, int, int, int, int], str, Mapping]] = []
+    try:
+        raw = video_data._to_raw()
+    except (AttributeError, TypeError, ValueError):
+        raw = None
+
+    aweme_detail = raw.get("aweme_detail") if isinstance(raw, Mapping) else None
+    video = aweme_detail.get("video") if isinstance(aweme_detail, Mapping) else None
+    raw_candidates = video.get("bit_rate") if isinstance(video, Mapping) else None
+    if isinstance(raw_candidates, Mapping):
+        raw_candidates = [raw_candidates]
+    if isinstance(raw_candidates, (list, tuple)):
+        for index, candidate in enumerate(raw_candidates):
+            if not isinstance(candidate, Mapping):
+                continue
+            url = _first_play_url(candidate)
+            bit_rate = _positive_int(candidate.get("bit_rate"))
+            if not url or not bit_rate:
+                continue
+            width, height = _candidate_resolution(candidate)
+            sort_key = (
+                bit_rate,
+                _candidate_quality_rank(candidate),
+                height,
+                width,
+                _candidate_codec_rank(candidate),
+                -index,
+            )
+            candidates.append((sort_key, url, candidate))
+
+    if candidates:
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        sort_key, selected_url, selected = candidates[0]
+        width, height = _candidate_resolution(selected)
+        logger.info(
+            "Douyin stream candidates=%d selected gear=%s bitrate=%d resolution=%sx%s codec=%s",
+            len(candidates),
+            selected.get("gear_name") or "unknown",
+            sort_key[0],
+            width or "?",
+            height or "?",
+            "hevc" if _candidate_codec_rank(selected) else "h264/unknown",
+        )
+        return selected_url
+
+    if isinstance(fallback_urls, str):
+        fallback_urls = [fallback_urls]
+    if isinstance(fallback_urls, (list, tuple)):
+        fallback = next(
+            (url.strip() for url in fallback_urls if isinstance(url, str) and url.strip()),
+            None,
+        )
+        if fallback:
+            logger.debug("Using F2 convenience video URL fallback")
+            return fallback
+    return None
 
 
 def _download_timestamp() -> str:
