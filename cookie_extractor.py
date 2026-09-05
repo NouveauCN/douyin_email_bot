@@ -199,13 +199,16 @@ def validate_cookie(cookie_str: str, timeout: int = 15) -> tuple[bool, str]:
         return True, "Cookie 有效"
 
     except httpx.TimeoutException:
-        return True, "验证未完成 (超时)"
+        # An unavailable endpoint cannot confirm that a cookie is valid.
+        # Callers use the boolean to decide whether it is safe to persist the
+        # extracted value, so network failures must fail closed.
+        return False, "验证未完成 (超时)"
     except httpx.HTTPError as exc:
         logger.debug("Validation HTTP error: %s", exc)
-        return True, "验证未完成 (网络错误)"
+        return False, "验证未完成 (网络错误)"
     except Exception as exc:
         logger.debug("Validation unexpected error: %s", exc)
-        return True, "验证未完成"
+        return False, "验证未完成"
 
 
 # ── Orchestrator ───────────────────────────────────────────────────
@@ -370,14 +373,28 @@ def check_auth_cookies(profile_dir: Path) -> dict:
             )
             page = browser.pages[0] if browser.pages else browser.new_page()
 
+            navigation_failed = False
+            navigation_status = None
             try:
-                page.goto(
+                response = page.goto(
                     DOUYIN_HOMEPAGE,
                     wait_until="domcontentloaded",
                     timeout=15000,
                 )
-            except Exception:
-                pass
+                # A persistent profile can contain stale auth cookies even
+                # when the site is returning an error page.  Playwright's
+                # ``goto`` response is the only reliable reachability signal
+                # available here; fail closed when it is absent or an HTTP
+                # error was returned.
+                navigation_status = getattr(response, "status", None)
+                if not isinstance(navigation_status, int) or navigation_status >= 400:
+                    navigation_failed = True
+            except Exception as exc:
+                # Do not infer a logged-in state from stale profile cookies
+                # when the page could not be reached.  In particular, this
+                # prevents /api/status from persisting an unverified cookie.
+                navigation_failed = True
+                logger.debug("Auth cookie check navigation failed: %s", exc)
 
             # Check for QR expiry text on the page
             page_text = ""
@@ -403,6 +420,17 @@ def check_auth_cookies(profile_dir: Path) -> dict:
             ]
 
             browser.close()
+
+        if navigation_failed:
+            return {
+                "status": "error", "cookie_str": None,
+                "auth_count": len(auth_found),
+                "message": (
+                    f"抖音页面验证失败 (HTTP {navigation_status})，请检查网络后重试"
+                    if navigation_status is not None
+                    else "抖音页面验证失败，请检查网络后重试"
+                ),
+            }
 
         if len(auth_found) >= 2:
             cookie_str = "; ".join(

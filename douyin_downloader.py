@@ -12,8 +12,8 @@ import logging
 import os
 import re
 import stat
-import sys
 import tempfile
+from contextvars import ContextVar
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
@@ -29,21 +29,19 @@ from f2.exceptions import (
     APIResponseError,
     APITimeoutError,
 )
+try:
+    from f2.exceptions import APIUnauthorizedError
+except ImportError:  # Older F2 releases fold this into APIResponseError.
+    APIUnauthorizedError = APIResponseError
+
+from f2_bootstrap import firefox_user_agent
 
 from media_processor import log_process_result, process_media
 from media_file_lock import media_file_lock
 
 logger = logging.getLogger("DouyinDownloader")
 
-_FIREFOX_UA_PLATFORM = (
-    "X11; Linux x86_64" if sys.platform.startswith("linux") else
-    "Macintosh; Intel Mac OS X 10.15" if sys.platform == "darwin" else
-    "Windows NT 10.0; Win64; x64"
-)
-_FIREFOX_USER_AGENT = (
-    f"Mozilla/5.0 ({_FIREFOX_UA_PLATFORM}; rv:130.0) "
-    "Gecko/20100101 Firefox/130.0"
-)
+_DOUYIN_USER_AGENT = firefox_user_agent()
 
 DOUYIN_SHORT_RE = re.compile(r"^https://v\.douyin\.com/([A-Za-z0-9_-]+)/?$")
 DOUYIN_SHORT_PATH_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -100,6 +98,50 @@ def _short_link_verify() -> str | bool:
     return os.getenv("DOUYIN_SHORT_LINK_CA_BUNDLE") or True
 
 
+def _cookie_value(cookie: str, name: str) -> str | None:
+    """Extract one cookie pair without accepting values containing delimiters."""
+    for item in str(cookie or "").split(";"):
+        key, separator, value = item.strip().partition("=")
+        if separator and key.strip() == name:
+            value = value.strip().strip('"')
+            return value if value and len(value) <= 512 else None
+    return None
+
+
+def _configure_f2_request_identity(cookie: str):
+    """Make F2's already-imported Pydantic request model use this session.
+
+    F2 evaluates BaseRequestModel defaults at module import time.  Updating the
+    field default immediately before constructing the handler keeps msToken
+    paired with the current browser Cookie instead of a process-static token.
+    """
+    token = _cookie_value(cookie, "msToken")
+    reset_token = _CURRENT_MS_TOKEN.set(token)
+    try:
+        from f2.apps.douyin.model import BaseRequestModel
+        if not getattr(BaseRequestModel, "_douyin_email_bot_mstoken_patch", False):
+            original_init = BaseRequestModel.__init__
+
+            def init_with_session_token(self, **data):
+                token = _CURRENT_MS_TOKEN.get()
+                if token:
+                    data.setdefault("msToken", token)
+                original_init(self, **data)
+
+            BaseRequestModel.__init__ = init_with_session_token
+            BaseRequestModel._douyin_email_bot_mstoken_patch = True
+        return reset_token
+    except (ImportError, AttributeError, TypeError):
+        logger.debug("Unable to bind current msToken to F2 request model", exc_info=True)
+        _CURRENT_MS_TOKEN.reset(reset_token)
+        return None
+
+
+_CURRENT_MS_TOKEN: ContextVar[str | None] = ContextVar(
+    "douyin_ms_token", default=None,
+)
+
+
 class DouyinDownloader:
     """Download Douyin videos using F2 metadata + direct httpx download.
 
@@ -151,7 +193,7 @@ class DouyinDownloader:
             "timeout": self.config.timeout,
             "max_retries": self.config.max_retries,
             "proxies": {},
-            "headers": {"User-Agent": _FIREFOX_USER_AGENT},
+            "headers": {"User-Agent": _DOUYIN_USER_AGENT},
         }
 
         try:
@@ -159,21 +201,21 @@ class DouyinDownloader:
         except APINotFoundError:
             logger.warning("Video not found: %s", url)
             return self._error("无效的抖音链接，未找到对应视频")
-        except APIResponseError as exc:
+        except (APIUnauthorizedError, APIResponseError) as exc:
             status = _api_status(exc)
             if status in (401, 403):
                 logger.warning("Douyin API access denied (HTTP %s): %s", status, url)
                 return self._error(
-                    "抖音登录态无权访问该视频，请在 Web Login 更新 Cookie",
-                    error_code="cookie_required", retryable=True,
+                    "抖音接口拒绝访问（可能触发风控，HTTP %s），请稍后再试或在 Web Login 更新 Cookie" % status,
+                    error_code="cookie_required", retryable=True, status_code=status,
                 )
             logger.warning("Douyin API returned empty/invalid data for: %s", url)
             return self._error("视频不存在或已被删除")
         except DouyinAccessError as exc:
             logger.warning("Douyin media access denied (HTTP %s): %s", exc.status_code, url)
             return self._error(
-                "抖音登录态无权下载该视频，请在 Web Login 更新 Cookie",
-                error_code="cookie_required", retryable=True,
+                "抖音媒体请求触发风控（HTTP %s），请稍后再试或在 Web Login 更新 Cookie" % exc.status_code,
+                error_code="cookie_required", retryable=True, status_code=exc.status_code,
             )
         except APITimeoutError:
             logger.warning("Douyin request timed out: %s", url)
@@ -188,7 +230,20 @@ class DouyinDownloader:
     async def _download_async(self, kwargs: dict, download_dir: Path) -> dict:
         """Fetch metadata via F2, then download directly via httpx."""
 
-        handler = DouyinHandler(kwargs | {"mode": "one", "path": str(download_dir),
+        token_reset = _configure_f2_request_identity(kwargs.get("cookie", ""))
+        try:
+            return await self._download_async_bound(kwargs, download_dir)
+        finally:
+            if token_reset is not None:
+                _CURRENT_MS_TOKEN.reset(token_reset)
+
+    async def _download_async_bound(self, kwargs: dict, download_dir: Path) -> dict:
+        """Implementation separated so the request token is always reset."""
+
+        # F2's own retry loop must not churn a risk-controlled metadata
+        # request.  Media mirrors retain the caller's configured retries.
+        metadata_kwargs = kwargs | {"max_retries": 1}
+        handler = DouyinHandler(metadata_kwargs | {"mode": "one", "path": str(download_dir),
                                           "naming": self.config.naming,
                                           "folderize": self.config.folderize,
                                           "max_tasks": 1,
@@ -443,7 +498,7 @@ class DouyinDownloader:
                     async with httpx.AsyncClient(timeout=timeout, follow_redirects=False,
                                                   trust_env=False) as client:
                         for _ in range(5):
-                            headers = {"User-Agent": _FIREFOX_USER_AGENT,
+                            headers = {"User-Agent": _DOUYIN_USER_AGENT,
                                        "Referer": "https://www.douyin.com/"}
                         # Cookies are sent only to known Douyin-owned media
                         # hosts.  In particular, never leak the session cookie
@@ -458,7 +513,10 @@ class DouyinDownloader:
                                     current_url = urljoin(current_url, location)
                                     continue
                                 if response.status_code in (401, 403):
-                                    raise DouyinAccessError(f"media access denied (HTTP {response.status_code})", response.status_code)
+                                    raise DouyinAccessError(
+                                        f"Douyin risk control denied media (HTTP {response.status_code})",
+                                        response.status_code,
+                                    )
                                 response.raise_for_status()
                                 with os.fdopen(temp_fd, "wb") as output:
                                     temp_fd = None
@@ -510,11 +568,14 @@ class DouyinDownloader:
         raise last_error  # type: ignore[misc]
 
     @staticmethod
-    def _error(msg: str, *, error_code: str | None = None, retryable: bool = False) -> dict:
+    def _error(msg: str, *, error_code: str | None = None, retryable: bool = False,
+               status_code: int | None = None) -> dict:
         result = {"success": False, "filepath": None, "title": None, "error": msg}
         if error_code:
             result["error_code"] = error_code
             result["retryable"] = retryable
+        if status_code is not None:
+            result["status_code"] = status_code
         return result
 
 

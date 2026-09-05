@@ -7,10 +7,76 @@ smoke tools safe to import and allows repeated calls without stacking patches.
 """
 
 from pathlib import Path
+import os
+import re
+import shutil
+import subprocess
 import sys
 
 
 _BOOTSTRAPPED = False
+_FIREFOX_VERSION_CACHE: dict[str, str] = {}
+
+
+def _firefox_executables() -> list[Path]:
+    """Find Firefox and Playwright's bundled Firefox in bounded locations."""
+    paths: list[Path] = []
+    for name in ("firefox", "firefox-esr"):
+        resolved = shutil.which(name)
+        if resolved:
+            paths.append(Path(resolved))
+    configured = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+    roots: list[Path] = []
+    if configured and configured != "0":
+        roots.append(Path(configured).expanduser())
+    # Playwright's documented per-user cache and the common Docker root.
+    roots.extend((Path.home() / ".cache" / "ms-playwright", Path("/ms-playwright")))
+    for root in dict.fromkeys(roots):
+        if root.is_dir():
+            paths.extend(sorted(root.glob("firefox-*/firefox/firefox"), reverse=True))
+    return list(dict.fromkeys(paths))
+
+
+def firefox_version() -> str:
+    """Return the installed Firefox major/minor version for request identity."""
+    configured = os.getenv("DOUYIN_FIREFOX_VERSION", "").strip()
+    if configured:
+        candidates = [configured]
+    else:
+        cache_key = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "")
+        if cache_key in _FIREFOX_VERSION_CACHE:
+            return _FIREFOX_VERSION_CACHE[cache_key]
+        candidates = []
+        for path in _firefox_executables():
+            try:
+                output = subprocess.run(
+                    [str(path), "--version"], capture_output=True, text=True,
+                    timeout=2, check=False,
+                ).stdout
+                candidates.append(output)
+            except (OSError, subprocess.SubprocessError):
+                pass
+    for value in candidates:
+        match = re.search(r"Firefox\s+(\d+(?:\.\d+){0,3})", value, re.I)
+        if not match and configured:
+            match = re.fullmatch(r"\d+(?:\.\d+){0,3}", value)
+        if match:
+            parts = match.group(1).split(".")
+            # Keep the browser's native two-component form; padding to four
+            # components creates a fingerprint that Firefox itself doesn't
+            # advertise (e.g. 153.0.0.0).
+            if len(parts) < 2:
+                parts.append("0")
+            version = ".".join(parts[:4])
+            if not configured:
+                _FIREFOX_VERSION_CACHE[cache_key] = version
+            return version
+    return "130.0"
+
+
+def firefox_user_agent(version: str | None = None) -> str:
+    native_version = version or firefox_version()
+    return f"Mozilla/5.0 (X11; Linux x86_64; rv:{native_version}) Gecko/20100101 Firefox/{native_version}"
 
 
 def _write_if_missing(path: Path, content: str) -> None:
@@ -54,10 +120,6 @@ def bootstrap_f2(project_dir: Path | None = None) -> None:
         platform_name = "Linux" if sys.platform.startswith("linux") else (
             "Darwin" if sys.platform == "darwin" else "Windows"
         )
-        browser_platform = "Linux x86_64" if platform_name == "Linux" else (
-            "MacIntel" if platform_name == "Darwin" else "Win32"
-        )
-
         @classmethod
         def safe_brm_os(cls):
             value = orig_brm_os(cls)
@@ -76,16 +138,17 @@ def bootstrap_f2(project_dir: Path | None = None) -> None:
 
         @classmethod
         def safe_brm_browser(cls):
+            version = firefox_version()
             return {
                 "name": "Firefox",
-                "version": "130.0.0.0",
+                "version": version,
                 "language": "zh-CN",
-                "platform": browser_platform,
+                "platform": "Linux x86_64",
             }
 
         @classmethod
         def safe_brm_engine(cls):
-            return {"name": "Gecko", "version": "130.0.0.0"}
+            return {"name": "Gecko", "version": firefox_version()}
 
         douyin_ccm.brm_os = safe_brm_os
         douyin_ccm.brm_version = safe_brm_version

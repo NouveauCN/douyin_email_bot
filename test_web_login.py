@@ -357,6 +357,34 @@ def test_remote_save_redacts_cookie_and_requires_auth(monkeypatch):
     assert saved["changes"][0]["key"] == "douyin.cookie"
 
 
+def test_remote_cookie_read_rejects_http_error_before_cookie_names(
+    monkeypatch,
+):
+    class Response:
+        status = 503
+
+    class FakePage:
+        def goto(self, *_args, **_kwargs):
+            return Response()
+
+    class FakeContext:
+        pages = [FakePage()]
+
+        def cookies(self):
+            return [
+                {"name": "sessionid", "value": "secret", "domain": ".douyin.com"},
+                {"name": "uid", "value": "private", "domain": ".douyin.com"},
+            ]
+
+    browser = web_login.RemoteBrowserSession()
+    browser._context = FakeContext()
+    browser._owner = "owner"
+    browser._call = lambda callback: callback()
+
+    with pytest.raises(web_login.RemoteBrowserError, match="HTTP 503"):
+        browser.cookies("owner")
+
+
 def test_api_rejects_missing_and_cross_origin_requests(monkeypatch, tmp_path):
     monkeypatch.setattr(web_login, "_get_profile_dir", lambda: tmp_path)
     called = []

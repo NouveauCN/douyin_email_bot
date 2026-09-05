@@ -13,6 +13,7 @@ from typing import Literal
 from download_types import DownloadResult, ErrorCode, RetryClass
 
 Action = Literal["retry", "complete", "fail"]
+RISK_CONTROL_RETRY_FLOOR_SECONDS = 30 * 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,11 +77,18 @@ def decide_outcome(
         )
     if result.retryable and attempts < max_attempts:
         detail = result.error or "；".join(result.failed_items)
+        delay = max(0.0, float(retry_delay_seconds))
+        # A metadata 401/403 is an account/session risk-control response.  A
+        # normal transient delay can create a rapid retry loop and worsen it.
+        if result.error_code == ErrorCode.COOKIE_REQUIRED or any(part in (detail or "").lower() for part in (
+            "风险控制", "风控", "risk control", "risk-control", "access denied (http 403)",
+        )):
+            delay = max(delay, RISK_CONTROL_RETRY_FLOOR_SECONDS)
         return OutcomeDecision(
             action="retry",
             result=result,
             error=detail or ("partial download" if result.partial else "download failed"),
-            retry_at=float(now) + max(0.0, float(retry_delay_seconds)),
+            retry_at=float(now) + delay,
         )
     if result.success:
         return OutcomeDecision(action="complete", result=result, status="partially_succeeded")
