@@ -2,6 +2,7 @@
 
 import base64
 import io
+import sys
 import tempfile
 import threading
 import unittest
@@ -128,3 +129,19 @@ class FileBrowserSecurityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_entrypoint_disables_flask_dotenv_loading(monkeypatch):
+    calls = []
+    monkeypatch.setattr(sys, "argv", ["file_browser.py"])
+    monkeypatch.setattr(file_browser, "_build_dedup_index", lambda: None)
+
+    def fake_run(**kwargs):
+        calls.append(kwargs)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(file_browser.app, "run", fake_run)
+
+    file_browser.main()
+
+    assert calls[0]["load_dotenv"] is False

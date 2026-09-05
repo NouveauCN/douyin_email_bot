@@ -2,6 +2,7 @@
 
 import sys
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -192,6 +193,27 @@ def test_stop_endpoint_is_not_available():
     response = web_login.app.test_client().post("/api/stop")
 
     assert response.status_code == 404
+
+
+def test_standalone_entrypoint_disables_flask_dotenv_loading(monkeypatch):
+    calls = []
+    monkeypatch.setattr(sys, "argv", ["web_login.py"])
+
+    monkeypatch.setattr(web_login, "_get_profile_dir", lambda: Path("/tmp/test-web-login-profile"))
+
+    def fake_run(**kwargs):
+        calls.append(kwargs)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        web_login.app,
+        "run",
+        fake_run,
+    )
+
+    web_login.main()
+
+    assert calls[0]["load_dotenv"] is False
 
 
 def test_missing_password_disables_login(monkeypatch):

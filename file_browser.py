@@ -3060,7 +3060,10 @@ def main():
     _build_dedup_index()
 
     try:
-        app.run(host=args.host, port=args.port, debug=args.debug)
+        # Flask otherwise reloads .env at server startup.  That late reload can
+        # overwrite the environment snapshot used by config/settings loading
+        # and make managed secrets appear to be deployment overrides.
+        app.run(host=args.host, port=args.port, debug=args.debug, load_dotenv=False)
     except KeyboardInterrupt:
         log.info("Shutting down")
 

@@ -1205,7 +1205,16 @@ def main():
     log.info("Open http://<host>:%d in a browser to scan the QR code", args.port)
 
     try:
-        app.run(host=args.host, port=args.port, debug=args.debug, threaded=False)
+        # Keep Flask from reloading .env after the managed-settings/config
+        # snapshot has been initialized; doing so can lock Cookie persistence
+        # behind a late environment override.
+        app.run(
+            host=args.host,
+            port=args.port,
+            debug=args.debug,
+            threaded=False,
+            load_dotenv=False,
+        )
     except KeyboardInterrupt:
         log.info("Shutting down")
 
