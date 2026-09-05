@@ -291,7 +291,26 @@ class RemoteBrowserSession:
                 if self._context is None or self._owner != owner:
                     raise RemoteBrowserError("远程桌面未启动或已被锁定")
                 try:
+                    page = self._page_locked(owner)
+                    response = page.goto(
+                        DOUYIN_HOMEPAGE,
+                        wait_until="domcontentloaded",
+                        timeout=15000,
+                    )
+                    status = getattr(response, "status", None)
+                    # Never persist profile cookies solely because familiar
+                    # auth names are present.  Stale cookies are common, and
+                    # an unavailable/error navigation cannot establish that
+                    # the session is currently usable.
+                    if not isinstance(status, int):
+                        raise RemoteBrowserError("抖音页面验证失败，请检查网络后重试")
+                    if status >= 400:
+                        raise RemoteBrowserError(
+                            f"抖音页面验证失败 (HTTP {status})，请检查网络后重试"
+                        )
                     return self._context.cookies()
+                except RemoteBrowserError:
+                    raise
                 except Exception:
                     raise RemoteBrowserError("读取登录状态失败，请重试")
             all_cookies = self._call(read_cookies)

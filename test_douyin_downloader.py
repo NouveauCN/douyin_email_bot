@@ -1,5 +1,6 @@
 """Focused tests for Douyin streaming downloads and slideshow accounting."""
 
+import asyncio
 import tempfile
 import unittest
 from contextlib import contextmanager
@@ -110,6 +111,49 @@ class DouyinDownloadTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(target.read_bytes(), b"new content")
             self.assertEqual(target.stat().st_mode & 0o777, 0o640)
             self.assertEqual(list(Path(temp_dir).glob(".video.mp4.*.tmp")), [])
+
+    def test_current_cookie_mstoken_is_bound_to_f2_model(self):
+        from f2.apps.douyin.model import BaseRequestModel, PostDetail
+
+        original = BaseRequestModel.model_fields["msToken"].default
+        try:
+            douyin_downloader._configure_f2_request_identity(
+                "sessionid=secret; msToken=current-session-token"
+            )
+            assert PostDetail(aweme_id="123").msToken == "current-session-token"
+        finally:
+            BaseRequestModel.model_fields["msToken"].default = original
+
+    def test_missing_mstoken_does_not_reuse_previous_request_token(self):
+        from f2.apps.douyin.model import PostDetail
+
+        reset = douyin_downloader._configure_f2_request_identity(
+            "sessionid=secret; msToken=old-token"
+        )
+        assert PostDetail(aweme_id="123").msToken == "old-token"
+        douyin_downloader._CURRENT_MS_TOKEN.reset(reset)
+        reset = douyin_downloader._configure_f2_request_identity("sessionid=secret")
+        try:
+            assert PostDetail(aweme_id="123").msToken != "old-token"
+        finally:
+            douyin_downloader._CURRENT_MS_TOKEN.reset(reset)
+
+    async def test_mstoken_is_task_local(self):
+        from f2.apps.douyin.model import PostDetail
+
+        async def build(cookie, delay):
+            reset = douyin_downloader._configure_f2_request_identity(cookie)
+            try:
+                import asyncio
+                await asyncio.sleep(delay)
+                return PostDetail(aweme_id="123").msToken
+            finally:
+                douyin_downloader._CURRENT_MS_TOKEN.reset(reset)
+
+        values = await asyncio.gather(
+            build("msToken=token-a", 0.01), build("msToken=token-b", 0)
+        )
+        assert values == ["token-a", "token-b"]
 
     def test_media_access_denied_is_reported_as_cookie_required(self):
         with tempfile.TemporaryDirectory() as temp_dir:

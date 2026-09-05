@@ -19,6 +19,36 @@ def test_classify_result_treats_access_denied_as_cookie_refresh():
     assert result.retryable is True
 
 
+def test_risk_control_metadata_denial_has_long_retry_floor():
+    decision = decide_outcome(
+        DownloadResult(
+            success=False,
+            error="抖音接口拒绝访问（可能触发风控）",
+            retryable=True,
+            retry_class=RetryClass.TRANSIENT,
+        ),
+        attempts=1,
+        max_attempts=3,
+        now=100,
+        retry_delay_seconds=5,
+    )
+    assert decision.action == "retry"
+    assert decision.retry_at == 100 + 30 * 60
+
+
+def test_risk_control_media_denial_has_long_retry_floor():
+    result = classify_result(DownloadResult(
+        success=False,
+        error="抖音媒体请求触发风控（HTTP 403）",
+        error_code=ErrorCode.COOKIE_REQUIRED,
+        retryable=True,
+        retry_class=RetryClass.TRANSIENT,
+    ))
+    decision = decide_outcome(result, attempts=1, max_attempts=3,
+                              now=100, retry_delay_seconds=5)
+    assert decision.retry_at == 100 + 30 * 60
+
+
 def test_classify_result_keeps_missing_content_terminal():
     result = classify_result(DownloadResult(success=False, error="视频已被作者删除"))
     assert result.error_code == ErrorCode.DOWNLOAD_FAILED
