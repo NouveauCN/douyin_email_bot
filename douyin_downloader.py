@@ -17,7 +17,7 @@ import tempfile
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from colorama import Fore, Style
@@ -60,6 +60,39 @@ SHORT_LINK_CACHE_PATH = Path(
     or Path(__file__).parent / "logs" / "short_link_cache.json"
 )
 SHORT_LINK_CACHE_SCHEMA = "https-validated-v1"
+
+
+class DouyinAccessError(RuntimeError):
+    """The account/session was refused access to Douyin metadata or media."""
+
+    def __init__(self, message: str, status_code: int | None = None):
+        self.status_code = status_code
+        super().__init__(message)
+
+
+_MEDIA_COOKIE_HOSTS = frozenset({
+    "douyin.com", "iesdouyin.com", "douyinvod.com", "snssdk.com",
+})
+
+
+def _approved_media_host(url: str) -> bool:
+    try:
+        host = (urlparse(url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    return any(host == suffix or host.endswith("." + suffix)
+               for suffix in _MEDIA_COOKIE_HOSTS)
+
+
+def _api_status(error: BaseException) -> int | None:
+    value = getattr(error, "status_code", None)
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        if str(value).strip() in {"401", "403"}:
+            return int(str(value).strip())
+        match = re.search(r"\b(?:status(?:\s+code)?|http)\s*[:=]?\s*(401|403)\b", str(error), re.IGNORECASE)
+        return int(match.group(1)) if match else None
 
 
 def _short_link_verify() -> str | bool:
@@ -126,9 +159,22 @@ class DouyinDownloader:
         except APINotFoundError:
             logger.warning("Video not found: %s", url)
             return self._error("无效的抖音链接，未找到对应视频")
-        except APIResponseError:
+        except APIResponseError as exc:
+            status = _api_status(exc)
+            if status in (401, 403):
+                logger.warning("Douyin API access denied (HTTP %s): %s", status, url)
+                return self._error(
+                    "抖音登录态无权访问该视频，请在 Web Login 更新 Cookie",
+                    error_code="cookie_required", retryable=True,
+                )
             logger.warning("Douyin API returned empty/invalid data for: %s", url)
             return self._error("视频不存在或已被删除")
+        except DouyinAccessError as exc:
+            logger.warning("Douyin media access denied (HTTP %s): %s", exc.status_code, url)
+            return self._error(
+                "抖音登录态无权下载该视频，请在 Web Login 更新 Cookie",
+                error_code="cookie_required", retryable=True,
+            )
         except APITimeoutError:
             logger.warning("Douyin request timed out: %s", url)
             return self._error("抖音服务器响应超时，请稍后重试")
@@ -160,7 +206,8 @@ class DouyinDownloader:
         # media type.  F2 exposes all bitrate entries in the raw response, but
         # its convenience property only points at the first entry.
         play_urls = data.get("video_play_addr", [])
-        video_url = _select_best_video_url(video_data, play_urls)
+        video_urls = _video_url_candidates(video_data, play_urls)
+        video_url = video_urls[0] if video_urls else None
         images = data.get("images", [])
         media_type = data.get("media_type", -1)
 
@@ -224,7 +271,7 @@ class DouyinDownloader:
         if _has_downloaded_content(filepath):
             logger.info(f"{Fore.YELLOW}已存在: %s", filepath.name)
         else:
-            await self._download_file(video_url, filepath, kwargs)
+            await self._download_file(video_urls, filepath, kwargs)
             downloaded = True
             logger.info(
                 f"{Fore.GREEN}{Style.BRIGHT}[DONE] 下载完成: %s (%.1f MB)",
@@ -373,87 +420,102 @@ class DouyinDownloader:
             ),
         }
 
-    async def _download_file(self, url: str, filepath: Path, kwargs: dict) -> None:
+    async def _download_file(self, url: str | list[str] | tuple[str, ...], filepath: Path, kwargs: dict) -> None:
         """Stream a file into a same-directory temp file, then replace atomically."""
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/130.0.0.0 Safari/537.36"
-            ),
-            "Referer": "https://www.douyin.com/",
-        }
+        urls = [url] if isinstance(url, str) else [item for item in url if item]
+        if not urls:
+            raise ValueError("no media URL")
 
         max_retries = max(1, int(kwargs.get("max_retries", 3)))
         timeout = kwargs.get("timeout", 30)
 
         last_error = None
         for attempt in range(1, max_retries + 1):
-            temp_path: Path | None = None
-            temp_fd: int | None = None
-            try:
-                filepath.parent.mkdir(parents=True, exist_ok=True)
-                temp_fd, temp_name = tempfile.mkstemp(
-                    prefix=f".{filepath.name}.",
-                    suffix=".tmp",
-                    dir=str(filepath.parent),
-                )
-                temp_path = Path(temp_name)
-                async with httpx.AsyncClient(
-                    timeout=timeout, follow_redirects=True, headers=headers,
-                    trust_env=False,
-                ) as client:
-                    async with client.stream("GET", url) as response:
-                        response.raise_for_status()
-                        with os.fdopen(temp_fd, "wb") as output:
-                            temp_fd = None
-                            total_bytes = 0
-                            async for chunk in response.aiter_bytes():
-                                if chunk:
-                                    output.write(chunk)
-                                    total_bytes += len(chunk)
-                            if total_bytes == 0:
-                                raise ValueError("download response was empty")
-                            output.flush()
-                            os.fsync(output.fileno())
+            for candidate in urls:
+                temp_path: Path | None = None
+                temp_fd: int | None = None
+                try:
+                    filepath.parent.mkdir(parents=True, exist_ok=True)
+                    temp_fd, temp_name = tempfile.mkstemp(
+                        prefix=f".{filepath.name}.", suffix=".tmp", dir=str(filepath.parent))
+                    temp_path = Path(temp_name)
+                    current_url = candidate
+                    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False,
+                                                  trust_env=False) as client:
+                        for _ in range(5):
+                            headers = {"User-Agent": _FIREFOX_USER_AGENT,
+                                       "Referer": "https://www.douyin.com/"}
+                        # Cookies are sent only to known Douyin-owned media
+                        # hosts.  In particular, never leak the session cookie
+                        # to a foreign redirect/CDN host.
+                            if kwargs.get("cookie") and _approved_media_host(current_url):
+                                headers["Cookie"] = kwargs["cookie"]
+                            async with client.stream("GET", current_url, headers=headers) as response:
+                                if response.is_redirect:
+                                    location = response.headers.get("location")
+                                    if not location:
+                                        raise httpx.HTTPStatusError("redirect without location", request=response.request, response=response)
+                                    current_url = urljoin(current_url, location)
+                                    continue
+                                if response.status_code in (401, 403):
+                                    raise DouyinAccessError(f"media access denied (HTTP {response.status_code})", response.status_code)
+                                response.raise_for_status()
+                                with os.fdopen(temp_fd, "wb") as output:
+                                    temp_fd = None
+                                    total_bytes = 0
+                                    async for chunk in response.aiter_bytes():
+                                        if chunk:
+                                            output.write(chunk)
+                                            total_bytes += len(chunk)
+                                    if total_bytes == 0:
+                                        raise ValueError("download response was empty")
+                                    output.flush()
+                                    os.fsync(output.fileno())
+                                break
+                        else:
+                            raise httpx.TooManyRedirects("too many media redirects", request=response.request)
 
-                if filepath.exists():
-                    final_mode = stat.S_IMODE(filepath.stat().st_mode)
-                else:
-                    final_mode = 0o644
-                temp_path.chmod(final_mode)
-                # Only the atomic publish is locked; network streaming stays
-                # outside the media critical section.
-                with media_file_lock(
-                    filepath,
-                    root=Path(getattr(self.config, "download_path", filepath.parent)),
-                    timeout=5,
-                ):
-                    temp_path.replace(filepath)
-                temp_path = None
-                return
-            except Exception as e:
-                last_error = e
-                logger.warning("Download attempt %d/%d failed: %s", attempt, max_retries, e)
-                if attempt < max_retries:
-                    await asyncio.sleep(1)
-            finally:
-                if temp_fd is not None:
-                    try:
-                        os.close(temp_fd)
-                    except OSError:
-                        pass
-                if temp_path is not None:
-                    try:
-                        temp_path.unlink()
-                    except FileNotFoundError:
-                        pass
+                    if filepath.exists():
+                        final_mode = stat.S_IMODE(filepath.stat().st_mode)
+                    else:
+                        final_mode = 0o644
+                    temp_path.chmod(final_mode)
+                    # Only the atomic publish is locked; network streaming stays
+                    # outside the media critical section.
+                    with media_file_lock(
+                        filepath,
+                        root=Path(getattr(self.config, "download_path", filepath.parent)),
+                        timeout=5,
+                    ):
+                        temp_path.replace(filepath)
+                    temp_path = None
+                    return
+                except Exception as e:
+                    last_error = e
+                    logger.warning("Download attempt %d/%d failed: %s", attempt, max_retries, e)
+                finally:
+                    if temp_fd is not None:
+                        try:
+                            os.close(temp_fd)
+                        except OSError:
+                            pass
+                    if temp_path is not None:
+                        try:
+                            temp_path.unlink()
+                        except FileNotFoundError:
+                            pass
+            if attempt < max_retries:
+                await asyncio.sleep(1)
 
         raise last_error  # type: ignore[misc]
 
     @staticmethod
-    def _error(msg: str) -> dict:
-        return {"success": False, "filepath": None, "title": None, "error": msg}
+    def _error(msg: str, *, error_code: str | None = None, retryable: bool = False) -> dict:
+        result = {"success": False, "filepath": None, "title": None, "error": msg}
+        if error_code:
+            result["error_code"] = error_code
+            result["retryable"] = retryable
+        return result
 
 
 def _normalize_share_url(url: str) -> str:
@@ -514,6 +576,42 @@ def _first_play_url(candidate: Mapping) -> str | None:
     if not isinstance(urls, (list, tuple)):
         return None
     return next((url.strip() for url in urls if isinstance(url, str) and url.strip()), None)
+
+
+def _video_url_candidates(video_data, fallback_urls) -> list[str]:
+    """Return ranked stream URLs, retaining mirrors for HTTP fallback."""
+    candidates: list[tuple[tuple[int, int, int, int, int, int], str]] = []
+    try:
+        raw = video_data._to_raw()
+    except (AttributeError, TypeError, ValueError):
+        raw = None
+    aweme_detail = raw.get("aweme_detail") if isinstance(raw, Mapping) else None
+    video = aweme_detail.get("video") if isinstance(aweme_detail, Mapping) else None
+    raw_candidates = video.get("bit_rate") if isinstance(video, Mapping) else None
+    if isinstance(raw_candidates, Mapping):
+        raw_candidates = [raw_candidates]
+    if isinstance(raw_candidates, (list, tuple)):
+        for index, candidate in enumerate(raw_candidates):
+            if not isinstance(candidate, Mapping):
+                continue
+            bit_rate = _positive_int(candidate.get("bit_rate"))
+            width, height = _candidate_resolution(candidate)
+            urls = candidate.get("play_addr", {}).get("url_list", []) if isinstance(candidate.get("play_addr"), Mapping) else []
+            if isinstance(urls, str):
+                urls = [urls]
+            rank = (bit_rate, _candidate_quality_rank(candidate), height, width,
+                    _candidate_codec_rank(candidate), -index)
+            for url in urls if isinstance(urls, (list, tuple)) else ():
+                if isinstance(url, str) and url.strip():
+                    candidates.append((rank, url.strip()))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    urls = [url for _, url in candidates]
+    if isinstance(fallback_urls, str):
+        fallback_urls = [fallback_urls]
+    if isinstance(fallback_urls, (list, tuple)):
+        urls.extend(url.strip() for url in fallback_urls
+                    if isinstance(url, str) and url.strip())
+    return list(dict.fromkeys(urls))
 
 
 def _select_best_video_url(video_data, fallback_urls) -> str | None:

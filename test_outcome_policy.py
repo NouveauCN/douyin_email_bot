@@ -9,6 +9,23 @@ def test_classify_result_keeps_legacy_transient_error_semantics():
     assert result.retryable is True
 
 
+def test_classify_result_treats_access_denied_as_cookie_refresh():
+    result = classify_result(DownloadResult(
+        success=False,
+        error="Douyin media access denied (HTTP 403)",
+    ))
+    assert result.error_code == ErrorCode.COOKIE_REQUIRED
+    assert result.retry_class == RetryClass.TRANSIENT
+    assert result.retryable is True
+
+
+def test_classify_result_keeps_missing_content_terminal():
+    result = classify_result(DownloadResult(success=False, error="视频已被作者删除"))
+    assert result.error_code == ErrorCode.DOWNLOAD_FAILED
+    assert result.retry_class == RetryClass.PERMANENT
+    assert result.retryable is False
+
+
 def test_partial_transient_result_retries_until_attempt_limit():
     result = DownloadResult(
         success=True,

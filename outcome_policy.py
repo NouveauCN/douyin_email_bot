@@ -39,8 +39,12 @@ def classify_result(result: DownloadResult) -> DownloadResult:
         code, retry = ErrorCode.TIMEOUT, RetryClass.TRANSIENT
     elif any(part in text for part in ("network", "connection", "网络", "连接")):
         code, retry = ErrorCode.NETWORK, RetryClass.TRANSIENT
-    elif any(part in text for part in ("cookie", "登录", "私密", "删除")):
+    elif any(part in text for part in ("cookie", "登录", "auth", "authentication", "access denied", "http 401", "http 403")):
         code, retry = ErrorCode.COOKIE_REQUIRED, RetryClass.TRANSIENT
+    elif any(part in text for part in ("私密", "删除", "不存在", "not found")):
+        # Missing/private content is a terminal content outcome, not a cue to
+        # repeatedly refresh an otherwise valid login session.
+        code, retry = ErrorCode.DOWNLOAD_FAILED, RetryClass.PERMANENT
     else:
         code, retry = ErrorCode.DOWNLOAD_FAILED, RetryClass.PERMANENT
     return DownloadResult(

@@ -111,6 +111,59 @@ class DouyinDownloadTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(target.stat().st_mode & 0o777, 0o640)
             self.assertEqual(list(Path(temp_dir).glob(".video.mp4.*.tmp")), [])
 
+    def test_media_access_denied_is_reported_as_cookie_required(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            downloader = douyin_downloader.DouyinDownloader(SimpleNamespace(
+                cookie="sessionid=secret", download_path=temp_dir,
+                timeout=30, max_retries=1,
+            ))
+
+            async def denied(_kwargs, _download_dir):
+                raise douyin_downloader.DouyinAccessError(
+                    "media access denied", 403
+                )
+
+            with patch.object(downloader, "_download_async", new=denied):
+                result = downloader.download("https://www.douyin.com/video/123")
+
+            self.assertFalse(result["success"])
+            self.assertEqual(result["error_code"], "cookie_required")
+            self.assertTrue(result["retryable"])
+
+    async def test_media_cookie_is_stripped_on_foreign_redirect_and_mirror_falls_back(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "video.mp4"
+            requests = []
+
+            def handler(request):
+                requests.append((str(request.url), request.headers.get("cookie")))
+                if request.url.host == "media.douyinvod.com" and request.url.path.endswith("/video"):
+                    return httpx.Response(
+                        302, headers={"Location": "https://foreign.example/video"},
+                        request=request,
+                    )
+                if request.url.host == "foreign.example":
+                    return httpx.Response(403, request=request)
+                return httpx.Response(200, content=b"mirror", request=request)
+
+            downloader = douyin_downloader.DouyinDownloader(
+                SimpleNamespace(download_path=temp_dir)
+            )
+            with self._mock_client(handler):
+                await downloader._download_file(
+                    [
+                        "https://media.douyinvod.com/video",
+                        "https://media.douyinvod.com/mirror",
+                    ],
+                    target,
+                    {"cookie": "sessionid=secret", "max_retries": 1},
+                )
+
+            self.assertEqual(target.read_bytes(), b"mirror")
+            self.assertEqual(requests[0][1], "sessionid=secret")
+            self.assertEqual(requests[1][1], None)
+            self.assertEqual(requests[2][1], "sessionid=secret")
+
 
     async def test_valid_https_redirect_is_cached(self):
         with tempfile.TemporaryDirectory() as temp_dir:
