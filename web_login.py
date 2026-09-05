@@ -69,6 +69,7 @@ _DESKTOP_HEIGHT = 720
 _MAX_DESKTOP_JSON_BYTES = 16 * 1024
 _COOKIE_SAVE_MAX_ATTEMPTS = 4
 _COOKIE_SAVE_BACKOFF_SECONDS = (0.05, 0.1, 0.2)
+_cookie_save_lock = threading.Lock()
 
 
 class RemoteBrowserError(RuntimeError):
@@ -556,37 +557,56 @@ def _persist_authenticated_cookie(cookie_str: str) -> bool:
     window is expected while both processes commit their changes.
     """
     changes = [{"key": "douyin.cookie", "action": "set", "value": cookie_str}]
-    for attempt in range(_COOKIE_SAVE_MAX_ATTEMPTS):
-        try:
-            _settings.apply(changes)
-            return True
-        except sqlite3.OperationalError as exc:
-            message = str(exc).lower()
-            if "locked" not in message and "busy" not in message:
+    # /api/status and /api/desktop/save can observe the same authenticated
+    # browser at once.  Serialize those writes before relying on SQLite's
+    # busy timeout; this also makes the revision/reload signal deterministic.
+    with _cookie_save_lock:
+        for attempt in range(_COOKIE_SAVE_MAX_ATTEMPTS):
+            try:
+                revision = _settings.apply(changes)
+                if isinstance(revision, int):
+                    log.info("Authenticated cookie persisted to managed settings (revision=%d)", revision)
+                else:
+                    log.info("Authenticated cookie persisted to managed settings")
+                return True
+            except sqlite3.OperationalError as exc:
+                message = str(exc).lower()
+                if "locked" not in message and "busy" not in message:
+                    log.error(
+                        "Authenticated cookie persistence failed (exception_type=%s category=sqlite_operational)",
+                        type(exc).__name__,
+                    )
+                    return False
+                if attempt + 1 >= _COOKIE_SAVE_MAX_ATTEMPTS:
+                    log.error(
+                        "Authenticated cookie persistence failed (exception_type=%s category=sqlite_busy)",
+                        type(exc).__name__,
+                    )
+                    return False
+                log.warning(
+                    "Authenticated cookie persistence retry %d/%d (exception_type=%s category=sqlite_busy)",
+                    attempt + 1,
+                    _COOKIE_SAVE_MAX_ATTEMPTS - 1,
+                    type(exc).__name__,
+                )
+                time.sleep(_COOKIE_SAVE_BACKOFF_SECONDS[attempt])
+            except PermissionError as exc:
+                # SettingsStore deliberately locks values supplied by an
+                # explicit DOUYIN_COOKIE environment override.  Keep this
+                # distinction visible to operators without exposing cookie
+                # contents; retrying cannot make a read-only setting writable.
+                category = "environment_override" if "read-only" in str(exc).lower() else "filesystem_permission"
                 log.error(
-                    "Authenticated cookie persistence failed (exception_type=%s category=sqlite_operational)",
+                    "Authenticated cookie persistence failed (exception_type=%s category=%s)",
+                    type(exc).__name__, category,
+                )
+                return False
+            except Exception as exc:
+                log.error(
+                    "Authenticated cookie persistence failed (exception_type=%s category=unexpected)",
                     type(exc).__name__,
                 )
                 return False
-            if attempt + 1 >= _COOKIE_SAVE_MAX_ATTEMPTS:
-                log.error(
-                    "Authenticated cookie persistence failed (exception_type=%s category=sqlite_busy)",
-                    type(exc).__name__,
-                )
-                return False
-            log.warning(
-                "Authenticated cookie persistence retry %d/%d (exception_type=%s category=sqlite_busy)",
-                attempt + 1,
-                _COOKIE_SAVE_MAX_ATTEMPTS - 1,
-                type(exc).__name__,
-            )
-            time.sleep(_COOKIE_SAVE_BACKOFF_SECONDS[attempt])
-        except Exception as exc:
-            log.error(
-                "Authenticated cookie persistence failed (exception_type=%s category=unexpected)",
-                type(exc).__name__,
-            )
-            return False
     return False
 
 
