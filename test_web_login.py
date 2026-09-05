@@ -161,6 +161,21 @@ def test_cookie_save_permanent_failure_is_redacted(monkeypatch, caplog):
     assert "category=sqlite_operational" in caplog.text or "category=sqlite_busy" in caplog.text
 
 
+def test_cookie_save_reports_environment_override_without_secret(monkeypatch, caplog):
+    cookie = "sessionid=permission-secret"
+
+    class LockedSettings:
+        def apply(self, changes):
+            raise PermissionError("setting is read-only: douyin.cookie")
+
+    monkeypatch.setattr(web_login, "_settings", LockedSettings())
+    with caplog.at_level("ERROR", logger="web_login"):
+        assert web_login._persist_authenticated_cookie(cookie) is False
+
+    assert "category=environment_override" in caplog.text
+    assert cookie not in caplog.text
+
+
 def test_qr_response_is_not_cacheable(monkeypatch, tmp_path):
     monkeypatch.setattr(web_login, "_get_profile_dir", lambda: tmp_path)
     monkeypatch.setattr(web_login, "screenshot_qr_code", lambda _: ("base64", "ok"))
