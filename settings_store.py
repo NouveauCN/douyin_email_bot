@@ -640,6 +640,27 @@ class SettingsStore:
             request_restart=False,
         )["revision"]
 
+    def apply_douyin_identity(self, cookie: str, user_agent: str) -> int:
+        """Atomically persist Web Login cookie and its browser UA.
+
+        The UA is an internal value and intentionally is not registered as a
+        user-editable setting, so ordinary Settings PATCH cannot write it.
+        """
+        if not isinstance(user_agent, str) or not user_agent or len(user_agent) > 1024:
+            raise ValueError("invalid browser user agent")
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in user_agent):
+            raise ValueError("invalid browser user agent")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = int(db.execute("SELECT value FROM metadata WHERE key='revision'").fetchone()[0])
+            now = time.time()
+            for key, value in (("douyin.cookie", cookie), ("douyin.user_agent", user_agent)):
+                db.execute("INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at", (key, json.dumps(value), now))
+            revision = current + 1
+            db.execute("UPDATE metadata SET value=? WHERE key='revision'", (str(revision),))
+            db.commit()
+        return revision
+
     def apply(self, changes: list[Mapping[str, Any]], base_revision: int | None = None) -> int:
         """Apply browser-style ``[{key, action, value?}]`` changes.
 
@@ -884,8 +905,8 @@ class SettingsStore:
                     # fallback rules when constructing AppConfig.
                     pass
             result[key] = {
-                "value": None if definition.secret else value,
-                "configured": bool(value) if definition.secret else value is not None,
+                "value": None if definition.secret or key == "douyin.user_agent" else value,
+                "configured": bool(value) if definition.secret or key == "douyin.user_agent" else value is not None,
                 "source": source,
                 "editable": definition.editable and not (definition.env and os.getenv(definition.env) is not None),
                 "apply_mode": definition.apply_mode,

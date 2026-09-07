@@ -138,6 +138,41 @@ class DouyinDownloadTests(unittest.IsolatedAsyncioTestCase):
         finally:
             douyin_downloader._CURRENT_MS_TOKEN.reset(reset)
 
+    def test_request_model_uses_paired_identity_and_nested_context_restores(self):
+        from f2.apps.douyin.model import PostDetail
+
+        previous_identity = douyin_downloader.identity_snapshot()
+        douyin_downloader.update_identity(
+            "sessionid=outer; msToken=outer-token",
+            "Mozilla/5.0 Firefox/120.0",
+        )
+        cookie, user_agent = douyin_downloader.identity_snapshot()
+        outer = douyin_downloader._configure_f2_request_identity(cookie, user_agent)
+        try:
+            request = PostDetail(aweme_id="outer")
+            assert request.msToken == "outer-token"
+            assert request.browser_name == "Firefox"
+            assert request.browser_version == "120.0"
+
+            inner = douyin_downloader._configure_f2_request_identity(
+                "sessionid=inner; msToken=inner-token",
+                "Mozilla/5.0 Firefox/121.0",
+            )
+            try:
+                request = PostDetail(aweme_id="inner")
+                assert request.msToken == "inner-token"
+                assert request.browser_name == "Firefox"
+                assert request.browser_version == "121.0"
+            finally:
+                douyin_downloader._reset_f2_request_identity(inner)
+
+            request = PostDetail(aweme_id="restored")
+            assert request.msToken == "outer-token"
+            assert request.browser_version == "120.0"
+        finally:
+            douyin_downloader._reset_f2_request_identity(outer)
+            douyin_downloader.update_identity(*previous_identity)
+
     async def test_mstoken_is_task_local(self):
         from f2.apps.douyin.model import PostDetail
 

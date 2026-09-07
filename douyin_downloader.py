@@ -13,6 +13,7 @@ import os
 import re
 import stat
 import tempfile
+import threading
 from contextvars import ContextVar
 from collections.abc import Mapping
 from datetime import datetime
@@ -42,6 +43,23 @@ from media_file_lock import media_file_lock
 logger = logging.getLogger("DouyinDownloader")
 
 _DOUYIN_USER_AGENT = firefox_user_agent()
+_IDENTITY_LOCK = threading.RLock()
+_IDENTITY_COOKIE = ""
+_IDENTITY_USER_AGENT = _DOUYIN_USER_AGENT
+
+
+def update_identity(cookie: str | None, user_agent: str | None = None) -> None:
+    """Atomically replace the cookie/UA pair used by new downloads."""
+    global _IDENTITY_COOKIE, _IDENTITY_USER_AGENT, _DOUYIN_USER_AGENT
+    with _IDENTITY_LOCK:
+        _IDENTITY_COOKIE = "" if cookie is None else str(cookie)
+        _IDENTITY_USER_AGENT = str(user_agent or firefox_user_agent())
+        _DOUYIN_USER_AGENT = _IDENTITY_USER_AGENT
+
+
+def identity_snapshot() -> tuple[str, str]:
+    with _IDENTITY_LOCK:
+        return _IDENTITY_COOKIE, _IDENTITY_USER_AGENT
 
 DOUYIN_SHORT_RE = re.compile(r"^https://v\.douyin\.com/([A-Za-z0-9_-]+)/?$")
 DOUYIN_SHORT_PATH_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -108,7 +126,7 @@ def _cookie_value(cookie: str, name: str) -> str | None:
     return None
 
 
-def _configure_f2_request_identity(cookie: str):
+def _configure_f2_request_identity(cookie: str, user_agent: str | None = None):
     """Make F2's already-imported Pydantic request model use this session.
 
     F2 evaluates BaseRequestModel defaults at module import time.  Updating the
@@ -117,6 +135,7 @@ def _configure_f2_request_identity(cookie: str):
     """
     token = _cookie_value(cookie, "msToken")
     reset_token = _CURRENT_MS_TOKEN.set(token)
+    reset_ua = _CURRENT_USER_AGENT.set(user_agent or _DOUYIN_USER_AGENT)
     try:
         from f2.apps.douyin.model import BaseRequestModel
         if not getattr(BaseRequestModel, "_douyin_email_bot_mstoken_patch", False):
@@ -126,20 +145,46 @@ def _configure_f2_request_identity(cookie: str):
                 token = _CURRENT_MS_TOKEN.get()
                 if token:
                     data.setdefault("msToken", token)
+                else:
+                    try:
+                        from f2.utils import TokenManager
+                        data.setdefault("msToken", TokenManager.gen_real_msToken())
+                    except Exception:
+                        # F2's Pydantic field is a string; use its documented
+                        # false sentinel without retaining a prior token.
+                        data.setdefault("msToken", "false")
+                ua = _CURRENT_USER_AGENT.get()
+                if ua:
+                    match = re.search(r"Firefox/(\d+(?:\.\d+)*)", ua)
+                    data.setdefault("browser_name", "Firefox" if match else "Firefox")
+                    if match:
+                        data.setdefault("browser_version", match.group(1))
                 original_init(self, **data)
 
             BaseRequestModel.__init__ = init_with_session_token
             BaseRequestModel._douyin_email_bot_mstoken_patch = True
+        _IDENTITY_RESETS[id(reset_token)] = reset_ua
         return reset_token
     except (ImportError, AttributeError, TypeError):
         logger.debug("Unable to bind current msToken to F2 request model", exc_info=True)
         _CURRENT_MS_TOKEN.reset(reset_token)
+        _CURRENT_USER_AGENT.reset(reset_ua)
         return None
 
 
 _CURRENT_MS_TOKEN: ContextVar[str | None] = ContextVar(
     "douyin_ms_token", default=None,
 )
+_CURRENT_USER_AGENT: ContextVar[str | None] = ContextVar("douyin_user_agent", default=None)
+_IDENTITY_RESETS: dict[int, object] = {}
+
+
+def _reset_f2_request_identity(token) -> None:
+    """Restore both request identity context variables for nested callers."""
+    ua_token = _IDENTITY_RESETS.pop(id(token), None)
+    _CURRENT_MS_TOKEN.reset(token)
+    if ua_token is not None:
+        _CURRENT_USER_AGENT.reset(ua_token)
 
 
 class DouyinDownloader:
@@ -150,6 +195,7 @@ class DouyinDownloader:
 
     def __init__(self, config):
         self.config = config
+        update_identity(getattr(config, "cookie", ""), getattr(config, "user_agent", ""))
 
     def download(self, url: str) -> dict:
         """Download a single Douyin video from a share link.
@@ -187,13 +233,14 @@ class DouyinDownloader:
         download_dir = Path(self.config.download_path)
         download_dir.mkdir(parents=True, exist_ok=True)
 
+        cookie, user_agent = identity_snapshot()
         kwargs = {
             "url": url,
-            "cookie": self.config.cookie,
+            "cookie": cookie,
             "timeout": self.config.timeout,
             "max_retries": self.config.max_retries,
             "proxies": {},
-            "headers": {"User-Agent": _DOUYIN_USER_AGENT},
+            "headers": {"User-Agent": user_agent},
         }
 
         try:
@@ -230,12 +277,12 @@ class DouyinDownloader:
     async def _download_async(self, kwargs: dict, download_dir: Path) -> dict:
         """Fetch metadata via F2, then download directly via httpx."""
 
-        token_reset = _configure_f2_request_identity(kwargs.get("cookie", ""))
+        token_reset = _configure_f2_request_identity(kwargs.get("cookie", ""), kwargs.get("headers", {}).get("User-Agent"))
         try:
             return await self._download_async_bound(kwargs, download_dir)
         finally:
             if token_reset is not None:
-                _CURRENT_MS_TOKEN.reset(token_reset)
+                _reset_f2_request_identity(token_reset)
 
     async def _download_async_bound(self, kwargs: dict, download_dir: Path) -> dict:
         """Implementation separated so the request token is always reset."""

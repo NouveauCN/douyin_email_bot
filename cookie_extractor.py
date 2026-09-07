@@ -308,6 +308,7 @@ def screenshot_qr_code(
                 viewport={"width": 1280, "height": 720},
             )
             page = browser.pages[0] if browser.pages else browser.new_page()
+            user_agent = ""
 
             try:
                 page.goto(
@@ -373,6 +374,7 @@ def check_auth_cookies(profile_dir: Path) -> dict:
             )
             page = browser.pages[0] if browser.pages else browser.new_page()
 
+            user_agent = ""
             navigation_failed = False
             navigation_status = None
             try:
@@ -389,6 +391,10 @@ def check_auth_cookies(profile_dir: Path) -> dict:
                 navigation_status = getattr(response, "status", None)
                 if not isinstance(navigation_status, int) or navigation_status >= 400:
                     navigation_failed = True
+                try:
+                    user_agent = str(page.evaluate("() => navigator.userAgent") or "")
+                except Exception:
+                    pass
             except Exception as exc:
                 # Do not infer a logged-in state from stale profile cookies
                 # when the page could not be reached.  In particular, this
@@ -440,6 +446,7 @@ def check_auth_cookies(profile_dir: Path) -> dict:
                 "status": "logged_in",
                 "cookie_str": cookie_str,
                 "auth_count": len(auth_found),
+                "user_agent": user_agent,
                 "message": f"检测到登录态: {', '.join(auth_found[:3])}",
             }
 

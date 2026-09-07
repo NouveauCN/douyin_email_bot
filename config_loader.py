@@ -159,6 +159,7 @@ class DouyinConfig:
 
     download_path: str = "./downloads"
     cookie: str = ""       # From DOUYIN_COOKIE env var
+    user_agent: str = ""   # Internal Web Login browser identity
     naming: str = "{create}_{aweme_id}"
     folderize: bool = True
     timeout: int = 30
@@ -290,6 +291,7 @@ def load_config(path: Path) -> AppConfig:
     douyin = DouyinConfig(
         download_path=str(_dl_path.resolve()),
         cookie=_setting_value("douyin.cookie", "DOUYIN_COOKIE", managed, dotenv, douyin_raw.get("cookie"), ""),
+        user_agent=str(managed.get("douyin.user_agent", "") or ""),
         naming=_setting_value("douyin.naming", "DOUYIN_NAMING", managed, dotenv, douyin_raw.get("naming"), "{create}_{aweme_id}"),
         folderize=_as_bool(_setting_value("douyin.folderize", "DOUYIN_FOLDERIZE", managed, dotenv, douyin_raw.get("folderize"), True), True),
         timeout=_env_int("DOUYIN_TIMEOUT", int(_setting_value("douyin.timeout", "DOUYIN_TIMEOUT", managed, dotenv, douyin_raw.get("timeout"), 30))),
