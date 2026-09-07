@@ -119,6 +119,28 @@ def test_secret_values_are_never_in_snapshot_or_public_managed_values(tmp_path):
     assert "douyin.cookie" not in store.managed_values(include_secrets=False)
 
 
+def test_douyin_identity_is_atomic_and_user_agent_is_not_public_or_patchable(tmp_path):
+    store = SettingsStore(tmp_path / "settings.sqlite3")
+
+    revision = store.apply_douyin_identity(
+        "sessionid=identity-cookie",
+        "Mozilla/5.0 Firefox/153.0",
+    )
+
+    assert revision == 1
+    assert store.get_revision() == revision
+    assert store.get("douyin.cookie") == "sessionid=identity-cookie"
+    assert store.get("douyin.user_agent") == "Mozilla/5.0 Firefox/153.0"
+    assert store.snapshot()["douyin.cookie"]["configured"] is True
+    assert "douyin.user_agent" not in store.snapshot()
+    assert "Mozilla/5.0 Firefox/153.0" not in repr(store.snapshot())
+
+    with pytest.raises((KeyError, ValueError)):
+        store.apply_changes({"douyin.user_agent": "spoofed"}, revision)
+    assert store.get("douyin.user_agent") == "Mozilla/5.0 Firefox/153.0"
+    assert store.get_revision() == revision
+
+
 def test_resource_limits_cover_strings_secrets_and_allowlist(tmp_path):
     store = SettingsStore(tmp_path / "settings.sqlite3")
     with pytest.raises(ValueError, match="too long"):

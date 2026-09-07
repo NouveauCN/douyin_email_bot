@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import web_login
+from settings_store import SettingsStore
 
 
 SAME_ORIGIN_HEADERS = {"Origin": "http://localhost"}
@@ -142,6 +143,27 @@ def test_cookie_save_retries_transient_sqlite_contention(monkeypatch):
     assert len(calls) == 3
     assert sleeps == [0.05, 0.1]
     assert calls[-1][0]["value"] == cookie
+
+
+def test_real_settings_store_rejects_cookie_only_identity_save(monkeypatch, tmp_path):
+    store = SettingsStore(tmp_path / "settings.sqlite3")
+    monkeypatch.setattr(web_login, "_settings", store)
+
+    assert web_login._persist_authenticated_cookie("sessionid=without-ua") is False
+    assert store.get("douyin.cookie") is None
+    assert store.get("douyin.user_agent") is None
+    assert store.get_revision() == 0
+
+
+def test_real_settings_store_saves_cookie_and_user_agent_as_one_identity(monkeypatch, tmp_path):
+    store = SettingsStore(tmp_path / "settings.sqlite3")
+    monkeypatch.setattr(web_login, "_settings", store)
+    user_agent = "Mozilla/5.0 (X11; Linux x86_64) Firefox/153.0"
+
+    assert web_login._persist_authenticated_cookie("sessionid=paired", user_agent) is True
+    assert store.get("douyin.cookie") == "sessionid=paired"
+    assert store.get("douyin.user_agent") == user_agent
+    assert store.get_revision() == 1
 
 
 def test_cookie_save_permanent_failure_is_redacted(monkeypatch, caplog):

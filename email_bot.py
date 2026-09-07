@@ -844,7 +844,7 @@ class EmailBot:
         changed = {key for key in changed if current.get(key) != self._managed_settings.get(key)}
         self._managed_settings = current
         self._settings_revision = revision
-        if changed and changed <= {"douyin.cookie"}:
+        if changed and changed <= {"douyin.cookie", "douyin.user_agent"}:
             # Resolve the complete effective config so reset (which removes
             # the managed override) follows the same legacy env/YAML/default
             # precedence as startup.  A managed clear remains an explicit
@@ -852,7 +852,7 @@ class EmailBot:
             from config_loader import load_config
 
             effective = load_config(self._project_dir / "config.yaml")
-            self._hot_reload_cookie(effective.douyin.cookie)
+            self._hot_reload_identity(effective.douyin.cookie, effective.douyin.user_agent)
             return
         if changed:
             logger.info("Managed settings changed (%s); waiting for restart request", ", ".join(sorted(changed)))
@@ -862,6 +862,16 @@ class EmailBot:
         with self._cookie_lock:
             self.downloader.config.cookie = cookie
         logger.info("Hot-reloaded DOUYIN_COOKIE (%d chars)", len(cookie))
+
+    def _hot_reload_identity(self, cookie, user_agent) -> None:
+        from douyin_downloader import update_identity
+        cookie = "" if cookie is None else str(cookie)
+        ua = "" if user_agent is None else str(user_agent)
+        with self._cookie_lock:
+            self.downloader.config.cookie = cookie
+            self.downloader.config.user_agent = ua
+            update_identity(cookie, ua)
+        logger.info("Hot-reloaded Douyin browser identity (cookie=%d chars, ua_configured=%s)", len(cookie), bool(ua))
 
     def _claim_restart_request(self, revision: int) -> dict | None:
         """Atomically claim one queued request, avoiding duplicate drains."""

@@ -72,6 +72,15 @@ _COOKIE_SAVE_BACKOFF_SECONDS = (0.05, 0.1, 0.2)
 _cookie_save_lock = threading.Lock()
 
 
+def _sanitize_user_agent(value) -> str | None:
+    """Accept only a plausible browser UA obtained from navigator."""
+    if not isinstance(value, str) or not value or len(value) > 1024:
+        return None
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        return None
+    return value.strip() if len(value.strip()) >= 16 else None
+
+
 class RemoteBrowserError(RuntimeError):
     """A safe, user-facing browser-controller error."""
 
@@ -329,6 +338,20 @@ class RemoteBrowserSession:
             auth_count = sum(1 for c in selected if c.get("name") in _AUTH_COOKIE_NAMES)
             return cookie_str, auth_count
 
+    def identity(self, owner: str) -> tuple[str | None, str | None, int]:
+        with _browser_lock:
+            def read_identity():
+                if self._context is None or self._owner != owner:
+                    raise RemoteBrowserError("远程桌面未启动或已被锁定")
+                page = self._page_locked(owner)
+                all_cookies = self._context.cookies()
+                selected = [c for c in all_cookies if (str(c.get("domain", "")).lstrip(".").lower() == "douyin.com" or str(c.get("domain", "")).lstrip(".").lower().endswith(".douyin.com"))]
+                cookie = "; ".join(f"{c.get('name', '')}={c.get('value', '')}" for c in selected if c.get("name")) or None
+                auth_count = sum(1 for c in selected if c.get("name") in _AUTH_COOKIE_NAMES)
+                ua = page.evaluate("() => navigator.userAgent")
+                return cookie, _sanitize_user_agent(ua), auth_count
+            return self._call(read_identity)
+
 
 _remote_browser = RemoteBrowserSession()
 
@@ -568,21 +591,32 @@ def _desktop_failure(exc: RemoteBrowserError, status: int = 409):
     return _desktop_response({"success": False, "message": str(exc)}, status)
 
 
-def _persist_authenticated_cookie(cookie_str: str) -> bool:
+def _persist_authenticated_cookie(cookie_str: str, user_agent: str | None = None) -> bool:
     """Persist a validated cookie, retrying only transient SQLite contention.
 
     The cookie is intentionally never included in logs or exception responses.
     The settings database is also written by the bot, so a short busy/locked
     window is expected while both processes commit their changes.
     """
+    ua = _sanitize_user_agent(user_agent)
     changes = [{"key": "douyin.cookie", "action": "set", "value": cookie_str}]
+    # Once the managed store supports paired identity writes, never fall back
+    # to a cookie-only commit: that would leave the bot with mismatched
+    # browser fingerprints.  The fallback exists only for old test/deployment
+    # doubles which predate the paired store API.
+    if callable(getattr(_settings, "apply_douyin_identity", None)) and not ua:
+        log.error("Authenticated cookie persistence rejected: browser user agent unavailable")
+        return False
     # /api/status and /api/desktop/save can observe the same authenticated
     # browser at once.  Serialize those writes before relying on SQLite's
     # busy timeout; this also makes the revision/reload signal deterministic.
     with _cookie_save_lock:
         for attempt in range(_COOKIE_SAVE_MAX_ATTEMPTS):
             try:
-                revision = _settings.apply(changes)
+                if ua and callable(getattr(_settings, "apply_douyin_identity", None)):
+                    revision = _settings.apply_douyin_identity(cookie_str, ua)
+                else:
+                    revision = _settings.apply(changes)
                 if isinstance(revision, int):
                     log.info("Authenticated cookie persisted to managed settings (revision=%d)", revision)
                 else:
@@ -746,13 +780,19 @@ def api_desktop_reload():
 def api_desktop_save():
     try:
         owner = _desktop_owner()
-        cookie_str, auth_count = _remote_browser.cookies(owner)
+        if callable(getattr(_remote_browser, "identity", None)):
+            cookie_str, user_agent, auth_count = _remote_browser.identity(owner)
+            if cookie_str and not user_agent:
+                return _desktop_response({"success": False, "status": "failure", "auth_count": auth_count, "message": "无法验证浏览器身份，请重试"}, 409)
+        else:
+            cookie_str, auth_count = _remote_browser.cookies(owner)
+            user_agent = None
         if not cookie_str:
             return _desktop_response({"success": False, "status": "pending", "auth_count": 0, "message": "尚未检测到抖音登录状态"}, 409)
         grade, is_authenticated = _assess_quality(cookie_str)
         if not is_authenticated:
             return _desktop_response({"success": False, "status": "pending", "auth_count": auth_count, "message": f"尚未检测到完整登录状态（{grade}）"}, 409)
-        if not _persist_authenticated_cookie(cookie_str):
+        if not _persist_authenticated_cookie(cookie_str, user_agent):
             return _desktop_response({"success": False, "message": "Cookie 保存失败，请稍后重试"}, 500)
         log.info("Remote login cookie saved (%d auth tokens)", auth_count)
         return _desktop_response({"success": True, "status": "logged_in", "auth_count": auth_count, "message": f"登录状态已保存（{grade}）"})
@@ -803,13 +843,19 @@ def api_status():
     owner = session.get("web_login_owner")
     if isinstance(owner, str) and _remote_browser.active_for(owner):
         try:
-            cookie_str, auth_count = _remote_browser.cookies(owner)
+            if callable(getattr(_remote_browser, "identity", None)):
+                cookie_str, user_agent, auth_count = _remote_browser.identity(owner)
+                if cookie_str and not user_agent:
+                    return _desktop_response({"status": "failure", "auth_count": auth_count, "message": "无法验证浏览器身份，请重试"}, 409)
+            else:
+                cookie_str, auth_count = _remote_browser.cookies(owner)
+                user_agent = None
         except RemoteBrowserError as exc:
             return _desktop_failure(exc)
         if cookie_str:
             grade, is_authenticated = _assess_quality(cookie_str)
             if is_authenticated:
-                if not _persist_authenticated_cookie(cookie_str):
+                if not _persist_authenticated_cookie(cookie_str, user_agent):
                     return _desktop_response({"status": "failure", "auth_count": auth_count, "message": "Cookie 保存失败，请稍后重试"}, 500)
                 return _desktop_response({"status": "logged_in", "auth_count": auth_count, "message": f"登录状态已检测并保存（{grade}）"})
         return _desktop_response({"status": "pending", "auth_count": auth_count, "message": "等待扫码或登录"})
@@ -817,7 +863,8 @@ def api_status():
     with _browser_lock:
         result = check_auth_cookies(profile_dir)
 
-    cookie_str = result.get("cookie_str")
+        cookie_str = result.get("cookie_str")
+        user_agent = _sanitize_user_agent(result.get("user_agent"))
     if result.get("status") == "logged_in" and cookie_str:
         # Validate cookie quality before saving
         grade, _ = _assess_quality(cookie_str)
@@ -825,7 +872,7 @@ def api_status():
 
         # Persist only after quality validation. Do not put the cookie in the
         # process environment: it would hide later managed-store updates.
-        if not _persist_authenticated_cookie(cookie_str):
+        if not _persist_authenticated_cookie(cookie_str, user_agent):
             # Never include the cookie or the storage exception in a response
             # or log line.  The browser can retry after the operator fixes the
             # environment override or runtime database.
