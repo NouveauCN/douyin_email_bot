@@ -272,6 +272,7 @@ class DouyinDownloadTests(unittest.IsolatedAsyncioTestCase):
         locations = (
             "https://douyin.com/video/1234567890",
             "https://www.douyin.com/note/1234567891/?region=cn",
+            "https://www.douyin.com/share/slides/1234567895",
             "https://m.douyin.com/share/video/1234567892",
             "https://www.douyin.com/share/note/1234567893/",
             "https://www.iesdouyin.com/share/note/1234567894/",

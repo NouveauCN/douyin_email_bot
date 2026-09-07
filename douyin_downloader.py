@@ -45,8 +45,8 @@ _DOUYIN_USER_AGENT = firefox_user_agent()
 
 DOUYIN_SHORT_RE = re.compile(r"^https://v\.douyin\.com/([A-Za-z0-9_-]+)/?$")
 DOUYIN_SHORT_PATH_RE = re.compile(r"^[A-Za-z0-9_-]+$")
-DOUYIN_AWEME_ID_RE = re.compile(r"/(?:share/)?(?:video|note)/(\d+)")
-DOUYIN_AWEME_PATH_RE = re.compile(r"^/(?:share/)?(?:video|note)/(\d+)/?$")
+DOUYIN_AWEME_ID_RE = re.compile(r"/(?:share/)?(?:video|note|slides)/(\d+)")
+DOUYIN_AWEME_PATH_RE = re.compile(r"^/(?:share/)?(?:video|note|slides)/(\d+)/?$")
 _DOUYIN_REDIRECT_HOSTS = frozenset({
     "douyin.com",
     "www.douyin.com",
@@ -771,7 +771,7 @@ async def _resolve_short_link(path: str, headers: dict) -> str:
     """Resolve a Douyin short link over verified HTTPS only.
 
     The redirect is deliberately not followed automatically: only a known
-    Douyin host and the exact video/note path shape are accepted and cached.
+    Douyin host and the exact video/note/slides path shape are accepted and cached.
     A private CA may be supplied explicitly with ``DOUYIN_SHORT_LINK_CA_BUNDLE``.
     """
     if not DOUYIN_SHORT_PATH_RE.fullmatch(path):
