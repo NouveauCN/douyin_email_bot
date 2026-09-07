@@ -5,9 +5,12 @@ import re
 import shutil
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
 from colorama import Fore, Style
+import httpx
 
 from media_file_lock import MediaFileLockBusy, media_file_lock
 from media_processor import log_process_result, process_media
@@ -18,6 +21,10 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _TITLE_RE = re.compile(r"《([^》]+)》")
 _MEDIA_EXTS = {".mp4", ".mkv", ".mov"}
 _COVER_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+_VIDEO_ID_RE = re.compile(r"(?:/video/(BV[0-9A-Za-z]+|av[0-9]+)|[?&](?:bvid|aid)=(BV[0-9A-Za-z]+|[0-9]+))")
+_AUTHOR_MAX_LENGTH = 50
+_B23_HOSTS = {"b23.tv", "www.b23.tv"}
+_BILIBILI_HOSTS = {"bilibili.com", "www.bilibili.com"}
 
 
 class BilibiliDownloader:
@@ -89,6 +96,15 @@ class BilibiliDownloader:
 
         covers = _move_cover_files(download_dir, started_at)
         files = _collect_downloaded_files(download_dir, started_at)
+        video_id = _extract_video_id(url)
+        author, _ = _fetch_bilibili_metadata(video_id)
+        files = _rename_downloaded_files(
+            files,
+            download_dir,
+            video_id or "unknown",
+            author,
+            _download_timestamp(started_at),
+        )
         _process_downloaded_media([*files, *covers], shared_root)
         filepath = _format_file_result(files, download_dir)
         title = _extract_title(output) or "Bilibili Video"
@@ -172,6 +188,125 @@ def _extract_title(output: str) -> str | None:
     if match:
         return match.group(1).strip()
     return None
+
+
+def _extract_video_id(url: str) -> str | None:
+    """Extract the stable BV/av identifier without depending on yutto output."""
+    value = _extract_video_id_from_url(url)
+    if value:
+        return value
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in _B23_HOSTS:
+        return None
+    try:
+        resolved = _resolve_b23_url(url)
+    except Exception as exc:
+        logger.info("Bilibili short-link resolution unavailable: %s", exc)
+        return None
+    return _extract_video_id_from_url(resolved) if resolved else None
+
+
+def _extract_video_id_from_url(url: str) -> str | None:
+    match = _VIDEO_ID_RE.search(url)
+    if not match:
+        return None
+    value = next((group for group in match.groups() if group), "")
+    if value.startswith("BV"):
+        return value
+    return f"av{value}" if value.isdigit() else value
+
+
+def _resolve_b23_url(url: str) -> str | None:
+    """Resolve a b23.tv link through a tiny, HTTPS-only redirect budget."""
+    current = url
+    for _ in range(3):
+        parsed = urlparse(current)
+        if parsed.scheme != "https" or parsed.hostname not in (_B23_HOSTS | _BILIBILI_HOSTS):
+            return None
+        if parsed.hostname in _BILIBILI_HOSTS:
+            return current
+        response = httpx.get(
+            current,
+            headers={"User-Agent": "Mozilla/5.0"},
+            follow_redirects=False,
+            timeout=10,
+        )
+        if response.status_code not in {301, 302, 303, 307, 308}:
+            return current
+        location = response.headers.get("location")
+        if not location:
+            return None
+        current = urljoin(current, location)
+    return None
+
+
+def _fetch_bilibili_metadata(video_id: str | None) -> tuple[str, None]:
+    """Best-effort author lookup; metadata must not affect download success."""
+    if not video_id:
+        return "Bilibili", None
+    params = {"bvid": video_id} if video_id.startswith("BV") else {"aid": video_id[2:]}
+    try:
+        response = httpx.get(
+            "https://api.bilibili.com/x/web-interface/view",
+            params=params,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            return "Bilibili", None
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return "Bilibili", None
+        owner = data.get("owner")
+        if not isinstance(owner, dict):
+            return "Bilibili", None
+        author = _sanitize_author(owner.get("name"))
+        return author or "Bilibili", None
+    except Exception as exc:
+        logger.info("Bilibili metadata unavailable for %s: %s", video_id, exc)
+        return "Bilibili", None
+
+
+def _sanitize_author(name: object) -> str:
+    """Match Douyin's filename sanitization and author length limit."""
+    if not isinstance(name, str):
+        return ""
+    value = name
+    unsafe = r'<>:"/\\|?*'
+    for char in unsafe:
+        value = value.replace(char, "_")
+    return value.strip()[:_AUTHOR_MAX_LENGTH]
+
+
+def _download_timestamp(timestamp: float | None = None) -> str:
+    moment = datetime.now() if timestamp is None else datetime.fromtimestamp(timestamp)
+    return moment.strftime("%Y%m%d_%H%M%S")
+
+
+def _rename_downloaded_files(
+    files: list[Path], download_dir: Path, video_id: str, author: str,
+    timestamp: str,
+) -> list[Path]:
+    """Publish only this yutto invocation's videos under the Douyin layout."""
+    if not files:
+        return files
+    author_dir = _sanitize_author(author) or "Bilibili"
+    target_dir = download_dir / author_dir
+    target_dir.mkdir(parents=True, exist_ok=True)
+    multiple = len(files) > 1
+    renamed: list[Path] = []
+    for index, source in enumerate(files, start=1):
+        if not source.exists():
+            # Keeps unit-test doubles and an already-published path harmless.
+            renamed.append(source)
+            continue
+        part = f"_P{index:02d}" if multiple else ""
+        target = _unique_path(target_dir / f"{timestamp}_{video_id}{part}.mp4")
+        source.replace(target)
+        renamed.append(target)
+    return renamed
 
 
 def _summarize_yutto_error(output: str) -> str:
