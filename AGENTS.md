@@ -220,6 +220,16 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   media processor without changing `files`, `covers`, or count metadata.
 - One URL may return multiple files. Preserve `files` and `file_count` metadata
   and useful single- and multi-file email replies.
+- Publish newly downloaded videos as
+  `<bilibili_download_path>/<author>/<YYYYMMDD_HHMMSS>_<BV-or-av>.mp4`, using
+  the yutto start time (not the video's publication time) and the same author
+  sanitization/50-character limit as Douyin. Multiple P parts use `_P01`,
+  `_P02`, etc.; existing targets are never overwritten.
+- Resolve supported `b23.tv` short links only over bounded HTTPS redirects to
+  approved Bilibili hosts. Short-link resolution and public author metadata
+  lookup are best-effort: timeout, malformed/untrusted redirects, unknown IDs,
+  bad JSON, or API failures must fall back to `Bilibili` and the start-time
+  filename without turning a successful yutto download into a failure.
 
 ### Media post-processing
 
