@@ -42,6 +42,7 @@ from f2_bootstrap import firefox_user_agent
 
 from media_processor import log_process_result, process_media
 from media_file_lock import media_file_lock
+import playwright_douyin_fetcher as _pw_fetcher
 
 logger = logging.getLogger("DouyinDownloader")
 
@@ -64,6 +65,52 @@ def identity_snapshot() -> tuple[str, str]:
     with _IDENTITY_LOCK:
         return _IDENTITY_COOKIE, _IDENTITY_USER_AGENT
 
+
+class _PlaywrightVideoData:
+    """Mimics F2's PostDetailFilter interface using Playwright-fetched raw JSON.
+
+    Provides ``_to_raw()`` and ``_to_dict()`` so downstream code that expects
+    a PostDetailFilter-like object can work without changes.
+    """
+
+    def __init__(self, raw_response: dict):
+        self._raw = raw_response
+        self._detail = raw_response.get("aweme_detail") or {}
+
+    def _to_raw(self) -> dict:
+        return self._raw
+
+    def _to_dict(self) -> dict:
+        detail = self._detail
+        if not detail:
+            return {}
+        video = detail.get("video") or {}
+        images = detail.get("images") or []
+        author = detail.get("author") or {}
+        return {
+            "aweme_id": str(detail.get("aweme_id") or ""),
+            "aweme_type": str(detail.get("aweme_type") or ""),
+            "media_type": detail.get("media_type", -1),
+            "desc": detail.get("desc") or "",
+            "nickname": author.get("nickname") or "",
+            "create_time": detail.get("create_time"),
+            "duration": detail.get("duration"),
+            "api_status_code": self._raw.get("status_code"),
+            "is_delete": detail.get("is_delete"),
+            "is_prohibited": detail.get("is_prohibited"),
+            "private_status": detail.get("private_status"),
+            "video_play_addr": video.get("play_addr", {}).get("url_list", []),
+            "video_bit_rate": video.get("bit_rate", []),
+            "images": images or [],
+            "images_video": [
+                img.get("video", {}).get("play_addr", {}).get("url_list", [])
+                for img in images if isinstance(img, dict)
+            ] if images else [],
+            "cover": (video.get("origin_cover") or {}).get("url_list", []),
+            "video_play_addr_h264": video.get("play_addr_h264", {}).get("url_list", []),
+        }
+
+
 DOUYIN_SHORT_RE = re.compile(r"^https://v\.douyin\.com/([A-Za-z0-9_-]+)/?$")
 DOUYIN_SHORT_PATH_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 DOUYIN_AWEME_ID_RE = re.compile(r"/(?:share/)?(?:video|note|slides)/(\d+)")
@@ -79,6 +126,26 @@ SHORT_LINK_CACHE_PATH = Path(
     or Path(__file__).parent / "logs" / "short_link_cache.json"
 )
 SHORT_LINK_CACHE_SCHEMA = "https-validated-v1"
+
+
+async def _playwright_fetch_video_data(
+    aweme_id: str,
+    cookie: str,
+    user_agent: str | None = None,
+) -> _PlaywrightVideoData | None:
+    """Fetch video metadata using the Playwright browser (a_bogus fallback)."""
+    try:
+        raw = await _pw_fetcher.fetch_aweme_detail(aweme_id, cookie, user_agent)
+    except Exception as exc:
+        logger.error("Playwright metadata fetch failed for %s: %s", aweme_id, exc)
+        return None
+    if raw is None:
+        return None
+    detail = raw.get("aweme_detail")
+    if not detail:
+        logger.warning("Playwright fetch returned no aweme_detail for %s", aweme_id)
+        return None
+    return _PlaywrightVideoData(raw)
 
 
 class DouyinAccessError(RuntimeError):
@@ -382,8 +449,27 @@ class DouyinDownloader:
         aweme_id = await _resolve_aweme_id(kwargs["url"])
         logger.debug("Resolved aweme_id: %s", aweme_id)
 
-        # Step 2: Fetch video metadata (works with document.cookie)
-        video_data = await handler.fetch_one_video(aweme_id)
+        # Step 2: Fetch video metadata — try F2 first, fall back to Playwright
+        # on a_bogus 403 (F2's algorithm is outdated).
+        video_data = None
+        try:
+            video_data = await handler.fetch_one_video(aweme_id)
+        except Exception as exc:
+            status = _api_status(exc)
+            if status == 403:
+                logger.warning(
+                    "F2 metadata fetch got 403 (likely stale a_bogus) for "
+                    "aweme_id=%s, falling back to Playwright browser fetch",
+                    aweme_id,
+                )
+                video_data = await _playwright_fetch_video_data(
+                    aweme_id, kwargs.get("cookie", ""),
+                    kwargs.get("headers", {}).get("User-Agent"),
+                )
+            else:
+                raise
+        if video_data is None:
+            raise APIResponseError("Failed to fetch metadata for " + aweme_id)
         data = video_data._to_dict()
 
         # Step 3: Select the best available video stream before deciding the
@@ -847,7 +933,21 @@ async def _validate_douyin_metadata_bound(
                 "path": "",
             })
             handler.enable_bark = False
-            data = (await handler.fetch_one_video(aweme_id))._to_dict()
+            try:
+                video_data = await handler.fetch_one_video(aweme_id)
+            except Exception as exc:
+                if _api_status(exc) == 403:
+                    logger.warning(
+                        "Validation: F2 got 403 for %s, trying Playwright", aweme_id,
+                    )
+                    video_data = await _playwright_fetch_video_data(
+                        aweme_id, cookie, user_agent,
+                    )
+                    if video_data is None:
+                        raise APINotFoundError("Playwright fallback also failed") from exc
+                else:
+                    raise
+            data = video_data._to_dict()
             if not isinstance(data, Mapping) or not data:
                 raise APINotFoundError("empty metadata")
             returned_id = str(data.get("aweme_id") or "")
