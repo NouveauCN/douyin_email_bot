@@ -262,13 +262,29 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
 - QR generation opens the Douyin login dialog, captures the complete viewport,
   and serializes Firefox access between QR and status requests.
 - QR status responses must never expose cookie contents to the browser and must
-  remain non-cacheable; successful cookies are persisted server-side only.
+  remain non-cacheable. Status checks detect login only; explicit work-link
+  verification is required before Web Login saves the identity server-side.
 - Keep auth-cookie indicators aligned between `cookie_extractor.py` and
   `douyin_downloader.py`.
 - `.env` update helpers currently write in place rather than atomically. Keep
   their formatting consistent and prefer a shared atomic implementation when
   changing them.
 - Web Login and `get_cookie.py` remain the only cookie acquisition entry points.
+- Web Login and CLI Cookie collection share filtering and token selection:
+  retain Douyin cookies and allow only a valid `msToken` from exact
+  `bytedance.com` (with or without its leading dot) as a fallback to a valid
+  Douyin-domain token. Never include other cookies from that fallback domain.
+- Remote-desktop saving requires a Douyin work URL and a bounded 15-second
+  metadata-only verification using the captured Cookie and Firefox User-Agent.
+  Only verification success may atomically replace the managed identity;
+  failures preserve the previous settings. Keep F2 bootstrap before validation
+  imports, restore request contexts, and never invoke media downloads or expose
+  secrets/raw provider request details during this check.
+- The standalone Web Login page reuses the embedded remote-desktop panel and
+  verified-save flow. Metadata validation bypasses synthetic token fallbacks,
+  disables Bark notifications, and bounds responses to 15 seconds with at most
+  two workers; a timed-out synchronous provider call retains its worker slot
+  until cleanup and cannot start a subsequent metadata request after expiry.
 
 ### Browser settings control plane
 

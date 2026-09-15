@@ -1,6 +1,6 @@
 # Architecture Contract
 
-Last reviewed: 2026-09-01
+Last reviewed: 2026-09-15
 
 The service is a lightweight modular monolith for one private deployment.
 Platform downloaders and the QQ transport are isolated, while task state and
@@ -61,6 +61,31 @@ state volume.  The optional Node gateway owns QQ SDK/session delivery state
 and communicates only through the authenticated bridge.  IMAP, SMTP, F2,
 HTTPX, yutto, Playwright, and FFmpeg are provider/process edges, not domain
 dependencies of the task contracts.
+
+### Douyin login identity verification
+
+Web Login and the Firefox CLI share Cookie collection. They retain Douyin
+cookies and may additionally extract only a valid `msToken` from the exact
+`bytedance.com` domain; other cookies from that domain are excluded. A valid
+Douyin-domain token takes precedence over that fallback.
+
+The remote desktop save action requires a Douyin work URL. Before changing
+runtime settings, the file-browser process verifies its metadata using the
+captured Cookie and Firefox User-Agent, with a 15-second response deadline.
+This calls the downloader's metadata-only boundary after F2 bootstrap, never
+the media download pipeline or the QQ bridge. Validation restores its request
+context and does not change the running downloader's identity.
+At most two validation workers may run. A synchronous provider call can outlive
+the response deadline; its worker retains its slot until cleanup and must not
+start a new metadata request after the deadline. Validation disables provider
+notifications and does not accept the bootstrap's synthetic-token fallback.
+
+Only successful metadata validation allows the Cookie and User-Agent to be
+saved atomically. Failures preserve the previous identity and return a safe
+error category; raw provider errors, request parameters, and secrets are not
+returned or logged. Existing settings revisions drive bot hot reload. A
+successful check establishes metadata access at that time, not guaranteed
+future media-CDN availability.
 
 ## Dependency and ownership rules
 

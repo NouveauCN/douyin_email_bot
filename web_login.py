@@ -44,8 +44,20 @@ from cookie_extractor import (  # noqa: E402
     _AUTH_COOKIE_NAMES,
     _assess_quality,
     check_auth_cookies,
+    collect_douyin_cookies,
     screenshot_qr_code,
 )
+
+
+def validate_douyin_metadata(url: str, cookie: str, user_agent: str, timeout: int = 15):
+    """Resolve and fetch one Douyin work without downloading media.
+
+    Kept as a small indirection so the login UI does not import downloader
+    code before F2 bootstrap and so tests can replace the network operation.
+    """
+    from douyin_downloader import validate_douyin_metadata as validator
+
+    return validator(url, cookie, user_agent, timeout=timeout)
 
 # ── App setup ─────────────────────────────────────────────────────
 
@@ -323,19 +335,9 @@ class RemoteBrowserSession:
                 except Exception:
                     raise RemoteBrowserError("读取登录状态失败，请重试")
             all_cookies = self._call(read_cookies)
-            selected = [
-                c for c in all_cookies
-                if (
-                    (domain := str(c.get("domain", "")).lstrip(".").lower())
-                    == "douyin.com"
-                    or domain.endswith(".douyin.com")
-                )
-            ]
-            cookie_str = "; ".join(
-                f"{c.get('name', '')}={c.get('value', '')}" for c in selected
-                if c.get("name")
-            ) or None
-            auth_count = sum(1 for c in selected if c.get("name") in _AUTH_COOKIE_NAMES)
+            selected = collect_douyin_cookies(all_cookies)
+            cookie_str = "; ".join(selected) or None
+            auth_count = sum(1 for c in selected if c.split("=", 1)[0] in _AUTH_COOKIE_NAMES)
             return cookie_str, auth_count
 
     def identity(self, owner: str) -> tuple[str | None, str | None, int]:
@@ -345,9 +347,9 @@ class RemoteBrowserSession:
                     raise RemoteBrowserError("远程桌面未启动或已被锁定")
                 page = self._page_locked(owner)
                 all_cookies = self._context.cookies()
-                selected = [c for c in all_cookies if (str(c.get("domain", "")).lstrip(".").lower() == "douyin.com" or str(c.get("domain", "")).lstrip(".").lower().endswith(".douyin.com"))]
-                cookie = "; ".join(f"{c.get('name', '')}={c.get('value', '')}" for c in selected if c.get("name")) or None
-                auth_count = sum(1 for c in selected if c.get("name") in _AUTH_COOKIE_NAMES)
+                selected = collect_douyin_cookies(all_cookies)
+                cookie = "; ".join(selected) or None
+                auth_count = sum(1 for c in selected if c.split("=", 1)[0] in _AUTH_COOKIE_NAMES)
                 ua = page.evaluate("() => navigator.userAgent")
                 return cookie, _sanitize_user_agent(ua), auth_count
             return self._call(read_identity)
@@ -663,6 +665,46 @@ def _persist_authenticated_cookie(cookie_str: str, user_agent: str | None = None
     return False
 
 
+def _validate_before_save(url: str, cookie_str: str, user_agent: str) -> tuple[bool, str]:
+    """Validate one work using the exact browser identity being saved."""
+    try:
+        result = validate_douyin_metadata(url, cookie_str, user_agent, timeout=15)
+    except Exception as exc:
+        status = getattr(exc, "status_code", None)
+        if str(status) in {"401", "403"}:
+            return False, "access_denied"
+        name = type(exc).__name__.lower()
+        if "timeout" in name:
+            return False, "timeout"
+        if "notfound" in name or "not_found" in name:
+            return False, "unavailable"
+        return False, "network"
+
+    if isinstance(result, dict):
+        if result.get("success") is True:
+            return True, "ok"
+        code = str(result.get("category") or result.get("error_code") or result.get("code") or "").lower()
+        if code in {"timeout", "timed_out"}:
+            return False, "timeout"
+        if code in {"access_denied", "unauthorized", "cookie_required", "forbidden"}:
+            return False, "access_denied"
+        if code == "token_failure":
+            return False, "token_failure"
+        if code in {"not_found", "unavailable", "invalid_url"}:
+            return False, "unavailable"
+        return False, "unavailable" if result else "network"
+    return False, "unavailable"
+
+
+_SAVE_FAILURE_MESSAGES = {
+    "timeout": "作品信息验证超时，请稍后重试",
+    "access_denied": "抖音拒绝访问，请重新登录后重试",
+    "unavailable": "作品链接无效、不可用或已被删除",
+    "network": "网络连接失败，请稍后重试",
+    "token_failure": "无法生成有效的抖音请求令牌，请重新登录后重试",
+}
+
+
 def _desktop_payload() -> dict:
     if request.content_length is not None and request.content_length > _MAX_DESKTOP_JSON_BYTES:
         raise RemoteBrowserError("请求过大")
@@ -780,22 +822,39 @@ def api_desktop_reload():
 def api_desktop_save():
     try:
         owner = _desktop_owner()
-        if callable(getattr(_remote_browser, "identity", None)):
+        remote_active = callable(getattr(_remote_browser, "active_for", None)) and _remote_browser.active_for(owner)
+        if callable(getattr(_remote_browser, "identity", None)) and remote_active:
             cookie_str, user_agent, auth_count = _remote_browser.identity(owner)
             if cookie_str and not user_agent:
                 return _desktop_response({"success": False, "status": "failure", "auth_count": auth_count, "message": "无法验证浏览器身份，请重试"}, 409)
-        else:
+        elif remote_active:
             cookie_str, auth_count = _remote_browser.cookies(owner)
             user_agent = None
+        else:
+            return _desktop_response({"success": False, "status": "failure", "message": "远程登录会话未启动，请重新开始登录"}, 409)
         if not cookie_str:
             return _desktop_response({"success": False, "status": "pending", "auth_count": 0, "message": "尚未检测到抖音登录状态"}, 409)
+        if not user_agent:
+            return _desktop_response({"success": False, "status": "failure", "auth_count": auth_count, "message": "无法验证浏览器身份，请重试"}, 409)
+        payload = _desktop_payload()
+        work_url = payload.get("url")
+        if not isinstance(work_url, str) or not work_url.strip() or len(work_url) > 2048:
+            return _desktop_response({"success": False, "status": "failure", "auth_count": auth_count, "message": "请先填写抖音作品链接"}, 400)
         grade, is_authenticated = _assess_quality(cookie_str)
         if not is_authenticated:
             return _desktop_response({"success": False, "status": "pending", "auth_count": auth_count, "message": f"尚未检测到完整登录状态（{grade}）"}, 409)
-        if not _persist_authenticated_cookie(cookie_str, user_agent):
-            return _desktop_response({"success": False, "message": "Cookie 保存失败，请稍后重试"}, 500)
+        valid, category = _validate_before_save(work_url.strip(), cookie_str, user_agent or "")
+        if not valid:
+            return _desktop_response({"success": False, "status": "failure", "category": category, "auth_count": auth_count, "message": _SAVE_FAILURE_MESSAGES[category]}, 422)
+        if not _session_is_unlocked():
+            return _desktop_response({"success": False, "message": "登录会话已过期，请重新开始登录"}, 409)
+        with _browser_lock:
+            if not _remote_browser.active_for(owner):
+                return _desktop_response({"success": False, "status": "failure", "auth_count": auth_count, "message": "登录会话已结束，请重新开始登录"}, 409)
+            if not _persist_authenticated_cookie(cookie_str, user_agent):
+                return _desktop_response({"success": False, "message": "Cookie 保存失败，请稍后重试"}, 500)
         log.info("Remote login cookie saved (%d auth tokens)", auth_count)
-        return _desktop_response({"success": True, "status": "logged_in", "auth_count": auth_count, "message": f"登录状态已保存（{grade}）"})
+        return _desktop_response({"success": True, "status": "logged_in", "auth_count": auth_count, "message": "作品信息验证通过，登录状态已保存"})
     except RemoteBrowserError as exc:
         return _desktop_failure(exc)
 
@@ -810,7 +869,11 @@ def api_desktop_lock():
 @app.route("/")
 def index():
     """Serve the QR login page."""
-    return render_template_string(LOGIN_HTML)
+    # The standalone entry point uses the same remote Firefox panel as the
+    # embedded file-browser tab.  Keep the historical QR endpoint available,
+    # but avoid maintaining a second save flow with different semantics.
+    panel = WEB_LOGIN_PANEL_HTML.replace("'/api/web-login'", "'/api'")
+    return render_template_string(LOGIN_HTML, web_login_panel=panel)
 
 
 @app.route("/api/qr")
@@ -855,9 +918,7 @@ def api_status():
         if cookie_str:
             grade, is_authenticated = _assess_quality(cookie_str)
             if is_authenticated:
-                if not _persist_authenticated_cookie(cookie_str, user_agent):
-                    return _desktop_response({"status": "failure", "auth_count": auth_count, "message": "Cookie 保存失败，请稍后重试"}, 500)
-                return _desktop_response({"status": "logged_in", "auth_count": auth_count, "message": f"登录状态已检测并保存（{grade}）"})
+                return _desktop_response({"status": "logged_in", "auth_count": auth_count, "message": f"已检测到登录状态（{grade}），请填写作品链接验证保存"})
         return _desktop_response({"status": "pending", "auth_count": auth_count, "message": "等待扫码或登录"})
     profile_dir = _get_profile_dir()
     with _browser_lock:
@@ -870,23 +931,7 @@ def api_status():
         grade, _ = _assess_quality(cookie_str)
         result["message"] += f" — {grade}"
 
-        # Persist only after quality validation. Do not put the cookie in the
-        # process environment: it would hide later managed-store updates.
-        if not _persist_authenticated_cookie(cookie_str, user_agent):
-            # Never include the cookie or the storage exception in a response
-            # or log line.  The browser can retry after the operator fixes the
-            # environment override or runtime database.
-            response = jsonify({
-                "status": "failure",
-                "auth_count": result.get("auth_count"),
-                "message": "Cookie 保存失败，请稍后重试",
-            })
-            response.headers["Cache-Control"] = "no-store"
-            return response, 500
-        log.info(
-            "Login success! Cookie saved (%d chars, %d auth tokens) — %s",
-            len(cookie_str), result["auth_count"], grade,
-        )
+        result["message"] = f"已检测到登录状态（{grade}），请填写作品链接验证保存"
 
     # Cookie contents are used only for persistence and must never reach clients.
     response = jsonify({key: result.get(key) for key in _STATUS_RESPONSE_FIELDS})
@@ -953,7 +998,11 @@ WEB_LOGIN_PANEL_HTML = r"""
       <button class="btn" id="webLoginTextButton" type="submit">发送到 Firefox</button>
     </form>
     <div id="webLoginStatus" class="web-login-status">尚未验证</div>
-    <button class="btn" id="webLoginSave" type="button">💾 保存登录状态</button>
+    <div class="web-login-text-form">
+      <label for="webLoginWorkUrl">作品链接</label>
+      <input id="webLoginWorkUrl" type="url" autocomplete="url" placeholder="粘贴抖音作品链接后验证保存" required>
+      <button class="btn" id="webLoginSave" type="button">💾 验证并保存登录状态</button>
+    </div>
     <button class="btn" id="webLoginReload" type="button">🔄 刷新页面</button>
     <button class="setting-action" id="webLoginLogout" type="button">🔒 结束远程桌面/锁定</button>
     <p class="web-login-hint">这是服务器上的 Firefox 远程桌面镜像。请直接点击抖音页面中的登录并完成扫码；不会依赖固定中文按钮。</p>
@@ -961,7 +1010,7 @@ WEB_LOGIN_PANEL_HTML = r"""
 </div>
 <script>
 (function() {
-  var timer = null, frameInFlight = false, started = false;
+  var timer = null, frameInFlight = false, started = false, saveInFlight = false;
   var api = '/api/web-login';
   var status = document.getElementById('webLoginStatus');
   var unlockStatus = document.getElementById('webLoginUnlockStatus');
@@ -984,7 +1033,6 @@ WEB_LOGIN_PANEL_HTML = r"""
       var response = await fetch(api + '/desktop/frame', {cache: 'no-store'}); var data = await responseData(response);
       if (!response.ok || !data.success) throw new Error(data.message || '截图失败');
       image.src = data.frame; image.style.display = 'block'; placeholder.style.display = 'none';
-      setStatus('🖱️ 可直接操作服务器 Firefox 页面', 'wait');
     } catch (error) { placeholder.style.display = 'flex'; placeholder.textContent = '❌ ' + error.message; setStatus(error.message, 'err'); }
     finally { frameInFlight = false; }
   }
@@ -1025,7 +1073,7 @@ WEB_LOGIN_PANEL_HTML = r"""
   document.getElementById('webLoginDesktopFrame').onwheel = function(event) { event.preventDefault(); sendInput({kind: 'wheel', delta_x: Math.max(-2000, Math.min(2000, event.deltaX)), delta_y: Math.max(-2000, Math.min(2000, event.deltaY))}); };
   document.getElementById('webLoginDesktopBox').onkeydown = function(event) { if (event.key && event.key.length <= 64) { event.preventDefault(); sendInput({kind: 'key', key: event.key}); } };
   document.getElementById('webLoginTextForm').onsubmit = async function(event) { event.preventDefault(); var input = document.getElementById('webLoginTextInput'); var value = input.value; if (!value || value.length > 2048) { setStatus('请输入不超过 2048 个字符的验证码或文字', 'err'); return; } var button = document.getElementById('webLoginTextButton'); button.disabled = true; if (await sendInput({kind: 'text', text: value})) input.value = ''; button.disabled = false; };
-  document.getElementById('webLoginSave').onclick = async function() { var response = await fetch(api + '/desktop/save', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'}); var data = await responseData(response); setStatus(data.message || (data.success ? '登录状态已保存' : '保存失败'), data.success ? 'ok' : 'err'); };
+  document.getElementById('webLoginSave').onclick = async function() { if (saveInFlight) return; var button = document.getElementById('webLoginSave'), url = document.getElementById('webLoginWorkUrl').value.trim(); if (!url) { setStatus('请先填写抖音作品链接', 'err'); return; } saveInFlight = true; button.disabled = true; setStatus('正在验证作品信息...', 'wait'); try { var response = await fetch(api + '/desktop/save', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url: url})}); var data = await responseData(response); setStatus(data.message || (data.success ? '作品信息验证通过，登录状态已保存' : '保存失败'), data.success ? 'ok' : 'err'); } catch (error) { setStatus('验证请求失败，请稍后重试', 'err'); } finally { saveInFlight = false; button.disabled = false; } };
   document.getElementById('webLoginReload').onclick = async function() { var response = await fetch(api + '/desktop/reload', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'}); var data = await responseData(response); if (response.ok && data.frame) { document.getElementById('webLoginDesktopFrame').src = data.frame; setStatus('页面已刷新', 'wait'); } else setStatus(data.message || '刷新失败', 'err'); };
   document.getElementById('webLoginLogout').onclick = async function() { stop(); started = false; await fetch(api + '/desktop/lock', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'}); document.getElementById('webLoginControls').style.display = 'none'; document.getElementById('webLoginUnlock').style.display = 'block'; document.getElementById('webLoginUnlockButton').disabled = false; };
 })();
@@ -1040,207 +1088,28 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>抖音扫码登录 — Douyin Email Bot</title>
+<title>抖音登录状态 — Douyin Email Bot</title>
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
-    background: #0f0f0f; color: #e0e0e0;
-    display: flex; justify-content: center; align-items: center;
-    min-height: 100vh;
-  }
-  .card {
-    background: #1a1a1a; border-radius: 16px; padding: 40px 32px;
-    max-width: 1100px; width: 95%; text-align: center;
-    box-shadow: 0 8px 32px rgba(0,0,0,0.4);
-  }
-  h1 { font-size: 22px; font-weight: 600; margin-bottom: 8px; color: #fff; }
-  .subtitle { font-size: 13px; color: #888; margin-bottom: 28px; }
-  #qr-box {
-    width: min(960px, 90vw); aspect-ratio: 16 / 9; margin: 0 auto 20px;
-    border-radius: 12px; overflow: hidden; position: relative;
-    background: #2a2a2a; display: flex; align-items: center; justify-content: center;
-  }
-  #qr-box a { width: 100%; height: 100%; display: block; }
-  #qr-box img { width: 100%; height: 100%; object-fit: contain; cursor: zoom-in; }
-  #qr-placeholder { color: #666; font-size: 14px; }
-  .status { font-size: 14px; margin: 12px 0; min-height: 20px; }
-  .status.ok { color: #4caf50; }
-  .status.wait { color: #ff9800; }
-  .status.err { color: #f44336; }
-  .hint { font-size: 12px; color: #666; margin-top: 16px; line-height: 1.6; }
-  .btn {
-    display: inline-block; margin-top: 16px; padding: 10px 28px;
-    border: none; border-radius: 8px; font-size: 14px; cursor: pointer;
-    background: #fe2c55; color: #fff; text-decoration: none;
-    transition: opacity 0.2s;
-  }
-  .btn:hover { opacity: 0.85; }
-  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
-  .unlock-form { display:flex; justify-content:center; gap:8px; margin:22px 0; }
-  .unlock-form input { min-width:240px; border:1px solid #555; border-radius:8px; padding:10px; background:#252525; color:#fff; }
-  #login-panel { margin-top: 18px; }
+body { margin:0; min-height:100vh; background:#f5f5f5; font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif; }
+.standalone-login { max-width:1100px; margin:0 auto; padding:28px 16px; }
+.standalone-login h1 { text-align:center; font-size:22px; margin:0 0 8px; }
+.standalone-login .subtitle { text-align:center; color:#777; margin:0 0 18px; }
+.web-login-panel { background:#fff; border-radius:12px; padding:24px; color:#444; }
+.web-login-form { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:16px 0; }
+.web-login-form input { border:1px solid #ddd; border-radius:6px; padding:9px; font:inherit; }
+.web-login-qr-box { width:100%; max-width:960px; aspect-ratio:16/9; margin:0 auto 16px; overflow:hidden; background:#eee; display:flex; align-items:center; justify-content:center; }
+.web-login-qr-box img { width:100%; height:100%; object-fit:contain; }
+.web-login-status { margin:12px 0; }
+.web-login-status.err { color:#b42318; } .web-login-status.ok { color:#16794a; }
+.btn, .setting-action { padding:9px 14px; border:1px solid #ccc; border-radius:6px; cursor:pointer; }
+button:disabled { opacity:.5; cursor:wait; }
 </style>
 </head>
-<body>
-<div class="card">
-  <h1>抖音扫码登录</h1>
-  <p class="subtitle">Douyin Email Bot — Cookie 获取</p>
-
-  <div id="unlock-panel">
-    <p class="hint">请输入部署配置的 Web Login 密码以开始抖音扫码登录</p>
-    <form class="unlock-form" onsubmit="unlock(event)">
-      <input id="password" type="password" autocomplete="current-password" placeholder="Web Login 密码" required>
-      <button class="btn" id="unlock-btn" type="submit">验证并开始</button>
-    </form>
-    <div id="unlock-status" class="status wait">请输入密码后开始</div>
-  </div>
-
-  <div id="login-panel" style="display:none">
-  <div id="qr-box">
-    <a id="qr-link" href="#" target="_blank" title="点击打开原尺寸截图">
-      <img id="qr-img" src="" alt="抖音完整登录页面" style="display:none">
-    </a>
-    <div id="qr-placeholder">⏳ 加载中...</div>
-  </div>
-
-  <div id="status" class="status wait">正在生成二维码...</div>
-
-  <button id="refresh-btn" class="btn" onclick="loadQR()" style="display:none">
-    🔄 刷新二维码
-  </button>
-
-  <p class="hint">
-    使用 <b>抖音 App</b> 扫描二维码<br>
-    扫码成功后 Cookie 将自动保存到运行时设置
-  </p>
-  <button id="logout-btn" class="btn" onclick="logout()">🔒 锁定</button>
-  </div>
-</div>
-
-<script>
-let _pollTimer = null;
-let _pollInFlight = false;
-
-async function unlock(event) {
-  event.preventDefault();
-  const status = document.getElementById('unlock-status');
-  const button = document.getElementById('unlock-btn');
-  button.disabled = true;
-  status.textContent = '正在验证...';
-  try {
-    const resp = await fetch('/api/unlock', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({password: document.getElementById('password').value})
-    });
-    const data = await resp.json();
-    if (!resp.ok) throw new Error(data.message || '验证失败');
-    document.getElementById('unlock-panel').style.display = 'none';
-    document.getElementById('login-panel').style.display = 'block';
-    loadQR();
-  } catch (e) {
-    status.textContent = e.message;
-    status.className = 'status err';
-    button.disabled = false;
-  }
-}
-
-async function logout() {
-  stopPolling();
-  await fetch('/api/logout', {method: 'POST'});
-  document.getElementById('login-panel').style.display = 'none';
-  document.getElementById('unlock-panel').style.display = 'block';
-  document.getElementById('status').textContent = '已锁定，请重新验证';
-  document.getElementById('status').className = 'status wait';
-  document.getElementById('unlock-btn').disabled = false;
-}
-
-async function loadQR() {
-  const img = document.getElementById('qr-img');
-  const link = document.getElementById('qr-link');
-  const placeholder = document.getElementById('qr-placeholder');
-  const status = document.getElementById('status');
-  const refreshBtn = document.getElementById('refresh-btn');
-
-  img.style.display = 'none';
-  placeholder.style.display = 'flex';
-  placeholder.textContent = '⏳ 生成二维码...';
-  status.textContent = '正在生成二维码...';
-  status.className = 'status wait';
-  refreshBtn.style.display = 'none';
-  stopPolling();
-
-  try {
-    const resp = await fetch('/api/qr');
-    const data = await resp.json();
-    if (data.success) {
-      img.src = data.qr_image;
-      link.href = data.qr_image;
-      img.style.display = 'block';
-      placeholder.style.display = 'none';
-      status.textContent = '完整登录页面（点击图片可打开原尺寸）';
-      status.className = 'status wait';
-      refreshBtn.style.display = 'inline-block';
-      startPolling();
-    } else {
-      placeholder.textContent = '❌ 生成失败';
-      status.textContent = data.message || '生成二维码失败，请重试';
-      status.className = 'status err';
-      refreshBtn.style.display = 'inline-block';
-    }
-  } catch (e) {
-    placeholder.textContent = '❌ 网络错误';
-    status.textContent = '无法连接服务器: ' + e.message;
-    status.className = 'status err';
-    refreshBtn.style.display = 'inline-block';
-  }
-}
-
-function startPolling() {
-  stopPolling();
-  _pollTimer = setInterval(pollStatus, 10000);
-}
-
-function stopPolling() {
-  if (_pollTimer) { clearInterval(_pollTimer); _pollTimer = null; }
-}
-
-async function pollStatus() {
-  if (_pollInFlight) return;
-  _pollInFlight = true;
-  try {
-    const resp = await fetch('/api/status');
-    const data = await resp.json();
-    const el = document.getElementById('status');
-
-    if (data.status === 'logged_in') {
-      stopPolling();
-      el.textContent = '✅ 登录成功！Cookie 已保存 (' + data.auth_count + ' 个认证 token)';
-      el.className = 'status ok';
-
-      document.getElementById('refresh-btn').style.display = 'none';
-      document.getElementById('qr-img').style.opacity = '0.4';
-    } else if (data.status === 'expired') {
-      el.textContent = '⚠️ 二维码已过期，正在自动刷新...';
-      el.className = 'status wait';
-      setTimeout(loadQR, 1000);
-    } else if (data.status === 'pending') {
-      el.textContent = '⏳ ' + (data.message || '等待扫码...');
-      el.className = 'status wait';
-    } else {
-      el.textContent = '❌ ' + (data.message || '检查失败');
-      el.className = 'status err';
-    }
-  } catch (e) {
-    // network error during poll, ignore and keep trying
-  } finally {
-    _pollInFlight = false;
-  }
-}
-
-// QR capture intentionally starts only after password verification.
-</script>
-</body>
+<body><main class="standalone-login">
+<h1>抖音登录状态</h1>
+<p class="subtitle">直接操作服务器 Firefox，登录后粘贴作品链接验证保存</p>
+{{ web_login_panel|safe }}
+</main></body>
 </html>"""
 
 

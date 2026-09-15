@@ -372,6 +372,44 @@ def test_cookie_reset_uses_effective_legacy_config_and_clear_stays_empty(tmp_pat
         assert db.execute("SELECT COUNT(*) FROM restart_requests").fetchone()[0] == 0
 
 
+def test_cookie_and_user_agent_hot_reload_as_one_settings_revision(tmp_path, monkeypatch):
+    """A saved browser identity must reach the downloader as one pair."""
+    store = SettingsStore(tmp_path / "settings.sqlite3")
+    (tmp_path / "config.yaml").write_text("douyin: {}\n", encoding="utf-8")
+    monkeypatch.setenv("RUNTIME_SETTINGS_DB", str(store.path))
+    revision = store.apply_douyin_identity(
+        "sessionid=new-cookie", "Mozilla/5.0 Firefox/153.0"
+    )
+
+    bot = object.__new__(EmailBot)
+    bot._settings = store
+    bot._project_dir = tmp_path
+    bot._settings_revision = revision - 1
+    bot._managed_settings = {
+        "douyin.cookie": "sessionid=old-cookie",
+        "douyin.user_agent": "Mozilla/5.0 Firefox/152.0",
+    }
+    bot._cookie_lock = threading.Lock()
+    bot.downloader = SimpleNamespace(
+        config=SimpleNamespace(
+            cookie="sessionid=old-cookie",
+            user_agent="Mozilla/5.0 Firefox/152.0",
+        )
+    )
+    updates = []
+    monkeypatch.setattr(
+        "douyin_downloader.update_identity",
+        lambda cookie, user_agent: updates.append((cookie, user_agent)),
+    )
+
+    bot._handle_settings_revision(revision)
+
+    assert bot._settings_revision == revision
+    assert bot.downloader.config.cookie == "sessionid=new-cookie"
+    assert bot.downloader.config.user_agent == "Mozilla/5.0 Firefox/153.0"
+    assert updates == [("sessionid=new-cookie", "Mozilla/5.0 Firefox/153.0")]
+
+
 class _BlockingSocket:
     def __init__(self):
         self.closed = threading.Event()

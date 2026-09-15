@@ -10,12 +10,15 @@ import asyncio
 import json
 import logging
 import os
+import queue
 import re
 import stat
 import tempfile
 import threading
+import time
 from contextvars import ContextVar
 from collections.abc import Mapping
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -86,6 +89,10 @@ class DouyinAccessError(RuntimeError):
         super().__init__(message)
 
 
+class DouyinTokenError(RuntimeError):
+    """F2 could not obtain a real request token for metadata validation."""
+
+
 _MEDIA_COOKIE_HOSTS = frozenset({
     "douyin.com", "iesdouyin.com", "douyinvod.com", "snssdk.com",
 })
@@ -126,7 +133,12 @@ def _cookie_value(cookie: str, name: str) -> str | None:
     return None
 
 
-def _configure_f2_request_identity(cookie: str, user_agent: str | None = None):
+def _configure_f2_request_identity(
+    cookie: str,
+    user_agent: str | None = None,
+    *,
+    require_real_ms_token: bool = False,
+):
     """Make F2's already-imported Pydantic request model use this session.
 
     F2 evaluates BaseRequestModel defaults at module import time.  Updating the
@@ -134,25 +146,51 @@ def _configure_f2_request_identity(cookie: str, user_agent: str | None = None):
     paired with the current browser Cookie instead of a process-static token.
     """
     token = _cookie_value(cookie, "msToken")
+    if token and token.strip().lower() == "false":
+        token = None
     reset_token = _CURRENT_MS_TOKEN.set(token)
     reset_ua = _CURRENT_USER_AGENT.set(user_agent or _DOUYIN_USER_AGENT)
+    reset_strict = _REQUIRE_REAL_MS_TOKEN.set(require_real_ms_token)
     try:
         from f2.apps.douyin.model import BaseRequestModel
         if not getattr(BaseRequestModel, "_douyin_email_bot_mstoken_patch", False):
             original_init = BaseRequestModel.__init__
 
             def init_with_session_token(self, **data):
+                _check_validation_deadline()
                 token = _CURRENT_MS_TOKEN.get()
                 if token:
                     data.setdefault("msToken", token)
                 else:
                     try:
-                        from f2.utils import TokenManager
-                        data.setdefault("msToken", TokenManager.gen_real_msToken())
+                        from f2.apps.douyin.utils import TokenManager
+                        if _REQUIRE_REAL_MS_TOKEN.get():
+                            original_generator = getattr(
+                                TokenManager,
+                                "_douyin_email_bot_original_gen_real_msToken",
+                                None,
+                            )
+                            generated = (
+                                original_generator(TokenManager)
+                                if original_generator is not None
+                                else TokenManager.gen_real_msToken()
+                            )
+                        else:
+                            generated = TokenManager.gen_real_msToken()
+                        if _REQUIRE_REAL_MS_TOKEN.get() and (
+                            not generated or str(generated).strip().lower() == "false"
+                        ):
+                            raise DouyinTokenError("F2 did not generate a real msToken")
+                        data.setdefault("msToken", generated)
                     except Exception:
+                        if _REQUIRE_REAL_MS_TOKEN.get():
+                            raise DouyinTokenError(
+                                "F2 could not generate a real msToken"
+                            ) from None
                         # F2's Pydantic field is a string; use its documented
                         # false sentinel without retaining a prior token.
                         data.setdefault("msToken", "false")
+                _check_validation_deadline()
                 ua = _CURRENT_USER_AGENT.get()
                 if ua:
                     match = re.search(r"Firefox/(\d+(?:\.\d+)*)", ua)
@@ -163,12 +201,13 @@ def _configure_f2_request_identity(cookie: str, user_agent: str | None = None):
 
             BaseRequestModel.__init__ = init_with_session_token
             BaseRequestModel._douyin_email_bot_mstoken_patch = True
-        _IDENTITY_RESETS[id(reset_token)] = reset_ua
+        _IDENTITY_RESETS[id(reset_token)] = (reset_ua, reset_strict)
         return reset_token
     except (ImportError, AttributeError, TypeError):
         logger.debug("Unable to bind current msToken to F2 request model", exc_info=True)
         _CURRENT_MS_TOKEN.reset(reset_token)
         _CURRENT_USER_AGENT.reset(reset_ua)
+        _REQUIRE_REAL_MS_TOKEN.reset(reset_strict)
         return None
 
 
@@ -176,15 +215,58 @@ _CURRENT_MS_TOKEN: ContextVar[str | None] = ContextVar(
     "douyin_ms_token", default=None,
 )
 _CURRENT_USER_AGENT: ContextVar[str | None] = ContextVar("douyin_user_agent", default=None)
-_IDENTITY_RESETS: dict[int, object] = {}
+_REQUIRE_REAL_MS_TOKEN: ContextVar[bool] = ContextVar("douyin_require_real_ms_token", default=False)
+_IDENTITY_RESETS: dict[int, tuple[object, object]] = {}
+_VALIDATION_SLOTS = threading.BoundedSemaphore(2)
+_VALIDATION_LOG_SILENT: ContextVar[bool] = ContextVar(
+    "douyin_validation_log_silent", default=False,
+)
+_VALIDATION_DEADLINE: ContextVar[float | None] = ContextVar(
+    "douyin_validation_deadline", default=None,
+)
+
+
+def _check_validation_deadline() -> None:
+    deadline = _VALIDATION_DEADLINE.get()
+    if deadline is not None and time.monotonic() >= deadline:
+        raise asyncio.TimeoutError
+
+
+class _ValidationF2LogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not _VALIDATION_LOG_SILENT.get()
+
+
+@contextmanager
+def _silence_f2_validation_logs():
+    """Suppress F2 request records for this validation context only."""
+    loggers = [logging.getLogger(name) for name in ("f2", "httpx", "httpcore")]
+    log_filter = _ValidationF2LogFilter()
+    handlers = set(logging.getLogger().handlers)
+    for provider_logger in loggers:
+        provider_logger.addFilter(log_filter)
+        handlers.update(provider_logger.handlers)
+    for handler in handlers:
+        handler.addFilter(log_filter)
+    reset = _VALIDATION_LOG_SILENT.set(True)
+    try:
+        yield
+    finally:
+        _VALIDATION_LOG_SILENT.reset(reset)
+        for handler in handlers:
+            handler.removeFilter(log_filter)
+        for provider_logger in loggers:
+            provider_logger.removeFilter(log_filter)
 
 
 def _reset_f2_request_identity(token) -> None:
     """Restore both request identity context variables for nested callers."""
-    ua_token = _IDENTITY_RESETS.pop(id(token), None)
+    reset_pair = _IDENTITY_RESETS.pop(id(token), None)
     _CURRENT_MS_TOKEN.reset(token)
-    if ua_token is not None:
+    if reset_pair is not None:
+        ua_token, strict_token = reset_pair
         _CURRENT_USER_AGENT.reset(ua_token)
+        _REQUIRE_REAL_MS_TOKEN.reset(strict_token)
 
 
 class DouyinDownloader:
@@ -624,6 +706,174 @@ class DouyinDownloader:
         if status_code is not None:
             result["status_code"] = status_code
         return result
+
+
+def validate_douyin_metadata(
+    url: str,
+    cookie: str,
+    user_agent: str | None = None,
+    timeout: float = 15,
+) -> dict[str, object]:
+    """Validate a Douyin login by fetching one post's metadata only.
+
+    This is deliberately independent of :class:`DouyinDownloader`: it never
+    creates a download directory, writes media, or updates process identity.
+    The response is bounded even if a synchronous provider call blocks. Its
+    worker retains a concurrency slot until it exits; deadline checks prevent
+    a late token-generation result from starting a metadata request.
+    """
+    result = {"success": False, "category": "unavailable", "message": "抖音作品信息暂时不可用"}
+    candidate = str(url or "").strip()
+    if not _is_valid_metadata_url(candidate):
+        result.update(category="invalid_url", message="请输入有效的抖音作品链接")
+        return result
+    if not str(cookie or "").strip():
+        result.update(category="token_failure", message="未提供抖音 Cookie")
+        return result
+    if (_cookie_value(cookie, "msToken") or "").strip().lower() == "false":
+        result.update(category="token_failure", message="Cookie 中的抖音请求令牌无效")
+        return result
+
+    try:
+        limit = max(0.1, float(timeout))
+    except (TypeError, ValueError):
+        limit = 15.0
+    outcome: queue.Queue[dict[str, object]] = queue.Queue(maxsize=1)
+
+    def run() -> None:
+        try:
+            outcome.put(_validate_douyin_metadata_async(candidate, cookie, user_agent, limit))
+        except DouyinTokenError:
+            outcome.put({"success": False, "category": "token_failure", "message": "无法生成有效的抖音请求令牌"})
+        except (APITimeoutError, asyncio.TimeoutError, httpx.TimeoutException):
+            outcome.put({"success": False, "category": "timeout", "message": "抖音作品信息验证超时"})
+        except (APIUnauthorizedError, APIResponseError) as exc:
+            status = _api_status(exc)
+            if status in (401, 403):
+                outcome.put({"success": False, "category": "access_denied", "message": "抖音拒绝访问，请重新登录后重试"})
+            else:
+                outcome.put({"success": False, "category": "unavailable", "message": "抖音作品信息暂时不可用"})
+        except APINotFoundError:
+            outcome.put({"success": False, "category": "unavailable", "message": "作品不存在或已不可见"})
+        except APIConnectionError:
+            outcome.put({"success": False, "category": "unavailable", "message": "无法连接抖音，请稍后重试"})
+        except Exception:
+            # Do not expose F2's raw exception, which may contain request data.
+            logger.debug("Douyin metadata validation failed")
+            outcome.put({"success": False, "category": "unavailable", "message": "抖音作品信息暂时不可用"})
+
+    if not _VALIDATION_SLOTS.acquire(blocking=False):
+        return {"success": False, "category": "timeout", "message": "抖音作品信息验证超时"}
+
+    def release_slot() -> None:
+        try:
+            run()
+        finally:
+            _VALIDATION_SLOTS.release()
+
+    worker = threading.Thread(target=release_slot, name="douyin-metadata-validation", daemon=True)
+    try:
+        worker.start()
+    except Exception:
+        _VALIDATION_SLOTS.release()
+        return {"success": False, "category": "unavailable", "message": "抖音作品信息暂时不可用"}
+    worker.join(limit)
+    if worker.is_alive():
+        return {"success": False, "category": "timeout", "message": "抖音作品信息验证超时"}
+    try:
+        return outcome.get_nowait()
+    except queue.Empty:
+        return result
+
+
+def _is_valid_metadata_url(url: str) -> bool:
+    if DOUYIN_SHORT_RE.fullmatch(url):
+        return True
+    if _is_douyin_short_host_url(url):
+        return bool(DOUYIN_SHORT_RE.fullmatch(url))
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    try:
+        port = parsed.port
+    except ValueError:
+        return False
+    if (
+        parsed.scheme != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or parsed.fragment
+    ):
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
+    return host in _DOUYIN_REDIRECT_HOSTS and bool(DOUYIN_AWEME_PATH_RE.fullmatch(parsed.path))
+
+
+def _validate_douyin_metadata_async(
+    url: str, cookie: str, user_agent: str | None, timeout: float,
+) -> dict[str, object]:
+    return asyncio.run(_validate_douyin_metadata_bound(url, cookie, user_agent, timeout))
+
+
+async def _validate_douyin_metadata_bound(
+    url: str, cookie: str, user_agent: str | None, timeout: float,
+) -> dict[str, object]:
+    started_at = time.monotonic()
+    deadline_reset = _VALIDATION_DEADLINE.set(started_at + timeout)
+    reset = _configure_f2_request_identity(
+        cookie, user_agent, require_real_ms_token=True,
+    )
+    if reset is None:
+        _VALIDATION_DEADLINE.reset(deadline_reset)
+        raise DouyinTokenError("Unable to bind F2 request identity")
+    try:
+        async def fetch() -> dict:
+            _check_validation_deadline()
+            aweme_id = await _resolve_aweme_id(url)
+            if not aweme_id:
+                raise APINotFoundError("missing aweme id")
+            _check_validation_deadline()
+            remaining = timeout - (time.monotonic() - started_at)
+            handler = DouyinHandler({
+                "url": url,
+                "cookie": cookie,
+                "timeout": remaining,
+                "max_retries": 1,
+                "proxies": {},
+                "headers": {"User-Agent": user_agent or _DOUYIN_USER_AGENT},
+                "mode": "one",
+                "path": "",
+            })
+            handler.enable_bark = False
+            data = (await handler.fetch_one_video(aweme_id))._to_dict()
+            if not isinstance(data, Mapping) or not data:
+                raise APINotFoundError("empty metadata")
+            returned_id = str(data.get("aweme_id") or "")
+            if not returned_id or returned_id != aweme_id:
+                raise APINotFoundError("metadata id mismatch")
+            has_content = bool(data.get("video_play_addr") or data.get("images"))
+            if not has_content:
+                raise APINotFoundError("metadata has no playable content")
+            return dict(data)
+
+        with _silence_f2_validation_logs():
+            remaining = timeout - (time.monotonic() - started_at)
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            data = await asyncio.wait_for(fetch(), timeout=remaining)
+            return {
+                "success": True,
+                "category": "success",
+                "message": "作品信息验证通过",
+                "aweme_id": str(data.get("aweme_id") or ""),
+                "title": str(data.get("desc") or data.get("nickname") or ""),
+            }
+    finally:
+        if reset is not None:
+            _reset_f2_request_identity(reset)
+        _VALIDATION_DEADLINE.reset(deadline_reset)
 
 
 def _normalize_share_url(url: str) -> str:

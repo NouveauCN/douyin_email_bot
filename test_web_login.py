@@ -28,7 +28,7 @@ def _unlock(client, headers=SAME_ORIGIN_HEADERS):
     return client.post("/api/unlock", json={"password": "test-password"}, headers=headers)
 
 
-def test_status_saves_cookie_but_redacts_it_from_response(monkeypatch, tmp_path):
+def test_status_only_detects_cookie_but_does_not_save_it(monkeypatch, tmp_path):
     cookie = "sessionid=secret-value; passport_csrf_token=another-secret"
     result = {
         "status": "logged_in",
@@ -51,13 +51,11 @@ def test_status_saves_cookie_but_redacts_it_from_response(monkeypatch, tmp_path)
     assert _unlock(client).status_code == 200
     response = client.get("/api/status", headers=SAME_ORIGIN_HEADERS)
 
-    assert saved == {
-        "changes": [{"key": "douyin.cookie", "action": "set", "value": cookie}],
-    }
+    assert saved == {}
     assert response.get_json() == {
         "status": "logged_in",
         "auth_count": 2,
-        "message": "检测到登录态 — A",
+        "message": "已检测到登录状态（A），请填写作品链接验证保存",
     }
     assert "cookie_str" not in response.get_json()
     assert cookie not in response.get_data(as_text=True)
@@ -90,12 +88,12 @@ def test_status_returns_only_whitelisted_fields_and_is_not_cacheable(monkeypatch
     assert response.headers["Cache-Control"] == "no-store"
 
 
-def test_status_returns_safe_500_when_cookie_save_fails(monkeypatch, tmp_path):
+def test_status_does_not_touch_settings_when_cookie_is_detected(monkeypatch, tmp_path):
     cookie = "sessionid=must-not-leak"
 
     class FailingSettings:
         def apply(self, changes):
-            raise RuntimeError(f"database error involving {cookie}")
+            raise AssertionError("status must not save")
 
     monkeypatch.setattr(web_login, "_get_profile_dir", lambda: tmp_path)
     monkeypatch.setattr(
@@ -115,12 +113,8 @@ def test_status_returns_safe_500_when_cookie_save_fails(monkeypatch, tmp_path):
     assert _unlock(client).status_code == 200
     response = client.get("/api/status", headers=SAME_ORIGIN_HEADERS)
 
-    assert response.status_code == 500
-    assert response.get_json() == {
-        "status": "failure",
-        "auth_count": 1,
-        "message": "Cookie 保存失败，请稍后重试",
-    }
+    assert response.status_code == 200
+    assert response.get_json()["status"] == "logged_in"
     assert cookie not in response.get_data(as_text=True)
     assert response.headers["Cache-Control"] == "no-store"
 
@@ -238,6 +232,15 @@ def test_standalone_entrypoint_disables_flask_dotenv_loading(monkeypatch):
     assert calls[0]["load_dotenv"] is False
 
 
+def test_standalone_page_uses_remote_save_panel(monkeypatch):
+    response = web_login.app.test_client().get("/")
+    assert response.status_code == 200
+    body = response.get_data(as_text=True)
+    assert 'id="webLoginWorkUrl"' in body
+    assert "'/api'" in body
+    assert "/desktop/save" in body
+
+
 def test_missing_password_disables_login(monkeypatch):
     monkeypatch.delenv("WEB_LOGIN_PASSWORD")
     monkeypatch.setattr(web_login, "_password", lambda: "")
@@ -343,6 +346,9 @@ def test_remote_text_input_preserves_bounded_text_and_panel_supports_submit():
     panel = web_login.WEB_LOGIN_PANEL_HTML
     assert 'id="webLoginTextForm"' in panel
     assert 'id="webLoginTextInput"' in panel
+    assert 'id="webLoginWorkUrl"' in panel
+    assert '正在验证作品信息' in panel
+    assert "button.disabled = true" in panel
     assert 'maxlength="2048"' in panel
     assert "kind: 'text'" in panel
     assert "focus({preventScroll: true})" in panel
@@ -351,6 +357,12 @@ def test_remote_text_input_preserves_bounded_text_and_panel_supports_submit():
 
 def test_remote_save_redacts_cookie_and_requires_auth(monkeypatch):
     class FakeDesktop:
+        def active_for(self, owner):
+            return True
+
+        def identity(self, owner):
+            return "sessionid=secret; uid=private", "Mozilla/5.0 Firefox/153.0", 2
+
         def start(self, owner):
             return True, "ok"
 
@@ -371,12 +383,120 @@ def test_remote_save_redacts_cookie_and_requires_auth(monkeypatch):
     monkeypatch.setattr(web_login, "_remote_browser", FakeDesktop())
     monkeypatch.setattr(web_login, "_settings", FakeSettings())
     monkeypatch.setattr(web_login, "_assess_quality", lambda _: ("A", True))
+    monkeypatch.setattr(web_login, "validate_douyin_metadata", lambda *args, **kwargs: {"success": True})
     client = web_login.app.test_client()
     assert _unlock(client).status_code == 200
-    response = client.post("/api/desktop/save", json={}, headers=SAME_ORIGIN_HEADERS)
+    response = client.post("/api/desktop/save", json={"url": "https://www.douyin.com/video/123"}, headers=SAME_ORIGIN_HEADERS)
     assert response.status_code == 200
     assert "secret" not in response.get_data(as_text=True)
     assert saved["changes"][0]["key"] == "douyin.cookie"
+
+
+class _ActiveDesktop:
+    def __init__(self, cookie="sessionid=secret; uid=private", ua="Mozilla/5.0 Firefox/153.0"):
+        self.cookie, self.ua, self.active = cookie, ua, True
+
+    def active_for(self, owner):
+        return self.active
+
+    def identity(self, owner):
+        return self.cookie, self.ua, 2
+
+
+@pytest.mark.parametrize("result, expected", [
+    ({"success": False, "category": "access_denied", "message": "safe"}, "抖音拒绝访问"),
+    ({"success": False, "category": "timeout", "message": "safe"}, "验证超时"),
+    ({"success": False, "category": "unavailable", "message": "safe"}, "作品链接无效"),
+    ({"success": False, "category": "token_failure", "message": "safe"}, "无法生成有效"),
+])
+def test_remote_save_validation_failure_keeps_existing_identity(monkeypatch, result, expected):
+    desktop = _ActiveDesktop()
+    monkeypatch.setattr(web_login, "_remote_browser", desktop)
+    monkeypatch.setattr(web_login, "validate_douyin_metadata", lambda *args, **kwargs: result)
+    saved = []
+
+    class Settings:
+        def apply_douyin_identity(self, *args):
+            saved.append(args)
+
+    monkeypatch.setattr(web_login, "_settings", Settings())
+    client = web_login.app.test_client()
+    assert _unlock(client).status_code == 200
+    response = client.post("/api/desktop/save", json={"url": "https://www.douyin.com/video/123"}, headers=SAME_ORIGIN_HEADERS)
+    assert response.status_code == 422
+    assert expected in response.get_json()["message"]
+    assert "safe" not in response.get_data(as_text=True)
+    assert saved == []
+
+
+def test_remote_save_success_passes_same_cookie_and_ua_and_does_not_download(monkeypatch):
+    desktop = _ActiveDesktop()
+    monkeypatch.setattr(web_login, "_remote_browser", desktop)
+    calls = []
+    monkeypatch.setattr(web_login, "validate_douyin_metadata", lambda *args, **kwargs: calls.append((args, kwargs)) or {"success": True})
+    saved = []
+
+    class Settings:
+        def apply_douyin_identity(self, *args):
+            saved.append(args)
+
+    monkeypatch.setattr(web_login, "_settings", Settings())
+    client = web_login.app.test_client()
+    assert _unlock(client).status_code == 200
+    response = client.post("/api/desktop/save", json={"url": "https://www.douyin.com/video/123"}, headers=SAME_ORIGIN_HEADERS)
+    assert response.status_code == 200
+    assert response.get_json()["message"] == "作品信息验证通过，登录状态已保存"
+    assert calls[0][0] == ("https://www.douyin.com/video/123", desktop.cookie, desktop.ua)
+    assert calls[0][1] == {"timeout": 15}
+    assert saved == [(desktop.cookie, desktop.ua)]
+
+
+def test_remote_save_requires_work_url(monkeypatch):
+    monkeypatch.setattr(web_login, "_remote_browser", _ActiveDesktop())
+    client = web_login.app.test_client()
+    assert _unlock(client).status_code == 200
+    response = client.post("/api/desktop/save", json={}, headers=SAME_ORIGIN_HEADERS)
+    assert response.status_code == 400
+    assert "作品链接" in response.get_json()["message"]
+
+
+def test_remote_save_rejects_session_replaced_during_validation(monkeypatch):
+    desktop = _ActiveDesktop()
+    monkeypatch.setattr(web_login, "_remote_browser", desktop)
+    def validate(*args, **kwargs):
+        desktop.active = False
+        return {"success": True}
+    monkeypatch.setattr(web_login, "validate_douyin_metadata", validate)
+    client = web_login.app.test_client()
+    assert _unlock(client).status_code == 200
+    response = client.post("/api/desktop/save", json={"url": "https://www.douyin.com/video/123"}, headers=SAME_ORIGIN_HEADERS)
+    assert response.status_code == 409
+    assert "已结束" in response.get_json()["message"]
+
+
+def test_remote_save_rejects_session_expired_during_validation(monkeypatch):
+    desktop = _ActiveDesktop()
+    desktop.stop = lambda owner: setattr(desktop, "active", False)
+    monkeypatch.setattr(web_login, "_remote_browser", desktop)
+    saved = []
+    monkeypatch.setattr(web_login, "_persist_authenticated_cookie", lambda *args: saved.append(args))
+
+    def validate(*args, **kwargs):
+        web_login.session["web_login_unlocked_at"] = 0
+        return {"success": True}
+
+    monkeypatch.setattr(web_login, "validate_douyin_metadata", validate)
+    client = web_login.app.test_client()
+    assert _unlock(client).status_code == 200
+    response = client.post("/api/desktop/save", json={"url": "https://www.douyin.com/video/123"}, headers=SAME_ORIGIN_HEADERS)
+    assert response.status_code == 409
+    assert saved == []
+
+
+@pytest.mark.parametrize("result", [True, "provider error", ["data"], {"success": "true"}])
+def test_remote_validation_requires_explicit_structured_success(monkeypatch, result):
+    monkeypatch.setattr(web_login, "validate_douyin_metadata", lambda *args, **kwargs: result)
+    assert web_login._validate_before_save("url", "cookie", "ua")[0] is False
 
 
 def test_remote_cookie_read_rejects_http_error_before_cookie_names(

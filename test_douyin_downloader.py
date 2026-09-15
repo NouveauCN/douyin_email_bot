@@ -112,6 +112,68 @@ class DouyinDownloadTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(target.stat().st_mode & 0o777, 0o640)
             self.assertEqual(list(Path(temp_dir).glob(".video.mp4.*.tmp")), [])
 
+    def test_metadata_validation_rejects_malformed_short_url_without_f2(self):
+        with patch.object(douyin_downloader, "_validate_douyin_metadata_async") as validate:
+            result = douyin_downloader.validate_douyin_metadata(
+                "http://v.douyin.com/unsafe", "sessionid=secret"
+            )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["category"], "invalid_url")
+        validate.assert_not_called()
+
+    def test_metadata_validation_success_does_not_download_media_or_change_identity(self):
+        before = douyin_downloader.identity_snapshot()
+        with patch.object(
+            douyin_downloader,
+            "_validate_douyin_metadata_async",
+            return_value={
+                "success": True,
+                "category": "success",
+                "message": "作品信息验证通过",
+                "aweme_id": "123",
+                "title": "test",
+            },
+        ) as validate, patch.object(douyin_downloader.DouyinDownloader, "download") as download:
+            result = douyin_downloader.validate_douyin_metadata(
+                "https://www.douyin.com/video/123", "sessionid=secret", "Firefox/120"
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["category"], "success")
+        self.assertEqual(douyin_downloader.identity_snapshot(), before)
+        validate.assert_called_once()
+        download.assert_not_called()
+
+    def test_metadata_validation_maps_access_denied_without_exposing_exception(self):
+        denied = douyin_downloader.APIResponseError("cookie=secret https://private.example", 403)
+        with patch.object(
+            douyin_downloader, "_validate_douyin_metadata_async", side_effect=denied
+        ):
+            result = douyin_downloader.validate_douyin_metadata(
+                "https://www.douyin.com/video/123", "sessionid=secret"
+            )
+
+        self.assertEqual(result["category"], "access_denied")
+        self.assertNotIn("secret", str(result))
+
+    async def test_metadata_validation_rejects_empty_returned_aweme_id(self):
+        fake_handler = SimpleNamespace(
+            fetch_one_video=AsyncMock(
+                return_value=SimpleNamespace(_to_dict=lambda: {"images": ["image"]})
+            )
+        )
+        with patch.object(douyin_downloader, "_resolve_aweme_id", new=AsyncMock(return_value="123")), \
+                patch.object(douyin_downloader, "DouyinHandler", return_value=fake_handler):
+            result = await asyncio.to_thread(
+                douyin_downloader.validate_douyin_metadata,
+                "https://www.douyin.com/video/123",
+                "sessionid=secret; msToken=real-token",
+            )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["category"], "unavailable")
+
     def test_current_cookie_mstoken_is_bound_to_f2_model(self):
         from f2.apps.douyin.model import BaseRequestModel, PostDetail
 
@@ -137,6 +199,24 @@ class DouyinDownloadTests(unittest.IsolatedAsyncioTestCase):
             assert PostDetail(aweme_id="123").msToken != "old-token"
         finally:
             douyin_downloader._CURRENT_MS_TOKEN.reset(reset)
+
+    def test_strict_identity_rejects_false_generated_mstoken(self):
+        from f2.apps.douyin.model import PostDetail
+        from f2.apps.douyin.utils import TokenManager
+
+        reset = douyin_downloader._configure_f2_request_identity(
+            "sessionid=secret", require_real_ms_token=True
+        )
+        try:
+            with patch.object(
+                TokenManager,
+                "_douyin_email_bot_original_gen_real_msToken",
+                lambda _cls: "false",
+            ):
+                with self.assertRaises(douyin_downloader.DouyinTokenError):
+                    PostDetail(aweme_id="123")
+        finally:
+            douyin_downloader._reset_f2_request_identity(reset)
 
     def test_request_model_uses_paired_identity_and_nested_context_restores(self):
         from f2.apps.douyin.model import PostDetail
