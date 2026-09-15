@@ -21,8 +21,8 @@ colorama_init(autoreset=True)
 
 from cookie_extractor import (
     DEFAULT_PROFILE_DIR,
-    extract_cookies,
-    extract_with_playwright,
+    collect_douyin_cookies,
+    extract_cookies_with_user_agent,
     validate_cookie,
 )
 from settings_store import SettingsStore, default_database_path
@@ -40,7 +40,12 @@ logging.basicConfig(
 log = logging.getLogger("get_cookie")
 
 
-def interactive_login(profile_dir: Path, validate: bool = True) -> tuple[str | None, str]:
+def interactive_login(
+    profile_dir: Path,
+    validate: bool = True,
+    *,
+    include_user_agent: bool = False,
+) -> tuple[str | None, str] | tuple[str | None, str, str | None]:
     """Launch visible Firefox, wait for user to log in, extract cookies.
 
     The profile persists, enabling future headless runs.
@@ -48,11 +53,12 @@ def interactive_login(profile_dir: Path, validate: bool = True) -> tuple[str | N
     try:
         from playwright.sync_api import sync_playwright  # type: ignore[import-untyped]
     except ImportError:
-        return None, (
+        result = (None, (
             "Playwright 未安装。请运行：\n"
             "  uv add playwright\n"
             "  playwright install firefox"
-        )
+        ))
+        return (*result, None) if include_user_agent else result
 
     profile_dir.mkdir(parents=True, exist_ok=True)
 
@@ -87,42 +93,43 @@ def interactive_login(profile_dir: Path, validate: bool = True) -> tuple[str | N
             print()
             input(f"{Fore.YELLOW}按 Enter 提取 cookie (Firefox 将自动关闭)...")
 
+            user_agent = None
+            try:
+                user_agent = str(page.evaluate("() => navigator.userAgent") or "") or None
+            except Exception:
+                pass
             cookies = browser.cookies()
             browser.close()
 
-            douyin_cookies = _filter_douyin(cookies)
+            douyin_cookies = collect_douyin_cookies(cookies)
             if not douyin_cookies:
-                return None, "未找到抖音 cookie，请确认已成功登录。"
+                result = (None, "未找到抖音 cookie，请确认已成功登录。")
+                return (*result, user_agent) if include_user_agent else result
 
             cookie_str = "; ".join(douyin_cookies)
             log.info("提取到 %d 个抖音 cookie", len(douyin_cookies))
 
             if validate:
                 print(f"{Fore.CYAN}正在验证 cookie...")
-                valid, reason = validate_cookie(cookie_str)
+                valid, reason = validate_cookie(cookie_str, user_agent=user_agent)
                 if not valid:
-                    return None, f"Cookie 无效：{reason}"
+                    result = (None, f"Cookie 无效：{reason}")
+                    return (*result, user_agent) if include_user_agent else result
                 print(f"{Fore.GREEN}验证通过: {reason}")
 
-            return cookie_str, f"交互式登录成功（{len(cookie_str)} 字符）"
+            message = f"交互式登录成功（{len(cookie_str)} 字符）"
+            return (cookie_str, message, user_agent) if include_user_agent else (cookie_str, message)
 
     except Exception as exc:
-        return None, f"浏览器启动失败: {exc}"
+        message = f"浏览器启动失败: {exc}"
+        return (None, message, None) if include_user_agent else (None, message)
 
 
-def _filter_douyin(cookies: list) -> list[str]:
-    """Filter and format douyin.com cookies from Playwright cookie dicts."""
-    douyin_domains = frozenset({".douyin.com", "douyin.com", "www.douyin.com"})
-    return [
-        f"{c['name']}={c['value']}"
-        for c in cookies
-        if c.get("domain", "") in douyin_domains
-    ]
-
-
-def _save_cookie(cookie: str) -> None:
+def _save_cookie(cookie: str, user_agent: str | None) -> None:
     """Persist a validated cookie in the shared managed settings store."""
-    _settings.apply([{"key": "douyin.cookie", "action": "set", "value": cookie}])
+    if not user_agent:
+        raise ValueError("Firefox User-Agent unavailable")
+    _settings.apply_douyin_identity(cookie, user_agent)
 
 
 def main():
@@ -153,18 +160,20 @@ def main():
     if args.headless:
         print(f"{Fore.CYAN}无头模式：从持久化配置中提取 cookie...")
         print(f"配置目录: {profile_dir}")
-        cookie, msg = extract_cookies(
+        cookie, user_agent, msg = extract_cookies_with_user_agent(
             profile_dir=profile_dir,
             headless=True,
             validate=validate,
         )
     else:
         print(f"{Fore.CYAN}交互模式：启动 Firefox 进行登录...")
-        cookie, msg = interactive_login(profile_dir, validate=validate)
+        cookie, msg, user_agent = interactive_login(
+            profile_dir, validate=validate, include_user_agent=True
+        )
 
     if cookie:
         try:
-            _save_cookie(cookie)
+            _save_cookie(cookie, user_agent)
         except Exception:
             # Keep storage errors generic: a database exception must not echo
             # the cookie value or any other sensitive setting.

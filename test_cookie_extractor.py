@@ -7,6 +7,68 @@ from pathlib import Path
 import cookie_extractor
 
 
+def test_collect_douyin_cookies_allows_only_exact_bytedance_mstoken():
+    cookies = [
+        {"name": "sessionid", "value": "sid", "domain": ".douyin.com"},
+        {"name": "sub", "value": "ok", "domain": "www.douyin.com"},
+        {"name": "msToken", "value": "token", "domain": ".bytedance.com"},
+        {"name": "other", "value": "no", "domain": ".bytedance.com"},
+        {"name": "msToken", "value": "no", "domain": "foo.bytedance.com"},
+        {"name": "msToken", "value": "no", "domain": "bytedance.com"},
+    ]
+
+    assert cookie_extractor.collect_douyin_cookies(cookies) == [
+        "sessionid=sid", "sub=ok", "msToken=token"
+    ]
+
+
+def test_collect_douyin_cookies_discards_expired_empty_false_and_deduplicates(
+    monkeypatch,
+):
+    monkeypatch.setattr(cookie_extractor.time, "time", lambda: 1000)
+    cookies = [
+        {"name": "sid", "value": "first", "domain": ".douyin.com"},
+        {"name": "sid", "value": "second", "domain": ".douyin.com"},
+        {"name": "msToken", "value": "expired", "domain": ".bytedance.com", "expires": 999},
+        {"name": "empty", "value": " ", "domain": ".douyin.com"},
+        {"name": "false", "value": "false", "domain": ".douyin.com"},
+        {"name": "empty", "value": "", "domain": ".douyin.com"},
+        {"name": "msToken", "value": "false", "domain": "bytedance.com"},
+        {"name": "msToken", "value": "valid", "domain": ".bytedance.com", "expires": 1001},
+    ]
+
+    assert cookie_extractor.collect_douyin_cookies(cookies) == [
+        "sid=first", "empty= ", "false=false", "msToken=valid"
+    ]
+
+
+def test_collect_douyin_cookies_prefers_douyin_token_over_cross_domain():
+    cookies = [
+        {"name": "msToken", "value": "cross", "domain": ".bytedance.com"},
+        {"name": "msToken", "value": "douyin", "domain": ".douyin.com"},
+    ]
+
+    assert cookie_extractor.collect_douyin_cookies(cookies) == ["msToken=douyin"]
+
+
+def test_collect_douyin_cookies_rejects_invalid_mstoken_on_douyin_domain():
+    cookies = [
+        {"name": "msToken", "value": "false", "domain": ".douyin.com"},
+        {"name": "msToken", "value": "valid", "domain": ".bytedance.com"},
+    ]
+
+    assert cookie_extractor.collect_douyin_cookies(cookies) == ["msToken=valid"]
+
+
+def test_collect_douyin_cookies_accepts_bare_bytedance_domain_but_not_subdomain():
+    cookies = [
+        {"name": "msToken", "value": "bare", "domain": "bytedance.com"},
+        {"name": "other", "value": "no", "domain": "foo.bytedance.com"},
+    ]
+
+    assert cookie_extractor.collect_douyin_cookies(cookies) == ["msToken=bare"]
+
+
 def test_validate_cookie_network_failure_fails_closed(monkeypatch):
     class FailingClient:
         def __init__(self, **_kwargs):

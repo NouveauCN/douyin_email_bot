@@ -12,6 +12,7 @@ Usage:
 
 import base64
 import logging
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -29,13 +30,76 @@ _AUTH_COOKIE_NAMES = frozenset({
 })
 
 
+def collect_douyin_cookies(cookies: list[dict]) -> list[str]:
+    """Select safe, useful cookies from Playwright cookie dictionaries.
+
+    All cookies belonging to ``douyin.com`` or one of its subdomains are
+    retained.  The only cross-domain value allowed is ``msToken`` from the
+    exact ``bytedance.com`` domain, which is needed by Douyin's API. Expired
+    and invalid ``msToken`` values are discarded. Cookie names are
+    deduplicated deterministically, preferring the Douyin-domain value over
+    the cross-domain token when both are present.
+    """
+    selected: dict[str, tuple[int, int, str]] = {}
+    order: list[str] = []
+    for index, cookie in enumerate(cookies or []):
+        if not isinstance(cookie, dict):
+            continue
+        name = str(cookie.get("name", ""))
+        value = cookie.get("value")
+        if not name or value is None:
+            continue
+        value = str(value)
+        domain = str(cookie.get("domain", "")).lower()
+        normalized_domain = domain.lstrip(".")
+        is_douyin = (
+            normalized_domain == "douyin.com"
+            or normalized_domain.endswith(".douyin.com")
+        )
+        is_ms_token = name == "msToken"
+        is_bytedance_token = is_ms_token and domain in {"bytedance.com", ".bytedance.com"}
+        if not is_douyin and not is_bytedance_token:
+            continue
+
+        # ``false`` can be a legitimate value for an unrelated Douyin
+        # cookie.  It is only invalid for the API's cross-domain msToken.
+        if is_ms_token and (
+            not value.strip() or value.strip().lower() == "false"
+        ):
+            continue
+
+        expires = cookie.get("expires")
+        try:
+            # Playwright uses 0 or -1 for session cookies; only positive
+            # timestamps represent an expiry that can make a cookie stale.
+            if expires is not None and float(expires) > 0 and float(expires) <= time.time():
+                continue
+        except (TypeError, ValueError):
+            # Keep cookies with an unparseable expiry; the browser has already
+            # made the authoritative expiry decision when returning them.
+            pass
+
+        priority = 0 if is_douyin else 1
+        previous = selected.get(name)
+        candidate = (priority, index, value)
+        if previous is None:
+            order.append(name)
+            selected[name] = candidate
+        elif priority < previous[0]:
+            selected[name] = candidate
+
+    return [f"{name}={selected[name][2]}" for name in order if name in selected]
+
+
 # ── Extraction ────────────────────────────────────────────────────
 
 def extract_with_playwright(
     profile_dir: str | Path | None = None,
     headless: bool = True,
     timeout: int = 30000,
-) -> Optional[str]:
+    *,
+    include_user_agent: bool = False,
+) -> Optional[str] | tuple[Optional[str], Optional[str]]:
     """Launch Firefox via Playwright, navigate to douyin.com, extract cookies.
 
     Uses a persistent browser context so login state survives across runs.
@@ -47,7 +111,8 @@ def extract_with_playwright(
         timeout: Navigation timeout in milliseconds.
 
     Returns:
-        Semicolon-joined cookie string, or None on failure.
+        Semicolon-joined cookie string, or None on failure. When
+        ``include_user_agent`` is true, returns ``(cookie_string, user_agent)``.
     """
     profile_dir = _normalize_profile_dir(profile_dir)
 
@@ -59,7 +124,7 @@ def extract_with_playwright(
             "  uv add playwright\n"
             "  playwright install firefox"
         )
-        return None
+        return (None, None) if include_user_agent else None
 
     profile_dir.mkdir(parents=True, exist_ok=True)
 
@@ -97,18 +162,20 @@ def extract_with_playwright(
                 except Exception as exc:
                     logger.debug("Page navigation warning: %s", exc)
 
+                user_agent = None
+                if include_user_agent:
+                    try:
+                        user_agent = str(page.evaluate("() => navigator.userAgent") or "") or None
+                    except Exception:
+                        pass
                 all_cookies = browser.cookies()
                 browser.close()
 
-                douyin_cookies = [
-                    f"{c['name']}={c['value']}"
-                    for c in all_cookies
-                    if c.get("domain", "") in DOUYIN_DOMAINS
-                ]
+                douyin_cookies = collect_douyin_cookies(all_cookies)
 
                 if not douyin_cookies:
                     logger.warning("No douyin.com cookies in browser context")
-                    return None
+                    return (None, user_agent) if include_user_agent else None
 
                 logger.info(
                     "Extracted %d douyin cookies (%d chars) via Playwright%s",
@@ -116,7 +183,8 @@ def extract_with_playwright(
                     sum(len(c) for c in douyin_cookies) + len(douyin_cookies) - 1,
                     " (--headless=new)" if extra_args else "",
                 )
-                return "; ".join(douyin_cookies)
+                cookie_str = "; ".join(douyin_cookies)
+                return (cookie_str, user_agent) if include_user_agent else cookie_str
 
         except Exception as exc:
             last_error = exc
@@ -128,7 +196,29 @@ def extract_with_playwright(
                 continue
 
     logger.error("Playwright extraction failed: %s", last_error)
-    return None
+    return (None, None) if include_user_agent else None
+
+
+def extract_cookies_with_user_agent(
+    profile_dir: str | Path | None = None,
+    headless: bool = True,
+    validate: bool = True,
+) -> tuple[Optional[str], Optional[str], str]:
+    """Extract and optionally validate cookies together with Firefox UA."""
+    profile_dir = _normalize_profile_dir(profile_dir)
+    result = extract_with_playwright(
+        profile_dir, headless=headless, include_user_agent=True
+    )
+    cookie_str, user_agent = result
+    if cookie_str is None:
+        return None, user_agent, "未找到抖音 cookie，请确认已登录。"
+    grade, _ = _assess_quality(cookie_str)
+    if not validate:
+        return cookie_str, user_agent, f"Cookie 已提取 ({len(cookie_str)} 字符) — {grade}"
+    valid, reason = validate_cookie(cookie_str, user_agent=user_agent)
+    if valid:
+        return cookie_str, user_agent, f"Cookie 有效 ({len(cookie_str)} 字符) — {grade}"
+    return None, user_agent, f"Cookie 已过期或无效：{reason}"
 
 
 # ── Cookie quality ────────────────────────────────────────────────
@@ -163,7 +253,11 @@ def _assess_quality(cookie_str: str) -> tuple[str, bool]:
 
 # ── Validation ─────────────────────────────────────────────────────
 
-def validate_cookie(cookie_str: str, timeout: int = 15) -> tuple[bool, str]:
+def validate_cookie(
+    cookie_str: str,
+    timeout: int = 15,
+    user_agent: str | None = None,
+) -> tuple[bool, str]:
     """Test a cookie against douyin.com to check if it's still valid.
 
     Args:
@@ -174,7 +268,7 @@ def validate_cookie(cookie_str: str, timeout: int = 15) -> tuple[bool, str]:
         (is_valid, reason).
     """
     headers = {
-        "User-Agent": (
+        "User-Agent": user_agent or (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/130.0.0.0 Safari/537.36"
@@ -415,11 +509,8 @@ def check_auth_cookies(profile_dir: Path) -> dict:
             )
 
             all_cookies = browser.cookies()
-            cookies_dict = {
-                c["name"]: c["value"]
-                for c in all_cookies
-                if c.get("domain", "") in DOUYIN_DOMAINS
-            }
+            selected_cookies = collect_douyin_cookies(all_cookies)
+            cookies_dict = _parse_cookie_dict("; ".join(selected_cookies))
 
             auth_found = [
                 name for name in _AUTH_COOKIE_NAMES if name in cookies_dict

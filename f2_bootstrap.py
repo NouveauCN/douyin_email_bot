@@ -159,6 +159,7 @@ def bootstrap_f2(project_dir: Path | None = None) -> None:
     token_manager = _douyin_utils.TokenManager
     if not getattr(token_manager, "_douyin_email_bot_patched", False):
         orig_gen_real = token_manager.gen_real_msToken.__func__
+        token_manager._douyin_email_bot_original_gen_real_msToken = orig_gen_real
 
         @classmethod
         def safe_gen_real_ms_token(cls):
