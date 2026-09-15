@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import "./network-policy.js";
 import { BridgeClient } from "./bridge.js";
 import { loadConfig } from "./config.js";
 import { createGateway } from "./gateway.js";

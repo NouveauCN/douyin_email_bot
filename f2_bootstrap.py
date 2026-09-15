@@ -99,6 +99,9 @@ def bootstrap_f2(project_dir: Path | None = None) -> None:
     import ordering.  The function is idempotent for callers that invoke it
     from more than one entry point in the same process.
     """
+    from network_policy import enforce_direct_network
+
+    enforce_direct_network()
     global _BOOTSTRAPPED
     if _BOOTSTRAPPED:
         return
@@ -111,6 +114,10 @@ def bootstrap_f2(project_dir: Path | None = None) -> None:
     # entry points.
     import f2.apps.douyin.utils as _douyin_utils
     import f2.apps.bark.utils as _bark_utils
+
+    # TokenManager caches its configured proxies when its class is imported.
+    _douyin_utils.ClientConfManager.proxies = classmethod(lambda cls: {})
+    _douyin_utils.TokenManager.proxies = {}
 
     douyin_ccm = _douyin_utils.ClientConfManager
     if not getattr(douyin_ccm, "_douyin_email_bot_patched", False):

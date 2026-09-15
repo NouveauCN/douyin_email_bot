@@ -4,6 +4,7 @@ import logging
 import re
 import shutil
 import subprocess
+from network_policy import direct_environment
 import time
 from datetime import datetime
 from pathlib import Path
@@ -70,6 +71,7 @@ class BilibiliDownloader:
         try:
             completed = subprocess.run(
                 command,
+                env=direct_environment(),
                 cwd=download_dir,
                 capture_output=True,
                 text=True,
@@ -139,6 +141,7 @@ class BilibiliDownloader:
             "--output-format",
             "mp4",
             "--no-progress",
+            "--proxy", "no",
             "--no-color",
             "--no-danmaku",
             "--no-subtitle",
@@ -229,6 +232,7 @@ def _resolve_b23_url(url: str) -> str | None:
             current,
             headers={"User-Agent": "Mozilla/5.0"},
             follow_redirects=False,
+            trust_env=False,
             timeout=10,
         )
         if response.status_code not in {301, 302, 303, 307, 308}:
@@ -249,6 +253,7 @@ def _fetch_bilibili_metadata(video_id: str | None) -> tuple[str, None]:
         response = httpx.get(
             "https://api.bilibili.com/x/web-interface/view",
             params=params,
+            trust_env=False,
             headers={"User-Agent": "Mozilla/5.0"},
             timeout=10,
         )

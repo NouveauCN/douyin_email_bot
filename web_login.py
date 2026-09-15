@@ -47,6 +47,7 @@ from cookie_extractor import (  # noqa: E402
     collect_douyin_cookies,
     screenshot_qr_code,
 )
+from network_policy import direct_firefox_options
 
 
 def validate_douyin_metadata(url: str, cookie: str, user_agent: str, timeout: int = 15):
@@ -162,6 +163,7 @@ class RemoteBrowserSession:
             profile_dir.mkdir(parents=True, exist_ok=True)
             playwright = sync_playwright().start()
             context = playwright.firefox.launch_persistent_context(
+                **direct_firefox_options(),
                 user_data_dir=str(profile_dir),
                 headless=True,
                 viewport={"width": self._width, "height": self._height},

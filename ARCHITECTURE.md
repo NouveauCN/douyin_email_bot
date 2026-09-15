@@ -64,6 +64,13 @@ dependencies of the task contracts.
 
 ### Douyin login identity verification
 
+All application traffic is direct-only, including bot downloads, file-browser
+login validation, Firefox, yutto, and the QQ gateway. Compose clears runtime and
+build proxy variables. Startup sanitizes inherited environments, Firefox
+overrides persisted proxy preferences, yutto explicitly disables proxies, and
+first-party HTTPX calls do not trust proxy environment variables. This does not
+modify the Docker daemon's image-pull settings or host/router transparent routing.
+
 Web Login and the Firefox CLI share Cookie collection. They retain Douyin
 cookies and may additionally extract only a valid `msToken` from the exact
 `bytedance.com` domain; other cookies from that domain are excluded. A valid

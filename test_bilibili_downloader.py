@@ -7,7 +7,8 @@ from bilibili_downloader import BilibiliDownloader
 from config_loader import BilibiliConfig
 
 
-def test_download_uses_shared_media_root_for_videos_and_moved_covers(tmp_path):
+def test_download_uses_shared_media_root_for_videos_and_moved_covers(tmp_path, monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:8888")
     shared_root = tmp_path / "downloads"
     download_dir = shared_root / "bilibili"
     video = download_dir / "video.mp4"
@@ -20,7 +21,7 @@ def test_download_uses_shared_media_root_for_videos_and_moved_covers(tmp_path):
         patch(
             "bilibili_downloader.subprocess.run",
             return_value=CompletedProcess([], 0, stdout="Title: demo", stderr=""),
-        ),
+        ) as run,
         patch("bilibili_downloader._move_cover_files", return_value=[cover]),
         patch("bilibili_downloader._collect_downloaded_files", return_value=[video]),
         patch("bilibili_downloader._fetch_bilibili_metadata", return_value=("Bilibili", "20240101_010203")),
@@ -30,6 +31,10 @@ def test_download_uses_shared_media_root_for_videos_and_moved_covers(tmp_path):
 
     assert result["success"] is True
     process.assert_called_once_with([video, cover], shared_root)
+    command = run.call_args.args[0]
+    assert command[command.index("--proxy") + 1] == "no"
+    assert run.call_args.kwargs["env"]["HTTPS_PROXY"] == ""
+    assert run.call_args.kwargs["env"]["NO_PROXY"] == "*"
 
 
 def test_extracts_bv_and_av_ids():

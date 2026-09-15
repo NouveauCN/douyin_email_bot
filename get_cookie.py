@@ -25,6 +25,7 @@ from cookie_extractor import (
     extract_cookies_with_user_agent,
     validate_cookie,
 )
+from network_policy import direct_firefox_options
 from settings_store import SettingsStore, default_database_path
 
 PROJECT_DIR = Path(__file__).parent
@@ -68,6 +69,7 @@ def interactive_login(
     try:
         with sync_playwright() as p:
             browser = p.firefox.launch_persistent_context(
+                **direct_firefox_options(),
                 user_data_dir=str(profile_dir),
                 headless=False,
                 viewport={"width": 1280, "height": 720},
