@@ -127,6 +127,32 @@ SHORT_LINK_CACHE_PATH = Path(
 )
 SHORT_LINK_CACHE_SCHEMA = "https-validated-v1"
 
+# Track F2 403 fallback usage for deciding whether to fully remove F2.
+_F2_403_LOG = Path(__file__).parent / "logs" / "f2_403_fallback.log"
+
+
+def _record_f2_403_fallback(aweme_id: str) -> None:
+    """Append a timestamped line when the Playwright fallback is used."""
+    try:
+        _F2_403_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with _F2_403_LOG.open("a") as f:
+            f.write(f"{datetime.utcnow().isoformat()}\t{aweme_id}\n")
+    except OSError:
+        logger.debug("Failed to write F2 403 fallback log", exc_info=True)
+
+# Track F2 403 fallback usage for deciding whether to fully remove F2.
+_F2_403_LOG = Path(__file__).parent / "logs" / "f2_403_fallback.log"
+
+
+def _record_f2_403_fallback(aweme_id: str) -> None:
+    """Append a timestamped line when the Playwright fallback is used."""
+    try:
+        _F2_403_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with _F2_403_LOG.open("a") as f:
+            f.write(f"{datetime.utcnow().isoformat()}\t{aweme_id}\n")
+    except OSError:
+        logger.debug("Failed to write F2 403 fallback log", exc_info=True)
+
 
 async def _playwright_fetch_video_data(
     aweme_id: str,
@@ -462,6 +488,7 @@ class DouyinDownloader:
                     "aweme_id=%s, falling back to Playwright browser fetch",
                     aweme_id,
                 )
+                _record_f2_403_fallback(aweme_id)
                 video_data = await _playwright_fetch_video_data(
                     aweme_id, kwargs.get("cookie", ""),
                     kwargs.get("headers", {}).get("User-Agent"),
@@ -940,6 +967,7 @@ async def _validate_douyin_metadata_bound(
                     logger.warning(
                         "Validation: F2 got 403 for %s, trying Playwright", aweme_id,
                     )
+                    _record_f2_403_fallback(aweme_id)
                     video_data = await _playwright_fetch_video_data(
                         aweme_id, cookie, user_agent,
                     )
