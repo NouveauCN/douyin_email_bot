@@ -439,7 +439,16 @@ sudo docker compose down
   `BOT_BILIBILI_WORKER_COUNT`, `BOT_LEASE_SECONDS`, `BOT_HEARTBEAT_SECONDS`, or
   `BOT_OUTBOX_*` values: these remain managed/YAML settings unless explicitly
   injected outside Compose.
-- The bot intentionally clears proxy variables so Douyin traffic goes direct.
+- The entire stack is direct-only: bot, file_browser (including login metadata
+  validation), and qq_gateway must clear upper/lowercase proxy variables and set
+  `NO_PROXY`/`no_proxy` to `*`. Compose build arguments also disable inherited
+  build proxies. Never reintroduce automatic proxy discovery in these services.
+- F2 bootstrap enforces the direct environment before importing F2 and clears
+  cached TokenManager proxies. Firefox launches explicitly set
+  `network.proxy.type=0` with a sanitized child environment; yutto uses
+  `--proxy no`, and direct HTTPX calls disable `trust_env`. QQ clears inherited
+  proxy configuration before loading its SDK. Preserve these rules in CLI paths
+  as well as Docker. Host/router transparent routing is outside this app policy.
 - Python 3.12 is required locally and in Docker. `pyproject.toml` declares the
   exact direct dependencies, `uv.lock` is the authoritative transitive lock,
   and Docker installs it with `uv sync --frozen`; do not restore a parallel

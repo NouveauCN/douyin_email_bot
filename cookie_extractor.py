@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
+from network_policy import direct_firefox_options
 
 logger = logging.getLogger("CookieExtractor")
 
@@ -142,6 +143,7 @@ def extract_with_playwright(
         try:
             with sync_playwright() as p:
                 launch_kwargs: dict = {
+                    **direct_firefox_options(),
                     "user_data_dir": str(profile_dir),
                     "headless": use_headless,
                     "viewport": {"width": 1280, "height": 720},
@@ -279,7 +281,7 @@ def validate_cookie(
 
     try:
         with httpx.Client(
-            timeout=timeout, follow_redirects=True, headers=headers
+            timeout=timeout, follow_redirects=True, headers=headers, trust_env=False
         ) as client:
             resp = client.get(DOUYIN_HOMEPAGE)
 
@@ -397,6 +399,7 @@ def screenshot_qr_code(
     try:
         with sync_playwright() as p:
             browser = p.firefox.launch_persistent_context(
+                **direct_firefox_options(),
                 user_data_dir=str(profile_dir),
                 headless=True,
                 viewport={"width": 1280, "height": 720},
@@ -462,6 +465,7 @@ def check_auth_cookies(profile_dir: Path) -> dict:
     try:
         with sync_playwright() as p:
             browser = p.firefox.launch_persistent_context(
+                **direct_firefox_options(),
                 user_data_dir=str(profile_dir),
                 headless=True,
                 viewport={"width": 1280, "height": 720},

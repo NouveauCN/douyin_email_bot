@@ -1,6 +1,22 @@
+x-direct-network-build-args: &direct-network-build-args
+  HTTP_PROXY: ""
+  HTTPS_PROXY: ""
+  ALL_PROXY: ""
+  FTP_PROXY: ""
+  SOCKS_PROXY: ""
+  http_proxy: ""
+  https_proxy: ""
+  all_proxy: ""
+  ftp_proxy: ""
+  socks_proxy: ""
+  NO_PROXY: "*"
+  no_proxy: "*"
+
 services:
   bot:
-    build: .
+    build:
+      context: .
+      args: *direct-network-build-args
     container_name: douyin_email_bot
     restart: unless-stopped
     volumes:
@@ -29,18 +45,30 @@ services:
       - QQBOT_REPLY_WINDOW_SECONDS=${QQBOT_REPLY_WINDOW_SECONDS:-3600}
       - QQBOT_OUTBOX_LEASE_SECONDS=${QQBOT_OUTBOX_LEASE_SECONDS:-120}
       - TZ=Asia/Shanghai
-      # Keep Douyin traffic direct even when the Docker host has proxy vars set.
+      # All services and subprocesses must connect directly.
       - HTTP_PROXY=
       - HTTPS_PROXY=
       - ALL_PROXY=
-      - NO_PROXY=
+      - FTP_PROXY=
+      - SOCKS_PROXY=
       - http_proxy=
       - https_proxy=
       - all_proxy=
-      - no_proxy=
+      - ftp_proxy=
+      - socks_proxy=
+      - NO_PROXY=*
+      - no_proxy=*
+      - NODE_USE_ENV_PROXY=0
+      - GLOBAL_AGENT_HTTP_PROXY=
+      - GLOBAL_AGENT_HTTPS_PROXY=
+      - GLOBAL_AGENT_NO_PROXY=*
+      - npm_config_proxy=
+      - npm_config_https_proxy=
 
   file_browser:
-    build: .
+    build:
+      context: .
+      args: *direct-network-build-args
     container_name: douyin_file_browser
     restart: unless-stopped
     ports:
@@ -64,6 +92,25 @@ services:
       - COOKIE_PROFILE_DIR=/app/firefox_profile
       - WEB_LOGIN_PASSWORD=${WEB_LOGIN_PASSWORD:-}
       - TZ=Asia/Shanghai
+      # All services and subprocesses must connect directly.
+      - HTTP_PROXY=
+      - HTTPS_PROXY=
+      - ALL_PROXY=
+      - FTP_PROXY=
+      - SOCKS_PROXY=
+      - http_proxy=
+      - https_proxy=
+      - all_proxy=
+      - ftp_proxy=
+      - socks_proxy=
+      - NO_PROXY=*
+      - no_proxy=*
+      - NODE_USE_ENV_PROXY=0
+      - GLOBAL_AGENT_HTTP_PROXY=
+      - GLOBAL_AGENT_HTTPS_PROXY=
+      - GLOBAL_AGENT_NO_PROXY=*
+      - npm_config_proxy=
+      - npm_config_https_proxy=
       # Leave empty unless an exact trusted origin is explicitly configured;
       # Settings PATCH intentionally returns 403 without this allowlist.
       - FILE_BROWSER_ALLOWED_ORIGINS=${FILE_BROWSER_ALLOWED_ORIGINS:-}
@@ -78,7 +125,9 @@ services:
     command: ["python3", "file_browser.py"]
 
   qq_gateway:
-    build: ./qq_gateway
+    build:
+      context: ./qq_gateway
+      args: *direct-network-build-args
     container_name: douyin_qq_gateway
     restart: unless-stopped
     depends_on:
@@ -96,6 +145,25 @@ services:
       - QQBOT_OUTBOX_CLAIM_SIZE=${QQBOT_OUTBOX_CLAIM_SIZE:-10}
       - QQBOT_REQUEST_TIMEOUT_MS=${QQBOT_REQUEST_TIMEOUT_MS:-15000}
       - TZ=Asia/Shanghai
+      # All services and subprocesses must connect directly.
+      - HTTP_PROXY=
+      - HTTPS_PROXY=
+      - ALL_PROXY=
+      - FTP_PROXY=
+      - SOCKS_PROXY=
+      - http_proxy=
+      - https_proxy=
+      - all_proxy=
+      - ftp_proxy=
+      - socks_proxy=
+      - NO_PROXY=*
+      - no_proxy=*
+      - NODE_USE_ENV_PROXY=0
+      - GLOBAL_AGENT_HTTP_PROXY=
+      - GLOBAL_AGENT_HTTPS_PROXY=
+      - GLOBAL_AGENT_NO_PROXY=*
+      - npm_config_proxy=
+      - npm_config_https_proxy=
 
 volumes:
   logs:
