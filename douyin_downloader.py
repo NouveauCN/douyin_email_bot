@@ -431,7 +431,8 @@ class DouyinDownloader:
         slides_dir.mkdir(parents=True, exist_ok=True)
 
         # ── Build download queues ──────────────────────────────────
-        static_urls = [u.strip() for u in images if isinstance(u, str) and u.strip()]
+        # images may be flat URL strings or dicts with a nested url_list.
+        static_urls = _extract_image_urls(images)
         static_ext = ".webp"
         if static_urls:
             first = static_urls[0]
@@ -440,7 +441,8 @@ class DouyinDownloader:
             elif ".png" in first:
                 static_ext = ".png"
 
-        video_urls = [u.strip() for u in images_video if isinstance(u, str) and u.strip()]
+        # images_video is a list-of-lists from _to_dict(); flatten it.
+        video_urls = _extract_image_video_urls(images_video)
 
         # Animated clips → author folder (same logic as videos)
         # Only create the author directory if there are actually clips to put there.
@@ -796,6 +798,51 @@ async def _validate_douyin_metadata_bound(
 def _normalize_share_url(url: str) -> str:
     """Keep share URLs as-is; short-link resolution enforces HTTPS."""
     return url.strip()
+
+
+def _extract_image_urls(images: list) -> list[str]:
+    """Extract image download URLs from a list of image objects.
+
+    Each image may be a plain URL string or a dict with ``url_list`` /
+    ``download_url_list`` keys (as returned by the Playwright detail API).
+    """
+    urls: list[str] = []
+    for img in images:
+        if isinstance(img, str):
+            u = img.strip()
+            if u:
+                urls.append(u)
+        elif isinstance(img, dict):
+            for key in ("url_list", "download_url_list"):
+                candidates = img.get(key)
+                if isinstance(candidates, (list, tuple)):
+                    for u in candidates:
+                        if isinstance(u, str) and u.strip():
+                            urls.append(u.strip())
+                            break
+                if urls:
+                    break
+    return urls
+
+
+def _extract_image_video_urls(images_video: list) -> list[str]:
+    """Flatten the images_video list-of-lists into a flat URL list.
+
+    ``images_video`` from ``_PlaywrightVideoData._to_dict()`` is a list
+    where each element is the video URL list for one image (or a bare
+    URL string for legacy callers).
+    """
+    urls: list[str] = []
+    for item in images_video:
+        if isinstance(item, str):
+            u = item.strip()
+            if u:
+                urls.append(u)
+        elif isinstance(item, (list, tuple)):
+            for u in item:
+                if isinstance(u, str) and u.strip():
+                    urls.append(u.strip())
+    return urls
 
 
 def _positive_int(value) -> int:
