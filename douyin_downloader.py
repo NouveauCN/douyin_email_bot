@@ -164,7 +164,7 @@ async def _playwright_fetch_video_data(
 ) -> _PlaywrightVideoData | None:
     """Fetch video metadata using the Playwright browser (a_bogus fallback)."""
     try:
-        raw = await _pw_fetcher.fetch_aweme_detail(aweme_id, cookie, user_agent)
+        raw = _pw_fetcher.fetch_aweme_detail(aweme_id, cookie, user_agent)
     except Exception as exc:
         logger.error("Playwright metadata fetch failed for %s: %s", aweme_id, exc)
         return None
