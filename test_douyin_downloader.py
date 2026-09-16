@@ -10,11 +10,6 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 
-# F2 reads browser-model defaults during import, matching main.py's bootstrap.
-from f2_bootstrap import bootstrap_f2
-
-bootstrap_f2()
-
 import douyin_downloader
 
 
@@ -146,7 +141,7 @@ class DouyinDownloadTests(unittest.IsolatedAsyncioTestCase):
         download.assert_not_called()
 
     def test_metadata_validation_maps_access_denied_without_exposing_exception(self):
-        denied = douyin_downloader.APIResponseError("cookie=secret https://private.example", 403)
+        denied = douyin_downloader.APIResponseError("cookie=secret https://private.example", status_code=403)
         with patch.object(
             douyin_downloader, "_validate_douyin_metadata_async", side_effect=denied
         ):
@@ -158,13 +153,11 @@ class DouyinDownloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("secret", str(result))
 
     async def test_metadata_validation_rejects_empty_returned_aweme_id(self):
-        fake_handler = SimpleNamespace(
-            fetch_one_video=AsyncMock(
-                return_value=SimpleNamespace(_to_dict=lambda: {"images": ["image"]})
-            )
+        fake_video_data = SimpleNamespace(
+            _to_dict=lambda: {"images": ["image"]}
         )
         with patch.object(douyin_downloader, "_resolve_aweme_id", new=AsyncMock(return_value="123")), \
-                patch.object(douyin_downloader, "DouyinHandler", return_value=fake_handler):
+                patch.object(douyin_downloader, "_playwright_fetch_video_data", new=AsyncMock(return_value=fake_video_data)):
             result = await asyncio.to_thread(
                 douyin_downloader.validate_douyin_metadata,
                 "https://www.douyin.com/video/123",
@@ -173,102 +166,6 @@ class DouyinDownloadTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result["success"])
         self.assertEqual(result["category"], "unavailable")
-
-    def test_current_cookie_mstoken_is_bound_to_f2_model(self):
-        from f2.apps.douyin.model import BaseRequestModel, PostDetail
-
-        original = BaseRequestModel.model_fields["msToken"].default
-        try:
-            douyin_downloader._configure_f2_request_identity(
-                "sessionid=secret; msToken=current-session-token"
-            )
-            assert PostDetail(aweme_id="123").msToken == "current-session-token"
-        finally:
-            BaseRequestModel.model_fields["msToken"].default = original
-
-    def test_missing_mstoken_does_not_reuse_previous_request_token(self):
-        from f2.apps.douyin.model import PostDetail
-
-        reset = douyin_downloader._configure_f2_request_identity(
-            "sessionid=secret; msToken=old-token"
-        )
-        assert PostDetail(aweme_id="123").msToken == "old-token"
-        douyin_downloader._CURRENT_MS_TOKEN.reset(reset)
-        reset = douyin_downloader._configure_f2_request_identity("sessionid=secret")
-        try:
-            assert PostDetail(aweme_id="123").msToken != "old-token"
-        finally:
-            douyin_downloader._CURRENT_MS_TOKEN.reset(reset)
-
-    def test_strict_identity_rejects_false_generated_mstoken(self):
-        from f2.apps.douyin.model import PostDetail
-        from f2.apps.douyin.utils import TokenManager
-
-        reset = douyin_downloader._configure_f2_request_identity(
-            "sessionid=secret", require_real_ms_token=True
-        )
-        try:
-            with patch.object(
-                TokenManager,
-                "_douyin_email_bot_original_gen_real_msToken",
-                lambda _cls: "false",
-            ):
-                with self.assertRaises(douyin_downloader.DouyinTokenError):
-                    PostDetail(aweme_id="123")
-        finally:
-            douyin_downloader._reset_f2_request_identity(reset)
-
-    def test_request_model_uses_paired_identity_and_nested_context_restores(self):
-        from f2.apps.douyin.model import PostDetail
-
-        previous_identity = douyin_downloader.identity_snapshot()
-        douyin_downloader.update_identity(
-            "sessionid=outer; msToken=outer-token",
-            "Mozilla/5.0 Firefox/120.0",
-        )
-        cookie, user_agent = douyin_downloader.identity_snapshot()
-        outer = douyin_downloader._configure_f2_request_identity(cookie, user_agent)
-        try:
-            request = PostDetail(aweme_id="outer")
-            assert request.msToken == "outer-token"
-            assert request.browser_name == "Firefox"
-            assert request.browser_version == "120.0"
-
-            inner = douyin_downloader._configure_f2_request_identity(
-                "sessionid=inner; msToken=inner-token",
-                "Mozilla/5.0 Firefox/121.0",
-            )
-            try:
-                request = PostDetail(aweme_id="inner")
-                assert request.msToken == "inner-token"
-                assert request.browser_name == "Firefox"
-                assert request.browser_version == "121.0"
-            finally:
-                douyin_downloader._reset_f2_request_identity(inner)
-
-            request = PostDetail(aweme_id="restored")
-            assert request.msToken == "outer-token"
-            assert request.browser_version == "120.0"
-        finally:
-            douyin_downloader._reset_f2_request_identity(outer)
-            douyin_downloader.update_identity(*previous_identity)
-
-    async def test_mstoken_is_task_local(self):
-        from f2.apps.douyin.model import PostDetail
-
-        async def build(cookie, delay):
-            reset = douyin_downloader._configure_f2_request_identity(cookie)
-            try:
-                import asyncio
-                await asyncio.sleep(delay)
-                return PostDetail(aweme_id="123").msToken
-            finally:
-                douyin_downloader._CURRENT_MS_TOKEN.reset(reset)
-
-        values = await asyncio.gather(
-            build("msToken=token-a", 0.01), build("msToken=token-b", 0)
-        )
-        assert values == ["token-a", "token-b"]
 
     def test_media_access_denied_is_reported_as_cookie_required(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -371,17 +268,10 @@ class DouyinDownloadTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn('"aweme_id": "9999999999"', rewritten)
 
     async def test_http_short_link_input_is_rejected_without_fallback(self):
-        with patch.object(
-            douyin_downloader.AwemeIdFetcher,
-            "get_aweme_id",
-            new=AsyncMock(),
-        ) as fallback:
-            with self.assertRaises(douyin_downloader.APITimeoutError):
-                await douyin_downloader._resolve_aweme_id(
-                    "http://v.douyin.com/AbC123/"
-                )
-
-        fallback.assert_not_awaited()
+        with self.assertRaises(douyin_downloader.APITimeoutError):
+            await douyin_downloader._resolve_aweme_id(
+                "http://v.douyin.com/AbC123/"
+            )
 
     async def test_redirect_accepts_only_approved_hosts_and_paths(self):
         locations = (

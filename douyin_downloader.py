@@ -1,6 +1,8 @@
-"""Douyin video & slideshow downloader — wraps F2's async API behind a sync interface.
+"""Douyin video & slideshow downloader — fetches metadata via Playwright browser.
 
-Fetches metadata via F2, then downloads the content directly using httpx.
+Uses a real Firefox browser to call Douyin's API (the browser's JS
+automatically generates correct a_bogus signatures), then downloads
+the content directly using httpx.
 Supports:
   - Regular videos (media_type=4)
   - Slideshows / 图文 (media_type=42, aweme_type=68)
@@ -16,29 +18,13 @@ import stat
 import tempfile
 import threading
 import time
-from contextvars import ContextVar
 from collections.abc import Mapping
-from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 import httpx
 from colorama import Fore, Style
-from f2.apps.douyin.handler import DouyinHandler
-from f2.apps.douyin.utils import AwemeIdFetcher
-from f2.exceptions import (
-    APIConnectionError,
-    APINotFoundError,
-    APIResponseError,
-    APITimeoutError,
-)
-try:
-    from f2.exceptions import APIUnauthorizedError
-except ImportError:  # Older F2 releases fold this into APIResponseError.
-    APIUnauthorizedError = APIResponseError
-
-from f2_bootstrap import firefox_user_agent
 
 from media_processor import log_process_result, process_media
 from media_file_lock import media_file_lock
@@ -46,7 +32,34 @@ import playwright_douyin_fetcher as _pw_fetcher
 
 logger = logging.getLogger("DouyinDownloader")
 
-_DOUYIN_USER_AGENT = firefox_user_agent()
+# ── Local exception stubs (replacing F2 imports) ─────────────────────
+
+
+class APINotFoundError(Exception):
+    """Resource not found."""
+
+
+class APIResponseError(Exception):
+    """Unexpected API response."""
+
+    def __init__(self, msg: str = "", *, status_code: int | None = None):
+        super().__init__(msg)
+        self.status_code = status_code
+
+
+class APITimeoutError(Exception):
+    """API request timed out."""
+
+
+class APIConnectionError(Exception):
+    """Network connection failed."""
+
+
+class APIUnauthorizedError(Exception):
+    """API access unauthorized."""
+
+
+_DOUYIN_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:153.0) Gecko/20100101 Firefox/153.0"
 _IDENTITY_LOCK = threading.RLock()
 _IDENTITY_COOKIE = ""
 _IDENTITY_USER_AGENT = _DOUYIN_USER_AGENT
@@ -57,7 +70,7 @@ def update_identity(cookie: str | None, user_agent: str | None = None) -> None:
     global _IDENTITY_COOKIE, _IDENTITY_USER_AGENT, _DOUYIN_USER_AGENT
     with _IDENTITY_LOCK:
         _IDENTITY_COOKIE = "" if cookie is None else str(cookie)
-        _IDENTITY_USER_AGENT = str(user_agent or firefox_user_agent())
+        _IDENTITY_USER_AGENT = str(user_agent or _DOUYIN_USER_AGENT)
         _DOUYIN_USER_AGENT = _IDENTITY_USER_AGENT
 
 
@@ -67,10 +80,10 @@ def identity_snapshot() -> tuple[str, str]:
 
 
 class _PlaywrightVideoData:
-    """Mimics F2's PostDetailFilter interface using Playwright-fetched raw JSON.
+    """Mimics a PostDetailFilter-like interface using Playwright-fetched raw JSON.
 
     Provides ``_to_raw()`` and ``_to_dict()`` so downstream code that expects
-    a PostDetailFilter-like object can work without changes.
+    a filter-like object can work without changes.
     """
 
     def __init__(self, raw_response: dict):
@@ -130,39 +143,13 @@ SHORT_LINK_CACHE_PATH = Path(
 )
 SHORT_LINK_CACHE_SCHEMA = "https-validated-v1"
 
-# Track F2 403 fallback usage for deciding whether to fully remove F2.
-_F2_403_LOG = Path(__file__).parent / "logs" / "f2_403_fallback.log"
-
-
-def _record_f2_403_fallback(aweme_id: str) -> None:
-    """Append a timestamped line when the Playwright fallback is used."""
-    try:
-        _F2_403_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with _F2_403_LOG.open("a") as f:
-            f.write(f"{datetime.utcnow().isoformat()}\t{aweme_id}\n")
-    except OSError:
-        logger.debug("Failed to write F2 403 fallback log", exc_info=True)
-
-# Track F2 403 fallback usage for deciding whether to fully remove F2.
-_F2_403_LOG = Path(__file__).parent / "logs" / "f2_403_fallback.log"
-
-
-def _record_f2_403_fallback(aweme_id: str) -> None:
-    """Append a timestamped line when the Playwright fallback is used."""
-    try:
-        _F2_403_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with _F2_403_LOG.open("a") as f:
-            f.write(f"{datetime.utcnow().isoformat()}\t{aweme_id}\n")
-    except OSError:
-        logger.debug("Failed to write F2 403 fallback log", exc_info=True)
-
 
 async def _playwright_fetch_video_data(
     aweme_id: str,
     cookie: str,
     user_agent: str | None = None,
 ) -> _PlaywrightVideoData | None:
-    """Fetch video metadata using the Playwright browser (a_bogus fallback)."""
+    """Fetch video metadata using the Playwright browser."""
     try:
         raw = _pw_fetcher.fetch_aweme_detail(aweme_id, cookie, user_agent)
     except Exception as exc:
@@ -186,7 +173,7 @@ class DouyinAccessError(RuntimeError):
 
 
 class DouyinTokenError(RuntimeError):
-    """F2 could not obtain a real request token for metadata validation."""
+    """The session token required for metadata validation is unavailable."""
 
 
 _MEDIA_COOKIE_HOSTS = frozenset({
@@ -229,147 +216,11 @@ def _cookie_value(cookie: str, name: str) -> str | None:
     return None
 
 
-def _configure_f2_request_identity(
-    cookie: str,
-    user_agent: str | None = None,
-    *,
-    require_real_ms_token: bool = False,
-):
-    """Make F2's already-imported Pydantic request model use this session.
-
-    F2 evaluates BaseRequestModel defaults at module import time.  Updating the
-    field default immediately before constructing the handler keeps msToken
-    paired with the current browser Cookie instead of a process-static token.
-    """
-    token = _cookie_value(cookie, "msToken")
-    if token and token.strip().lower() == "false":
-        token = None
-    reset_token = _CURRENT_MS_TOKEN.set(token)
-    reset_ua = _CURRENT_USER_AGENT.set(user_agent or _DOUYIN_USER_AGENT)
-    reset_strict = _REQUIRE_REAL_MS_TOKEN.set(require_real_ms_token)
-    try:
-        from f2.apps.douyin.model import BaseRequestModel
-        if not getattr(BaseRequestModel, "_douyin_email_bot_mstoken_patch", False):
-            original_init = BaseRequestModel.__init__
-
-            def init_with_session_token(self, **data):
-                _check_validation_deadline()
-                token = _CURRENT_MS_TOKEN.get()
-                if token:
-                    data.setdefault("msToken", token)
-                else:
-                    try:
-                        from f2.apps.douyin.utils import TokenManager
-                        if _REQUIRE_REAL_MS_TOKEN.get():
-                            original_generator = getattr(
-                                TokenManager,
-                                "_douyin_email_bot_original_gen_real_msToken",
-                                None,
-                            )
-                            generated = (
-                                original_generator(TokenManager)
-                                if original_generator is not None
-                                else TokenManager.gen_real_msToken()
-                            )
-                        else:
-                            generated = TokenManager.gen_real_msToken()
-                        if _REQUIRE_REAL_MS_TOKEN.get() and (
-                            not generated or str(generated).strip().lower() == "false"
-                        ):
-                            raise DouyinTokenError("F2 did not generate a real msToken")
-                        data.setdefault("msToken", generated)
-                    except Exception:
-                        if _REQUIRE_REAL_MS_TOKEN.get():
-                            raise DouyinTokenError(
-                                "F2 could not generate a real msToken"
-                            ) from None
-                        # F2's Pydantic field is a string; use its documented
-                        # false sentinel without retaining a prior token.
-                        data.setdefault("msToken", "false")
-                _check_validation_deadline()
-                ua = _CURRENT_USER_AGENT.get()
-                if ua:
-                    match = re.search(r"Firefox/(\d+(?:\.\d+)*)", ua)
-                    data.setdefault("browser_name", "Firefox" if match else "Firefox")
-                    if match:
-                        data.setdefault("browser_version", match.group(1))
-                original_init(self, **data)
-
-            BaseRequestModel.__init__ = init_with_session_token
-            BaseRequestModel._douyin_email_bot_mstoken_patch = True
-        _IDENTITY_RESETS[id(reset_token)] = (reset_ua, reset_strict)
-        return reset_token
-    except (ImportError, AttributeError, TypeError):
-        logger.debug("Unable to bind current msToken to F2 request model", exc_info=True)
-        _CURRENT_MS_TOKEN.reset(reset_token)
-        _CURRENT_USER_AGENT.reset(reset_ua)
-        _REQUIRE_REAL_MS_TOKEN.reset(reset_strict)
-        return None
-
-
-_CURRENT_MS_TOKEN: ContextVar[str | None] = ContextVar(
-    "douyin_ms_token", default=None,
-)
-_CURRENT_USER_AGENT: ContextVar[str | None] = ContextVar("douyin_user_agent", default=None)
-_REQUIRE_REAL_MS_TOKEN: ContextVar[bool] = ContextVar("douyin_require_real_ms_token", default=False)
-_IDENTITY_RESETS: dict[int, tuple[object, object]] = {}
 _VALIDATION_SLOTS = threading.BoundedSemaphore(2)
-_VALIDATION_LOG_SILENT: ContextVar[bool] = ContextVar(
-    "douyin_validation_log_silent", default=False,
-)
-_VALIDATION_DEADLINE: ContextVar[float | None] = ContextVar(
-    "douyin_validation_deadline", default=None,
-)
-
-
-def _check_validation_deadline() -> None:
-    deadline = _VALIDATION_DEADLINE.get()
-    if deadline is not None and time.monotonic() >= deadline:
-        raise asyncio.TimeoutError
-
-
-class _ValidationF2LogFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        return not _VALIDATION_LOG_SILENT.get()
-
-
-@contextmanager
-def _silence_f2_validation_logs():
-    """Suppress F2 request records for this validation context only."""
-    loggers = [logging.getLogger(name) for name in ("f2", "httpx", "httpcore")]
-    log_filter = _ValidationF2LogFilter()
-    handlers = set(logging.getLogger().handlers)
-    for provider_logger in loggers:
-        provider_logger.addFilter(log_filter)
-        handlers.update(provider_logger.handlers)
-    for handler in handlers:
-        handler.addFilter(log_filter)
-    reset = _VALIDATION_LOG_SILENT.set(True)
-    try:
-        yield
-    finally:
-        _VALIDATION_LOG_SILENT.reset(reset)
-        for handler in handlers:
-            handler.removeFilter(log_filter)
-        for provider_logger in loggers:
-            provider_logger.removeFilter(log_filter)
-
-
-def _reset_f2_request_identity(token) -> None:
-    """Restore both request identity context variables for nested callers."""
-    reset_pair = _IDENTITY_RESETS.pop(id(token), None)
-    _CURRENT_MS_TOKEN.reset(token)
-    if reset_pair is not None:
-        ua_token, strict_token = reset_pair
-        _CURRENT_USER_AGENT.reset(ua_token)
-        _REQUIRE_REAL_MS_TOKEN.reset(strict_token)
 
 
 class DouyinDownloader:
-    """Download Douyin videos using F2 metadata + direct httpx download.
-
-    Bridges F2's async API into a synchronous call via asyncio.run().
-    """
+    """Download Douyin videos using Playwright metadata + direct httpx download."""
 
     def __init__(self, config):
         self.config = config
@@ -453,58 +304,27 @@ class DouyinDownloader:
             return self._error("下载过程中发生未知错误")
 
     async def _download_async(self, kwargs: dict, download_dir: Path) -> dict:
-        """Fetch metadata via F2, then download directly via httpx."""
-
-        token_reset = _configure_f2_request_identity(kwargs.get("cookie", ""), kwargs.get("headers", {}).get("User-Agent"))
-        try:
-            return await self._download_async_bound(kwargs, download_dir)
-        finally:
-            if token_reset is not None:
-                _reset_f2_request_identity(token_reset)
+        """Fetch metadata via Playwright, then download directly via httpx."""
+        return await self._download_async_bound(kwargs, download_dir)
 
     async def _download_async_bound(self, kwargs: dict, download_dir: Path) -> dict:
-        """Implementation separated so the request token is always reset."""
-
-        # F2's own retry loop must not churn a risk-controlled metadata
-        # request.  Media mirrors retain the caller's configured retries.
-        metadata_kwargs = kwargs | {"max_retries": 1}
-        handler = DouyinHandler(metadata_kwargs | {"mode": "one", "path": str(download_dir),
-                                          "naming": self.config.naming,
-                                          "folderize": self.config.folderize,
-                                          "max_tasks": 1,
-                                          "music": False, "cover": False, "desc": False})
+        """Fetch metadata via Playwright, then download directly via httpx."""
 
         # Step 1: Resolve short link → aweme_id
         aweme_id = await _resolve_aweme_id(kwargs["url"])
         logger.debug("Resolved aweme_id: %s", aweme_id)
 
-        # Step 2: Fetch video metadata — try F2 first, fall back to Playwright
-        # on a_bogus 403 (F2's algorithm is outdated).
-        video_data = None
-        try:
-            video_data = await handler.fetch_one_video(aweme_id)
-        except Exception as exc:
-            status = _api_status(exc)
-            if status == 403:
-                logger.warning(
-                    "F2 metadata fetch got 403 (likely stale a_bogus) for "
-                    "aweme_id=%s, falling back to Playwright browser fetch",
-                    aweme_id,
-                )
-                _record_f2_403_fallback(aweme_id)
-                video_data = await _playwright_fetch_video_data(
-                    aweme_id, kwargs.get("cookie", ""),
-                    kwargs.get("headers", {}).get("User-Agent"),
-                )
-            else:
-                raise
+        # Step 2: Fetch video metadata via Playwright browser
+        video_data = await _playwright_fetch_video_data(
+            aweme_id, kwargs.get("cookie", ""),
+            kwargs.get("headers", {}).get("User-Agent"),
+        )
         if video_data is None:
             raise APIResponseError("Failed to fetch metadata for " + aweme_id)
         data = video_data._to_dict()
 
         # Step 3: Select the best available video stream before deciding the
-        # media type.  F2 exposes all bitrate entries in the raw response, but
-        # its convenience property only points at the first entry.
+        # media type.
         play_urls = data.get("video_play_addr", [])
         video_urls = _video_url_candidates(video_data, play_urls)
         video_url = video_urls[0] if video_urls else None
@@ -874,7 +694,6 @@ def validate_douyin_metadata(
         except APIConnectionError:
             outcome.put({"success": False, "category": "unavailable", "message": "无法连接抖音，请稍后重试"})
         except Exception:
-            # Do not expose F2's raw exception, which may contain request data.
             logger.debug("Douyin metadata validation failed")
             outcome.put({"success": False, "category": "unavailable", "message": "抖音作品信息暂时不可用"})
 
@@ -937,74 +756,39 @@ async def _validate_douyin_metadata_bound(
     url: str, cookie: str, user_agent: str | None, timeout: float,
 ) -> dict[str, object]:
     started_at = time.monotonic()
-    deadline_reset = _VALIDATION_DEADLINE.set(started_at + timeout)
-    reset = _configure_f2_request_identity(
-        cookie, user_agent, require_real_ms_token=True,
-    )
-    if reset is None:
-        _VALIDATION_DEADLINE.reset(deadline_reset)
-        raise DouyinTokenError("Unable to bind F2 request identity")
-    try:
-        async def fetch() -> dict:
-            _check_validation_deadline()
-            aweme_id = await _resolve_aweme_id(url)
-            if not aweme_id:
-                raise APINotFoundError("missing aweme id")
-            _check_validation_deadline()
-            remaining = timeout - (time.monotonic() - started_at)
-            handler = DouyinHandler({
-                "url": url,
-                "cookie": cookie,
-                "timeout": remaining,
-                "max_retries": 1,
-                "proxies": {},
-                "headers": {"User-Agent": user_agent or _DOUYIN_USER_AGENT},
-                "mode": "one",
-                "path": "",
-            })
-            handler.enable_bark = False
-            try:
-                video_data = await handler.fetch_one_video(aweme_id)
-            except Exception as exc:
-                if _api_status(exc) == 403:
-                    logger.warning(
-                        "Validation: F2 got 403 for %s, trying Playwright", aweme_id,
-                    )
-                    _record_f2_403_fallback(aweme_id)
-                    video_data = await _playwright_fetch_video_data(
-                        aweme_id, cookie, user_agent,
-                    )
-                    if video_data is None:
-                        raise APINotFoundError("Playwright fallback also failed") from exc
-                else:
-                    raise
-            data = video_data._to_dict()
-            if not isinstance(data, Mapping) or not data:
-                raise APINotFoundError("empty metadata")
-            returned_id = str(data.get("aweme_id") or "")
-            if not returned_id or returned_id != aweme_id:
-                raise APINotFoundError("metadata id mismatch")
-            has_content = bool(data.get("video_play_addr") or data.get("images"))
-            if not has_content:
-                raise APINotFoundError("metadata has no playable content")
-            return dict(data)
 
-        with _silence_f2_validation_logs():
-            remaining = timeout - (time.monotonic() - started_at)
-            if remaining <= 0:
-                raise asyncio.TimeoutError
-            data = await asyncio.wait_for(fetch(), timeout=remaining)
-            return {
-                "success": True,
-                "category": "success",
-                "message": "作品信息验证通过",
-                "aweme_id": str(data.get("aweme_id") or ""),
-                "title": str(data.get("desc") or data.get("nickname") or ""),
-            }
-    finally:
-        if reset is not None:
-            _reset_f2_request_identity(reset)
-        _VALIDATION_DEADLINE.reset(deadline_reset)
+    async def fetch() -> dict:
+        aweme_id = await _resolve_aweme_id(url)
+        if not aweme_id:
+            raise APINotFoundError("missing aweme id")
+        remaining = timeout - (time.monotonic() - started_at)
+        if remaining <= 0:
+            raise asyncio.TimeoutError
+        video_data = await _playwright_fetch_video_data(aweme_id, cookie, user_agent)
+        if video_data is None:
+            raise APINotFoundError("metadata fetch failed")
+        data = video_data._to_dict()
+        if not isinstance(data, Mapping) or not data:
+            raise APINotFoundError("empty metadata")
+        returned_id = str(data.get("aweme_id") or "")
+        if not returned_id or returned_id != aweme_id:
+            raise APINotFoundError("metadata id mismatch")
+        has_content = bool(data.get("video_play_addr") or data.get("images"))
+        if not has_content:
+            raise APINotFoundError("metadata has no playable content")
+        return dict(data)
+
+    remaining = timeout - (time.monotonic() - started_at)
+    if remaining <= 0:
+        raise asyncio.TimeoutError
+    data = await asyncio.wait_for(fetch(), timeout=remaining)
+    return {
+        "success": True,
+        "category": "success",
+        "message": "作品信息验证通过",
+        "aweme_id": str(data.get("aweme_id") or ""),
+        "title": str(data.get("desc") or data.get("nickname") or ""),
+    }
 
 
 def _normalize_share_url(url: str) -> str:
@@ -1104,12 +888,11 @@ def _video_url_candidates(video_data, fallback_urls) -> list[str]:
 
 
 def _select_best_video_url(video_data, fallback_urls) -> str | None:
-    """Select the highest-quality playable stream from F2's raw candidates.
+    """Select the highest-quality playable stream from the raw candidates.
 
     Bitrate is the primary quality signal.  Gear family and dimensions make
     equal-bitrate choices deterministic, while the original index is retained
-    as the final stable tie-break.  The convenience property remains a safe
-    fallback for older or unexpected F2 response shapes.
+    as the final stable tie-break.
     """
     candidates: list[tuple[tuple[int, int, int, int, int, int], str, Mapping]] = []
     try:
@@ -1164,7 +947,7 @@ def _select_best_video_url(video_data, fallback_urls) -> str | None:
             None,
         )
         if fallback:
-            logger.debug("Using F2 convenience video URL fallback")
+            logger.debug("Using convenience video URL fallback")
             return fallback
     return None
 
@@ -1297,7 +1080,9 @@ async def _resolve_aweme_id(url: str) -> str:
     if _is_douyin_short_host_url(candidate):
         raise APITimeoutError("Douyin short links require HTTPS and a valid short path")
 
-    return await AwemeIdFetcher.get_aweme_id(candidate)
+    # Fallback: extract aweme_id from full douyin.com URLs
+    match = DOUYIN_AWEME_ID_RE.search(candidate)
+    return match.group(1) if match else ""
 
 
 def _short_link_cache_key(path: str) -> str:
