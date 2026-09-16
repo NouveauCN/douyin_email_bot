@@ -99,7 +99,10 @@ class _PlaywrightVideoData:
             "is_delete": detail.get("is_delete"),
             "is_prohibited": detail.get("is_prohibited"),
             "private_status": detail.get("private_status"),
-            "video_play_addr": video.get("play_addr", {}).get("url_list", []),
+            "video_play_addr": [
+                u for u in video.get("play_addr", {}).get("url_list", [])
+                if isinstance(u, str) and not u.endswith(".mp3")
+            ],
             "video_bit_rate": video.get("bit_rate", []),
             "images": images or [],
             "images_video": [
