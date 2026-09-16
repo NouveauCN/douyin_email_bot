@@ -332,7 +332,9 @@ class DouyinDownloader:
         media_type = data.get("media_type", -1)
 
         # ── Slideshow / 图文 ────────────────────────────────────────
-        if not play_urls and images:
+        # Prefer images when present: Douyin often includes a preview video
+        # play_addr for image posts, but the real content is the images.
+        if images:
             images_video = data.get("images_video", [])
             return await self._download_slideshow(
                 images, images_video, data, aweme_id, download_dir, kwargs,
