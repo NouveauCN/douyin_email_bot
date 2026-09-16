@@ -6,9 +6,13 @@ function setup(allowed = ["allowed"]) {
   const sent = [];
   const bot = { send: async (message) => { sent.push(message); return {}; } };
   const bridgeCalls = [];
-  const bridge = { enqueueMessage: async (message) => { bridgeCalls.push(message); return { accepted: true }; } };
+  const fixCalls = [];
+  const bridge = {
+    enqueueMessage: async (message) => { bridgeCalls.push(message); return { accepted: true }; },
+    triggerFix: async (args) => { fixCalls.push(args); return { accepted: true }; },
+  };
   const config = { allowedOpenIds: new Set(allowed), bridgeToken: "secret" };
-  return { bot, bridge, config, sent, bridgeCalls };
+  return { bot, bridge, config, sent, bridgeCalls, fixCalls };
 }
 
 const message = (content, senderId = "allowed") => ({
@@ -55,3 +59,38 @@ test("ignores non-C2C messages", async () => {
 });
 
 assert.match(helpText(), /QQ 私聊/);
+
+test("parseCommand recognizes /fix", () => {
+  assert.equal(parseCommand("/fix"), "fix");
+  assert.equal(parseCommand("/FIX"), "fix");
+  assert.equal(parseCommand("/fix "), "fix");
+});
+
+test("helpText includes /fix", () => {
+  assert.match(helpText(), /\/fix/);
+});
+
+test("/fix triggers bridge and replies ack for allowed user", async () => {
+  const ctx = setup();
+  const result = await handleInboundMessage({ ...ctx, message: message("/fix") });
+  assert.equal(result.handled, true);
+  assert.equal(result.kind, "fix");
+  assert.equal(ctx.fixCalls.length, 1);
+  assert.equal(ctx.fixCalls[0].openId, "allowed");
+  assert.match(ctx.sent[0].content, /诊断/);
+});
+
+test("/fix is denied for non-allowed user", async () => {
+  const ctx = setup();
+  await handleInboundMessage({ ...ctx, message: message("/fix", "unknown") });
+  assert.equal(ctx.fixCalls.length, 0);
+  assert.match(ctx.sent[0].content, /不在下载白名单/);
+});
+
+test("/fix handles bridge failure gracefully", async () => {
+  const ctx = setup();
+  ctx.bridge.triggerFix = async () => { throw new Error("bridge down"); };
+  const result = await handleInboundMessage({ ...ctx, message: message("/fix") });
+  assert.equal(result.kind, "fix");
+  assert.match(ctx.sent.at(-1).content, /诊断请求失败/);
+});

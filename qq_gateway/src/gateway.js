@@ -7,6 +7,7 @@ export function parseCommand(content) {
   const value = String(content ?? "").trim();
   if (/^\/(?:openid|me)$/iu.test(value)) return "openid";
   if (/^\/(?:help|帮助)$/iu.test(value)) return "help";
+  if (/^\/fix$/iu.test(value)) return "fix";
   return value.startsWith("/") ? "unknown" : null;
 }
 
@@ -16,6 +17,7 @@ export function helpText() {
     "直接发送一条抖音或 B 站链接即可下载。",
     "每条消息只能包含一个链接。",
     "/openid：查看当前 QQ OpenID",
+    "/fix：诊断机器人运行状态",
     "/帮助：显示本说明",
   ].join("\n");
 }
@@ -82,6 +84,20 @@ export async function handleInboundMessage({ message, config, bridge, bot }) {
   if (command === "help") {
     await sendReply(helpText(), "help");
     return { handled: true, kind: command };
+  }
+  if (command === "fix") {
+    if (!config.allowedOpenIds.has(message.senderId)) {
+      await sendReply("当前用户不在下载白名单中。", "denied");
+      return { handled: true, kind: "denied" };
+    }
+    try {
+      await sendReply("正在诊断，请稍候…", "fix-ack");
+      await bridge.triggerFix({ openId: message.senderId, messageId: message.messageId });
+    } catch (error) {
+      logError("[qq-gateway] bridge fix trigger failed", error, config.bridgeToken);
+      await sendReply("诊断请求失败，请稍后重试。", "fix-error");
+    }
+    return { handled: true, kind: "fix" };
   }
   if (!config.allowedOpenIds.has(message.senderId)) {
     await sendReply("当前用户不在下载白名单中。发送 /openid 获取 OpenID，然后在服务器配置 QQBOT_ALLOWED_OPENIDS。", "denied");

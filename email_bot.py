@@ -16,6 +16,7 @@ import os
 import re
 import smtplib
 import sqlite3
+import subprocess
 import threading
 import time
 import uuid
@@ -565,6 +566,188 @@ class EmailBot:
         except Exception:
             self._qq_bridge = None
             logger.exception("Could not start QQ bridge; continuing without QQ intake")
+
+    # ── /fix command ────────────────────────────────────────────────
+
+    def trigger_fix(self, *, open_id: str, message_id: str) -> None:
+        """Run MiMo diagnostics in a background thread and reply via QQ."""
+        thread = threading.Thread(
+            target=self._run_fix,
+            args=(open_id, message_id),
+            name="fix-diagnostics",
+            daemon=True,
+        )
+        thread.start()
+
+    def _run_fix(self, open_id: str, message_id: str) -> None:
+        """Collect diagnostics, invoke MiMo, and send the report via QQ."""
+        try:
+            context = self._collect_fix_context()
+            report = self._invoke_mimo_fix(context)
+            self._send_qq_reply(open_id, message_id, report)
+        except Exception:
+            logger.exception("Fix diagnostics failed")
+            try:
+                self._send_qq_reply(open_id, message_id, "诊断过程出错，请查看 bot.log。")
+            except Exception:
+                logger.exception("Could not send fix error reply")
+
+    def _collect_fix_context(self) -> str:
+        """Gather logs, task state, and system info for MiMo."""
+        lines: list[str] = []
+
+        # Recent bot log (last 80 lines, strip ANSI)
+        ansi_re = re.compile(r"\x1b\[[0-9;]*m")
+        try:
+            log_path = Path("/app/logs/bot.log")
+            if not log_path.exists():
+                log_path = self._project_dir / "logs" / "bot.log"
+            if log_path.exists():
+                raw = log_path.read_text(encoding="utf-8", errors="replace")
+                stripped = ansi_re.sub("", raw)
+                log_lines = stripped.splitlines()
+                lines.append("## 最近 bot 日志 (最后 80 行)")
+                lines.extend(log_lines[-80:])
+            else:
+                lines.append("## bot 日志未找到")
+        except Exception as exc:
+            lines.append(f"## 读取日志失败: {exc}")
+
+        lines.append("")
+
+        # Recent tasks
+        lines.append("## 最近任务 (最新 10 条)")
+        try:
+            if self._state is not None:
+                with self._state._lock:
+                    self._state._ensure_open()
+                    rows = self._state._conn.execute(
+                        "SELECT id, status, normalized_url, platform, last_error, "
+                        "error_code, created_at, updated_at "
+                        "FROM tasks ORDER BY id DESC LIMIT 10"
+                    ).fetchall()
+                    for r in rows:
+                        lines.append(
+                            f"- Task {r['id']}: {r['status']} platform={r['platform']} "
+                            f"url={r['normalized_url'][:60] if r['normalized_url'] else ''} "
+                            f"error={r['last_error'] or ''}"
+                        )
+        except Exception as exc:
+            lines.append(f"查询任务失败: {exc}")
+
+        lines.append("")
+
+        # Docker status
+        lines.append("## Docker 容器状态")
+        try:
+            result = subprocess.run(
+                ["docker", "compose", "-f", "/app/docker-compose.yml", "ps", "--format", "table"],
+                capture_output=True, text=True, timeout=10,
+            )
+            lines.append(result.stdout.strip() or "(无输出)")
+        except Exception as exc:
+            lines.append(f"docker 查询失败: {exc}")
+
+        lines.append("")
+
+        # Pending retries
+        lines.append("## 待重试 / 失败文件")
+        try:
+            for name in ("pending_retries.json", "failed_links.txt"):
+                p = Path("/app/state") / name
+                if p.exists():
+                    content = p.read_text(encoding="utf-8", errors="replace")[:2000]
+                    lines.append(f"### {name}")
+                    lines.append(content)
+        except Exception as exc:
+            lines.append(f"读取失败: {exc}")
+
+        return "\n".join(lines)
+
+    def _invoke_mimo_fix(self, context: str) -> str:
+        """Invoke MiMo (Claude Code) in print mode to diagnose the bot."""
+        prompt = (
+            "你是机器人运维诊断助手。以下是抖音/B站下载机器人的运行状态信息。\n"
+            "请分析日志和任务状态，找出问题根因，并给出具体的修复建议。\n"
+            "如果发现代码 bug，直接给出修复方案（含文件名和行号）。\n"
+            "输出使用中文，简洁明了，不超过 800 字。\n\n"
+            "--- 运行状态 ---\n\n"
+            f"{context}"
+        )
+
+        try:
+            result = subprocess.run(
+                [
+                    "claude",
+                    "-p", prompt,
+                    "--allowedTools", "Read,Grep,Glob,Bash(ls),Bash(docker *),Bash(cat),Bash(head),Bash(tail),Bash(grep)",
+                    "--max-turns", "8",
+                    "--max-budget-usd", "0.50",
+                    "--output-format", "text",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=180,
+                cwd=str(self._project_dir),
+                env={**os.environ, "NO_PROXY": "*", "no_proxy": "*"},
+            )
+            output = (result.stdout or "").strip()
+            if not output:
+                stderr = (result.stderr or "").strip()[:500]
+                return f"诊断工具未返回结果。\nstderr: {stderr}" if stderr else "诊断工具未返回结果。"
+            return f"📋 MiMo 诊断报告\n\n{output[:3000]}"
+        except FileNotFoundError:
+            return "诊断工具 (claude) 未安装。请先运行: npm install -g @anthropic-ai/claude-code"
+        except subprocess.TimeoutExpired:
+            return "诊断超时 (>180s)，请稍后重试或手动运行 claude -p '诊断机器人'。"
+        except Exception as exc:
+            return f"诊断工具调用失败: {exc}"
+
+    def _send_qq_reply(self, open_id: str, message_id: str, content: str) -> None:
+        """Send a QQ reply by creating a fix task and outbox chain."""
+        qq_store = self._qq_store_for_use()
+        if qq_store is None or self._state is None:
+            logger.warning("Cannot send QQ fix reply: store unavailable")
+            return
+        timestamp = self._state._now()
+        source_message_id = f"qq:fix:{message_id}"
+        try:
+            with self._state._lock, self._state._transaction():
+                self._state._ensure_open()
+                # Insert a lightweight fix task (no actual download).
+                self._state._conn.execute(
+                    "INSERT INTO tasks "
+                    "(source_message_id, normalized_url, original_url, platform, "
+                    "payload_json, status, attempts, created_at, updated_at) "
+                    "VALUES (?, '', '', 'fix', '{}', 'succeeded', 1, ?, ?) "
+                    "ON CONFLICT(source_message_id) DO UPDATE SET updated_at = excluded.updated_at",
+                    (source_message_id, timestamp, timestamp),
+                )
+                row = self._state._conn.execute(
+                    "SELECT id FROM tasks WHERE source_message_id = ?",
+                    (source_message_id,),
+                ).fetchone()
+                if row is None:
+                    logger.error("Fix task insert did not produce a row")
+                    return
+                task_id = int(row["id"])
+                # Insert accepted + completed outbox entries so the gateway
+                # outbox pump picks them up and sends via the QQ bot.
+                # payload.body is read directly by normalizeOutboxItem.
+                self._state._insert_qq_outbox_locked(
+                    task_id, open_id, message_id, "accepted",
+                    {"body": "正在诊断…"},
+                    timestamp,
+                    expires_at=timestamp + 3600,
+                )
+                self._state._insert_qq_outbox_locked(
+                    task_id, open_id, message_id, "completed",
+                    {"body": content},
+                    timestamp,
+                    expires_at=timestamp + 3600,
+                )
+        except Exception:
+            logger.exception("Failed to enqueue QQ fix reply")
 
     def accept_qq_message(self, payload: dict) -> dict:
         """Validate and atomically submit one QQ message through the task store."""

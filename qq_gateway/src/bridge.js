@@ -64,6 +64,10 @@ export class BridgeClient {
       retryable: Boolean(retryable),
     });
   }
+
+  triggerFix({ openId, messageId }) {
+    return this.post("/v1/qq/fix", { open_id: openId, message_id: messageId });
+  }
 }
 
 async function requestJson(url, { method, timeoutMs, token, body }) {

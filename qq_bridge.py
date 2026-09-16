@@ -209,6 +209,25 @@ def create_app(
             logger.exception("QQ outbox failure update failed")
             return jsonify({"error": "outbox failure update failed"}), 503
 
+    @app.post("/v1/qq/fix")
+    def trigger_fix() -> Any:
+        try:
+            payload = _request_json()
+            open_id = str(payload.get("open_id") or "").strip()
+            message_id = str(payload.get("message_id") or "").strip()
+            if not open_id or not message_id:
+                return jsonify({"error": "open_id and message_id are required"}), 400
+            callback = getattr(handler, "trigger_fix", None)
+            if not callable(callback):
+                return jsonify({"error": "fix endpoint not available"}), 501
+            callback(open_id=open_id, message_id=message_id)
+            return jsonify({"accepted": True}), 202
+        except (TypeError, ValueError) as exc:
+            return jsonify({"error": str(exc)}), 400
+        except Exception:
+            logger.exception("Fix trigger failed")
+            return jsonify({"error": "fix trigger failed"}), 503
+
     return app
 
 
