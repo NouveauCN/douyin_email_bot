@@ -117,3 +117,25 @@ def test_multi_part_and_conflicting_names_are_unique(tmp_path):
         [third], tmp_path, "av123", "author", "20240101_010203"
     )
     assert conflict[0].name == "20240101_010203_av123_2.mp4"
+
+
+def test_returns_failure_when_yutto_succeeds_but_no_files_found(tmp_path, monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:8888")
+    download_dir = tmp_path / "bilibili"
+    downloader = BilibiliDownloader(
+        BilibiliConfig(download_path=str(download_dir), timeout=30)
+    )
+
+    with (
+        patch(
+            "bilibili_downloader.subprocess.run",
+            return_value=CompletedProcess([], 0, stdout="", stderr=""),
+        ),
+        patch("bilibili_downloader._move_cover_files", return_value=[]),
+        patch("bilibili_downloader._collect_downloaded_files", return_value=[]),
+    ):
+        result = downloader.download("https://www.bilibili.com/video/BV1test")
+
+    assert result["success"] is False
+    assert result["file_count"] == 0
+    assert "未找到视频文件" in result["error"]

@@ -96,8 +96,20 @@ class BilibiliDownloader:
             logger.warning("yutto failed with code %s: %s", completed.returncode, output[-2000:])
             return self._error(_summarize_yutto_error(output))
 
+        logger.debug("yutto output: %s", output[-3000:])
+
         covers = _move_cover_files(download_dir, started_at)
         files = _collect_downloaded_files(download_dir, started_at)
+
+        if not files:
+            logger.warning(
+                "yutto exited successfully but no video files found in %s",
+                download_dir,
+            )
+            return self._error(
+                "B站下载完成但未找到视频文件，可能视频已删除或需要登录"
+            )
+
         video_id = _extract_video_id(url)
         author, _ = _fetch_bilibili_metadata(video_id)
         files = _rename_downloaded_files(
