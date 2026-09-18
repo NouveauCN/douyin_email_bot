@@ -139,3 +139,21 @@ def test_returns_failure_when_yutto_succeeds_but_no_files_found(tmp_path, monkey
     assert result["success"] is False
     assert result["file_count"] == 0
     assert "未找到视频文件" in result["error"]
+
+
+def test_summarize_empty_yutto_vip_message():
+    from bilibili_downloader import _summarize_empty_yutto
+
+    output = "WARN  以非大会员身份登录，注意无法下载会员专享剧集喔～"
+    result = _summarize_empty_yutto(output)
+    assert "大会员" in result
+    assert "登录" not in result  # should NOT trigger cookie classification
+
+
+def test_summarize_empty_yutto_other_messages():
+    from bilibili_downloader import _summarize_empty_yutto
+
+    assert "不存在" in _summarize_empty_yutto("视频不存在或已被删除")
+    assert "私密" in _summarize_empty_yutto("该视频为私密视频")
+    assert "地区" in _summarize_empty_yutto("该视频在当前地区不可用")
+    assert _summarize_empty_yutto("") == "B站下载完成但未找到视频文件，可能是大会员专享内容"

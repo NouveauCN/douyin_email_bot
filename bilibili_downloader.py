@@ -107,7 +107,7 @@ class BilibiliDownloader:
                 download_dir,
             )
             return self._error(
-                "B站下载完成但未找到视频文件，可能视频已删除或需要登录"
+                _summarize_empty_yutto(output)
             )
 
         video_id = _extract_video_id(url)
@@ -335,6 +335,23 @@ def _summarize_yutto_error(output: str) -> str:
         return "B站下载失败：未找到或无法使用 ffmpeg"
     tail = "\n".join(line for line in output.splitlines() if line.strip())[-1000:]
     return tail or "B站下载失败，yutto 未返回详细错误"
+
+
+def _summarize_empty_yutto(output: str) -> str:
+    """Diagnose a yutto run that returned 0 but produced no files."""
+    if not output:
+        return "B站下载完成但未找到视频文件，可能是大会员专享内容"
+    lower = output.lower()
+    if "大会员" in output or "vip" in lower:
+        return "该视频为大会员专享内容，当前账号无大会员权限"
+    if "不存在" in output or "not found" in lower or "deleted" in lower:
+        return "视频不存在或已被删除"
+    if "私密" in output or "private" in lower:
+        return "该视频为私密视频"
+    if "地区" in output or "region" in lower or "geo" in lower:
+        return "该视频在当前地区不可用"
+    tail = "\n".join(line for line in output.splitlines() if line.strip())[-500:]
+    return tail or "B站下载完成但未找到视频文件"
 
 
 def _collect_downloaded_files(download_dir: Path, started_at: float) -> list[Path]:
