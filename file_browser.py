@@ -499,6 +499,16 @@ def _format_date(prefix: str) -> str:
         return prefix
 
 
+def _is_landscape_image(image: Path) -> bool:
+    """Return whether a readable image is wider than it is tall."""
+    try:
+        with Image.open(image) as opened:
+            width, height = opened.size
+    except (OSError, ValueError):
+        return False
+    return width > height
+
+
 def _scan_downloads() -> dict:
     """Scan the downloads directory and return flat lists of videos and slides."""
     videos = []
@@ -521,6 +531,7 @@ def _scan_downloads() -> dict:
                         "size": img.stat().st_size,
                         "size_fmt": _format_size(img.stat().st_size),
                         "date": date_str,
+                        "is_landscape": _is_landscape_image(img),
                     })
         else:
             # Author folder — collect all video files
@@ -573,6 +584,7 @@ def _collect_comics_images() -> list[dict]:
                 "name": image.name,
                 "relpath": relpath,
                 "size_fmt": _format_size(size),
+                "is_landscape": _is_landscape_image(resolved),
             })
 
     images.sort(key=lambda image: image["relpath"])
@@ -1658,6 +1670,9 @@ INDEX_HTML = (
     width: 100%; aspect-ratio: 9 / 16; object-fit: cover; border-radius: 8px;
     background: #e8e8e8; margin-bottom: 10px;
   }
+  .card.landscape-card { grid-column: span 2; }
+  .card.landscape-card .card-thumb { aspect-ratio: 16 / 9; }
+  @media (max-width:440px) { .card.landscape-card { grid-column: span 1; } }
   .card .vname { font-size: 14px; color: #333; word-break: break-all; line-height: 1.3; }
   /* ── Pending duplicates ── */
   .dup-section { margin-bottom: 24px; }
@@ -1810,7 +1825,7 @@ INDEX_HTML = (
   </div>
   <div class="collapsible-body card-grid collapsed">
   {% for s in slides %}
-    <div class="card">
+    <div class="card{% if s.is_landscape %} landscape-card{% endif %}">
       <a class="card-inner" href="{{ url_for('view_image', filepath=s.relpath) }}">
         <img class="card-thumb" src="{{ url_for('raw_file', filepath=s.relpath) }}" loading="lazy" alt="" width="180" height="320">
         <div class="vname">{{ s.name }}</div>
@@ -1834,7 +1849,7 @@ INDEX_HTML = (
   {% if comics_images %}
   <div class="card-grid">
   {% for c in comics_images %}
-    <div class="card comics-card">
+    <div class="card comics-card{% if c.is_landscape %} landscape-card{% endif %}">
       <a class="card-inner" href="{{ url_for('view_comics_image', filepath=c.relpath) }}">
         <img class="card-thumb" src="{{ url_for('raw_comics_file', filepath=c.relpath) }}" loading="lazy" alt="" width="180" height="320">
         <div class="vname">{{ c.name }}</div>
@@ -2062,6 +2077,16 @@ function restoreSectionState() {
     }
   });
 }
+function markLandscapeCard(image) {
+  if (image.naturalWidth > image.naturalHeight) {
+    var card = image.closest('.card');
+    if (card) card.classList.add('landscape-card');
+  }
+}
+document.querySelectorAll('.card-thumb').forEach(function(image) {
+  if (image.complete) markLandscapeCard(image);
+  else image.addEventListener('load', function() { markLandscapeCard(image); }, {once:true});
+});
 function reloadPreservingSections() {
   var state = {};
   document.querySelectorAll('.section-header[data-section]').forEach(function(header) {
