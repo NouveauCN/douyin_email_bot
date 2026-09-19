@@ -119,6 +119,22 @@ class ImageViewerTests(unittest.TestCase):
         self.assertIn("function markLandscapeCard(image)", page)
         self.assertIn("document.querySelectorAll('.card-thumb')", page)
 
+    def test_landscape_video_thumbnail_keeps_its_orientation(self):
+        video = self.download_dir / "landscape.mp4"
+        video.write_bytes(b"video")
+        completed = file_browser.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="320,180\n"
+        )
+
+        with patch.object(file_browser.subprocess, "run", return_value=completed) as run:
+            thumbnail_filter = file_browser._video_thumbnail_filter(video)
+
+        self.assertEqual(
+            thumbnail_filter,
+            "scale=320:180:force_original_aspect_ratio=increase,crop=320:180",
+        )
+        self.assertIn("ffprobe", run.call_args.args[0])
+
     def test_comics_raw_and_viewer_are_independent_routes(self):
         nested = self.comics_dir / "nested"
         nested.mkdir()
