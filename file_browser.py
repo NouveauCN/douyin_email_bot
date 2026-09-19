@@ -509,6 +509,29 @@ def _is_landscape_image(image: Path) -> bool:
     return width > height
 
 
+def _video_thumbnail_filter(video: Path) -> str:
+    """Choose a thumbnail frame matching the video's display orientation."""
+    portrait = "scale=180:320:force_original_aspect_ratio=increase,crop=180:320"
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=width,height", "-of", "csv=p=0",
+                str(video),
+            ],
+            check=True,
+            timeout=10,
+            capture_output=True,
+            text=True,
+        )
+        width, height = (int(value) for value in probe.stdout.strip().split(","))
+    except (OSError, ValueError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return portrait
+    if width > height:
+        return "scale=320:180:force_original_aspect_ratio=increase,crop=320:180"
+    return portrait
+
+
 def _scan_downloads() -> dict:
     """Scan the downloads directory and return flat lists of videos and slides."""
     videos = []
@@ -950,10 +973,10 @@ def thumb(filepath):
     if not safe.is_file():
         abort(404, "File not found")
 
-    # Cache key: hex hash of relative path
+    # Version the key because older cache entries forced every video to portrait.
     cache_key = hashlib.sha256(filepath.encode()).hexdigest()[:16]
     _THUMB_CACHE.mkdir(exist_ok=True)
-    thumb_path = _THUMB_CACHE / f"{cache_key}.jpg"
+    thumb_path = _THUMB_CACHE / f"{cache_key}-v2.jpg"
 
     # Regenerate if missing or source is newer
     if not thumb_path.exists() or thumb_path.stat().st_mtime < safe.stat().st_mtime:
@@ -961,7 +984,7 @@ def thumb(filepath):
             subprocess.run([
                 "ffmpeg", "-y", "-i", str(safe),
                 "-vframes", "1",
-                "-vf", "scale=180:320:force_original_aspect_ratio=increase,crop=180:320",
+                "-vf", _video_thumbnail_filter(safe),
                 "-f", "mjpeg", "-q:v", "3",
                 str(thumb_path),
             ], check=True, timeout=30, capture_output=True)
