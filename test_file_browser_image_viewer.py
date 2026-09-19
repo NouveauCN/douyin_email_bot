@@ -104,6 +104,21 @@ class ImageViewerTests(unittest.TestCase):
         comics_card = page[page.index('class="card comics-card"'):]
         self.assertNotIn('class="del-btn"', comics_card.split('</div>\n  </div>', 1)[0])
 
+    def test_landscape_images_span_two_gallery_columns(self):
+        slide = self.slides_dir / "landscape.png"
+        file_browser.Image.new("RGB", (2, 1)).save(slide)
+        landscape = self.comics_dir / "landscape.png"
+        file_browser.Image.new("RGB", (2, 1)).save(landscape)
+
+        page = self.client.get("/").get_data(as_text=True)
+
+        self.assertIn('class="card landscape-card"', page)
+        self.assertIn('class="card comics-card landscape-card"', page)
+        self.assertIn('.card.landscape-card { grid-column: span 2; }', page)
+        self.assertIn('.card.landscape-card .card-thumb { aspect-ratio: 16 / 9; }', page)
+        self.assertIn("function markLandscapeCard(image)", page)
+        self.assertIn("document.querySelectorAll('.card-thumb')", page)
+
     def test_comics_raw_and_viewer_are_independent_routes(self):
         nested = self.comics_dir / "nested"
         nested.mkdir()
