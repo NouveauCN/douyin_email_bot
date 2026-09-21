@@ -1762,6 +1762,7 @@ INDEX_HTML = (
     .browse-search { display: grid; grid-template-columns: 1fr; gap: 6px; margin-bottom: 14px; }
     .browse-search label { font-size: 16px; }
     .browse-search input { min-width: 0; width: 100%; min-height: 44px; padding: 9px 12px; font-size: 16px; }
+    .browse-search select, .search-clear { width: 100%; font-size: 16px; }
     .search-status { min-height: 20px; font-size: 13px; }
     .card-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-bottom: 24px; }
     .card { border-radius: 8px; padding: 8px; }
@@ -1819,8 +1820,12 @@ INDEX_HTML = (
   .upload-status { font-size: 12px; color: #999; word-break: break-all; }
   .browse-search { display:flex; gap:8px; align-items:center; margin:0 0 18px; flex-wrap:wrap; }
   .browse-search label { color:#777; font-size:13px; }
-  .browse-search input { min-width:min(360px, 100%); flex:1; border:1px solid #ddd; border-radius:8px; padding:9px 12px; font:inherit; }
+  .browse-search input { min-width:min(260px, 100%); flex:1; border:1px solid #ddd; border-radius:8px; padding:9px 12px; font:inherit; }
+  .browse-search select, .search-clear { min-height:44px; border:1px solid #ddd; border-radius:8px; padding:8px 10px; background:#fff; font:inherit; }
+  .search-clear { cursor:pointer; color:#666; }
+  .browse-search input[aria-invalid="true"] { border-color:#c0392b; outline:2px solid rgba(192,57,43,.15); }
   .search-status { color:#888; font-size:12px; }
+  .search-status.error { color:#c0392b; }
   .comics-empty-state { color: #999; padding: 24px 20px; text-align: center; }
   .top-tabs { display:flex; gap:8px; margin:0 0 22px; }
   .top-tab { border:1px solid #ddd; border-radius:8px; padding:8px 18px; background:#fff; color:#777; cursor:pointer; font-size:13px; }
@@ -1905,6 +1910,19 @@ INDEX_HTML = (
     <label for="mediaSearch">🔎 搜索</label>
     <input id="mediaSearch" type="search" autocomplete="off"
            placeholder="文件名、相对路径或作者">
+    <select id="searchMode" aria-label="搜索方式">
+      <option value="text">文本包含</option>
+      <option value="regex">正则表达式</option>
+    </select>
+    <select id="searchHelper" aria-label="正则辅助模板">
+      <option value="">正则辅助（可选）</option>
+      <option value="\\.(?:jpg|jpeg|png|gif|webp)$">图片扩展名</option>
+      <option value="\\.(?:mp4|mov|mkv|webm)$">视频扩展名</option>
+      <option value="^\\d{8}_\\d{6}_">日期时间前缀</option>
+      <option value="(?:^|/)[^/]+/">目录路径</option>
+      <option value="custom">自定义正则（手动输入）</option>
+    </select>
+    <button class="search-clear" id="searchClear" type="button" aria-label="清除搜索">清除</button>
     <span id="searchStatus" class="search-status" aria-live="polite"></span>
   </div>
 
@@ -2173,11 +2191,34 @@ function toggleSection(header) {
   header.nextElementSibling.classList.toggle('collapsed');
 }
 var searchExpandedSections = [];
+function createSearchMatcher(input, mode) {
+  var pattern = input.trim();
+  if (!pattern) return {matches: function() { return true; }, empty: true};
+  if (mode === 'regex') {
+    // Keep the user's expression intact: lowercasing a regex can change its meaning.
+    var expression = new RegExp(pattern, 'i');
+    return {matches: function(value) { return expression.test(value); }, empty: false};
+  }
+  var query = pattern.toLocaleLowerCase();
+  return {matches: function(value) { return value.toLocaleLowerCase().indexOf(query) !== -1; }, empty: false};
+}
 function updateSearch() {
   var input = document.getElementById('mediaSearch');
+  var mode = document.getElementById('searchMode');
   var status = document.getElementById('searchStatus');
   if (!input || !status) return;
-  var query = input.value.trim().toLocaleLowerCase();
+  var query = input.value.trim();
+  var matcher;
+  try {
+    matcher = createSearchMatcher(query, mode ? mode.value : 'text');
+  } catch (error) {
+    input.setAttribute('aria-invalid', 'true');
+    status.className = 'search-status error';
+    status.textContent = '正则表达式无效：' + (error.message || '请检查语法');
+    return;
+  }
+  input.removeAttribute('aria-invalid');
+  status.className = 'search-status';
   var total = 0;
   document.querySelectorAll('.section-header[data-section]').forEach(function(header) {
     var body = header.nextElementSibling;
@@ -2185,14 +2226,14 @@ function updateSearch() {
     var cards = Array.from(body.querySelectorAll('.media-card'));
     var visible = 0;
     cards.forEach(function(card) {
-      var matches = !query || (card.dataset.search || '').toLocaleLowerCase().indexOf(query) !== -1;
+      var matches = matcher.matches(card.dataset.search || '');
       card.style.display = matches ? '' : 'none';
       if (matches) visible += 1;
     });
     total += visible;
     var count = header.querySelector('.section-count');
     if (count) count.textContent = visible + (header.dataset.section === 'videos' ? ' 个' : ' 张');
-    if (query && visible && header.classList.contains('collapsed')) {
+    if (!matcher.empty && visible && header.classList.contains('collapsed')) {
       header.classList.remove('collapsed');
       body.classList.remove('collapsed');
       if (searchExpandedSections.indexOf(header.dataset.section) === -1) {
@@ -2200,7 +2241,7 @@ function updateSearch() {
       }
     }
   });
-  if (!query) {
+  if (matcher.empty) {
     searchExpandedSections.forEach(function(section) {
       var header = document.querySelector('.section-header[data-section="' + section + '"]');
       if (header && !header.classList.contains('collapsed')) toggleSection(header);
@@ -2220,6 +2261,34 @@ function updateSearch() {
 }
 var mediaSearch = document.getElementById('mediaSearch');
 if (mediaSearch) mediaSearch.addEventListener('input', updateSearch);
+var searchMode = document.getElementById('searchMode');
+if (searchMode) searchMode.addEventListener('change', updateSearch);
+var searchHelper = document.getElementById('searchHelper');
+if (searchHelper) searchHelper.addEventListener('change', function() {
+  var value = searchHelper.value;
+  if (!value || value === 'custom') {
+    searchHelper.value = '';
+    if (value === 'custom' && mediaSearch) { mediaSearch.focus(); mediaSearch.select(); }
+    return;
+  }
+  if (!mediaSearch) return;
+  mediaSearch.value = value;
+  if (searchMode) searchMode.value = 'regex';
+  mediaSearch.focus();
+  mediaSearch.select();
+  updateSearch();
+  searchHelper.value = '';
+});
+var searchClear = document.getElementById('searchClear');
+if (searchClear) searchClear.addEventListener('click', function() {
+  if (!mediaSearch) return;
+  mediaSearch.value = '';
+  mediaSearch.removeAttribute('aria-invalid');
+  if (searchMode) searchMode.value = 'text';
+  if (searchHelper) searchHelper.value = '';
+  updateSearch();
+  mediaSearch.focus();
+});
 var savedSectionState = null;
 function restoreSectionState() {
   if (savedSectionState === null) {

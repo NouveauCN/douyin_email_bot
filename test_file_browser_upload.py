@@ -65,6 +65,21 @@ class UploadFormTests(unittest.TestCase):
         self.assertIn(".browse-search { display: grid;", page)
         self.assertIn(".top-tabs { display: grid; grid-template-columns: repeat(3", page)
 
+    def test_index_exposes_manual_regex_search_and_helpers(self):
+        page = self.client.get("/").get_data(as_text=True)
+
+        self.assertIn('id="searchMode"', page)
+        self.assertIn('value="regex"', page)
+        self.assertIn('id="searchHelper"', page)
+        self.assertIn("图片扩展名", page)
+        self.assertIn("视频扩展名", page)
+        self.assertIn("日期时间前缀", page)
+        self.assertIn('id="searchClear"', page)
+        self.assertIn("function createSearchMatcher(input, mode)", page)
+        self.assertIn("new RegExp(pattern, 'i')", page)
+        self.assertIn("正则表达式无效：", page)
+        self.assertIn("input.setAttribute('aria-invalid', 'true')", page)
+
     def test_empty_home_exposes_comics_gallery(self):
         response = self.client.get("/")
         page = response.get_data(as_text=True)
