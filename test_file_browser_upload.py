@@ -24,6 +24,9 @@ class UploadFormTests(unittest.TestCase):
             file_browser, "_DOWNLOAD_DIR", self.download_dir
         )
         self.download_patch.start()
+        self.comics_dir = self.download_dir / "original-comics"
+        self.comics_patch = patch.object(file_browser, "_COMICS_DIR", self.comics_dir)
+        self.comics_patch.start()
         self.index_patch = patch.object(file_browser, "_DEDUP_INDEX", {})
         self.pending_patch = patch.object(file_browser, "_PENDING_DUPS", [])
         self.index_patch.start()
@@ -35,6 +38,7 @@ class UploadFormTests(unittest.TestCase):
         self.pending_patch.stop()
         self.index_patch.stop()
         self.download_patch.stop()
+        self.comics_patch.stop()
         self.tempdir.cleanup()
 
     def test_index_contains_progressive_multipart_form(self):
@@ -47,6 +51,8 @@ class UploadFormTests(unittest.TestCase):
         self.assertIn('for="uploadInput"', page)
         self.assertIn("multiple", page)
         self.assertNotIn("uploadInput').click()", page)
+        self.assertIn('name="target"', page)
+        self.assertIn("二次元（仅图片）", page)
 
     def test_empty_home_exposes_comics_gallery(self):
         response = self.client.get("/")
@@ -113,6 +119,44 @@ class UploadFormTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.get_json()["success"])
         self.assertEqual(len(list((self.download_dir / "slides").glob("*.png"))), 1)
+
+    def test_comics_upload_writes_original_comics_directory(self):
+        response = self.client.post(
+            "/api/upload",
+            data={
+                "target": "comics",
+                "file": (io.BytesIO(_TEST_PNG), "anime.png"),
+            },
+            headers={"X-Requested-With": "XMLHttpRequest"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["success"])
+        self.assertEqual(len(list(self.comics_dir.glob("*.png"))), 1)
+        self.assertFalse((self.download_dir / "slides").exists())
+
+    def test_comics_upload_rejects_video_and_invalid_target(self):
+        video = self.client.post(
+            "/api/upload",
+            data={
+                "target": "comics",
+                "file": (io.BytesIO(b"video"), "anime.mp4"),
+            },
+            headers={"X-Requested-With": "XMLHttpRequest"},
+        )
+        invalid = self.client.post(
+            "/api/upload",
+            data={
+                "target": "elsewhere",
+                "file": (io.BytesIO(_TEST_PNG), "anime.png"),
+            },
+            headers={"X-Requested-With": "XMLHttpRequest"},
+        )
+
+        self.assertEqual(video.status_code, 400)
+        self.assertIn("仅支持图片", video.get_json()["error"])
+        self.assertEqual(invalid.status_code, 400)
+        self.assertIn("无效", invalid.get_json()["error"])
 
     def test_native_form_upload_redirects_to_status_page(self):
         response = self.client.post(

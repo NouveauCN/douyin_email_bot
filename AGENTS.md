@@ -93,10 +93,12 @@ sufficient.
   requests are rate limited, sessions are short-lived HttpOnly SameSite
   cookies, and no standalone Docker Web Login port or bypass service is
   exposed.
-- The file browser reads `/app/comics/pics` as a separate read-only comics
-  gallery source. Its `/comics/raw/...` and `/comics/image/...` routes must
-  validate resolved paths within that source and must never pass comics paths
-  to download upload, delete, crop, or dedup operations.
+- The file browser reads `/app/comics/pics` as a separate comics gallery source
+  and may upload directly into that original source (no parallel upload
+  directory). Its `/comics/raw/...` and `/comics/image/...` routes must
+  validate resolved paths within that source. Comics uploads are authorized
+  only after the same path validation; comics paths must remain blocked for
+  delete, crop, and dedup operations.
 
 ## F2 Bootstrap Invariant
 
@@ -427,8 +429,10 @@ sudo docker compose down
   `RUNTIME_SETTINGS_DB=/app/runtime-settings/settings.sqlite3`. It is not the
   mail state volume and is never mounted into unrelated services.
 - Bot and `file_browser` bind the host NAS root to `/app/downloads`.
-- `file_browser` also mounts `/srv/nas_data/comics` read-only at `/app/comics`
-  and uses `COMICS_PICS_PATH=/app/comics/pics` for the in-site comics gallery.
+- `file_browser` mounts `/srv/nas_data/comics` read-write at `/app/comics` so
+  its upload control can write directly to the original comics source, and
+  uses `COMICS_PICS_PATH=/app/comics/pics` for the in-site comics gallery.
+  The bot does not mount this source.
 - All services bind `config.yaml` read-only. The bot has a writable legacy
   `.env` bind for compatibility, while `file_browser` receives it read-only for
   bootstrap fallback and Compose injects `WEB_LOGIN_PASSWORD` explicitly.
