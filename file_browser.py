@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 import uuid
 from datetime import datetime
 from io import BytesIO
@@ -58,6 +59,11 @@ _LAST_RESTART_REQUEST_ID: str | None = None
 _DOWNLOAD_DIR = Path(_config.douyin.download_path)
 _COMICS_DIR = Path(os.environ.get("COMICS_PICS_PATH", "/app/comics/pics"))
 _THUMB_CACHE = Path("/app/.thumb_cache")
+_COMICS_THUMB_CACHE = _THUMB_CACHE / "comics-v1"
+_COMICS_THUMB_MAX_BYTES = 2 * 1024**3
+_COMICS_SCAN_TTL = 5.0
+_COMICS_SCAN_LOCK = threading.RLock()
+_COMICS_SCAN_CACHE: tuple[str, float, list[dict]] | None = None
 
 # ── App setup ─────────────────────────────────────────────────────────
 
@@ -585,7 +591,13 @@ def _scan_downloads() -> dict:
 
 def _collect_comics_images() -> list[dict]:
     """Recursively collect comics images that resolve inside the comics root."""
+    global _COMICS_SCAN_CACHE
     root = _COMICS_DIR.resolve()
+    now = time.monotonic()
+    with _COMICS_SCAN_LOCK:
+        if (_COMICS_SCAN_CACHE and _COMICS_SCAN_CACHE[0] == str(root)
+                and now - _COMICS_SCAN_CACHE[1] < _COMICS_SCAN_TTL):
+            return [dict(image) for image in _COMICS_SCAN_CACHE[2]]
     if not _COMICS_DIR.is_dir():
         return []
 
@@ -612,7 +624,67 @@ def _collect_comics_images() -> list[dict]:
             })
 
     images.sort(key=lambda image: image["relpath"])
+    with _COMICS_SCAN_LOCK:
+        _COMICS_SCAN_CACHE = (str(root), now, [dict(image) for image in images])
     return images
+
+
+def _invalidate_comics_scan() -> None:
+    global _COMICS_SCAN_CACHE
+    with _COMICS_SCAN_LOCK:
+        _COMICS_SCAN_CACHE = None
+
+
+def _comics_thumbnail_path(relpath: str, source: Path) -> Path:
+    """Return a versioned, confined thumbnail cache path."""
+    version = f"{source.stat().st_size}-{source.stat().st_mtime_ns}"
+    key = hashlib.sha256(f"{_COMICS_DIR.resolve()}\0{relpath}".encode()).hexdigest()
+    return _COMICS_THUMB_CACHE / f"{key}-{hashlib.sha256(version.encode()).hexdigest()[:16]}.webp"
+
+
+def _cleanup_comics_thumbnail_cache() -> None:
+    try:
+        entries = [p for p in _COMICS_THUMB_CACHE.iterdir()
+                   if p.is_file() and p.suffix.lower() == ".webp"]
+    except OSError:
+        return
+    total = sum(p.stat().st_size for p in entries if p.exists())
+    if total <= _COMICS_THUMB_MAX_BYTES:
+        return
+    for path in sorted(entries, key=lambda p: p.stat().st_atime):
+        try:
+            total -= path.stat().st_size
+            path.unlink()
+        except OSError:
+            continue
+        if total <= _COMICS_THUMB_MAX_BYTES:
+            break
+
+
+def _comics_thumbnail(relpath: str) -> Path:
+    source = _safe_comics_subpath(relpath)
+    if not source.is_file() or source.suffix.lower() not in _IMAGE_EXTS:
+        abort(404, "Image not found")
+    _COMICS_THUMB_CACHE.mkdir(parents=True, exist_ok=True)
+    target = _comics_thumbnail_path(relpath, source)
+    if not target.exists():
+        temporary = target.with_suffix(f".{uuid.uuid4().hex}.tmp")
+        try:
+            with Image.open(source) as image:
+                image = image.convert("RGB")
+                image.thumbnail((480, 480), Image.Resampling.LANCZOS)
+                image.save(temporary, format="WEBP", quality=82, method=4)
+            os.replace(temporary, target)
+        except (OSError, ValueError) as exc:
+            temporary.unlink(missing_ok=True)
+            log.warning("Comics thumbnail generation failed for %s: %s", relpath, exc)
+            abort(500, "Thumbnail generation failed")
+    try:
+        target.touch()
+    except OSError:
+        pass
+    _cleanup_comics_thumbnail_cache()
+    return target
 
 
 # Video extensions browsers can play natively
@@ -795,7 +867,9 @@ def _collect_videos(author: str | None = None) -> list[dict]:
 def index():
     """Top-level index: author folders + slideshow groups."""
     data = _scan_downloads()
-    data["comics_images"] = _collect_comics_images()
+    all_comics = _collect_comics_images()
+    data["comics_images"] = all_comics[:120]
+    data["comics_total"] = len(all_comics)
     data["empty"] = data["empty"] and not data["comics_images"]
     data["upload_success"] = request.args.get("upload_success", "")
     data["upload_error"] = request.args.get("upload_error", "")
@@ -897,7 +971,9 @@ def view_image(filepath):
         directory_name=safe.parent.name or "下载目录",
         back_url=back_url,
         images=images,
+        thumb_images=images,
         current_index=current_index,
+        is_comics=False,
     )
 
 
@@ -918,8 +994,12 @@ def view_comics_image(filepath):
     if current_index is None:
         abort(404, "Image not found")
 
-    for image in images:
-        image["raw_url"] = url_for("raw_comics_file", filepath=image["relpath"])
+    window_start = max(0, current_index - 30)
+    window_end = min(len(images), current_index + 31)
+    thumb_images = [dict(image, index=index)
+                    for index, image in enumerate(images[window_start:window_end], window_start)]
+    for image in thumb_images:
+        image["thumb_url"] = url_for("comics_thumbnail", filepath=image["relpath"])
 
     return render_template_string(
         IMAGE_VIEWER_HTML,
@@ -927,7 +1007,10 @@ def view_comics_image(filepath):
         directory_name="二次元图片",
         back_url=url_for("index"),
         images=images,
+        thumb_images=thumb_images,
         current_index=current_index,
+        current_raw_url=url_for("raw_comics_file", filepath=current_relpath),
+        is_comics=True,
     )
 
 
@@ -991,6 +1074,38 @@ def raw_comics_file(filepath):
     return send_from_directory(
         str(safe.parent), safe.name, mimetype=_mime_type(safe.name)
     )
+
+
+@app.route("/comics/thumb/<path:filepath>")
+def comics_thumbnail(filepath):
+    """Serve a cached thumbnail generated only from a validated comics image."""
+    relpath = filepath.replace("\\", "/")
+    target = _comics_thumbnail(relpath)
+    response = send_from_directory(str(target.parent), target.name, mimetype="image/webp")
+    response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    return response
+
+
+@app.route("/api/comics")
+def api_comics():
+    """Return a stable, paginated comics catalog."""
+    try:
+        offset = max(0, int(request.args.get("offset", 0)))
+    except (TypeError, ValueError):
+        offset = 0
+    default_limit = 120 if offset == 0 else 60
+    try:
+        limit = max(1, min(120 if offset == 0 else 60, int(request.args.get("limit", default_limit))))
+    except (TypeError, ValueError):
+        limit = default_limit
+    images = _collect_comics_images()
+    page = images[offset:offset + limit]
+    for image in page:
+        image["view_url"] = url_for("view_comics_image", filepath=image["relpath"])
+        image["raw_url"] = url_for("raw_comics_file", filepath=image["relpath"])
+        image["thumb_url"] = url_for("comics_thumbnail", filepath=image["relpath"])
+    return {"images": page, "offset": offset, "limit": limit,
+            "total": len(images), "has_more": offset + len(page) < len(images)}
 
 
 @app.route("/thumb/<path:filepath>")
@@ -1089,6 +1204,7 @@ def api_comics_delete():
                     if d.get("root", "downloads") != "comics"
                     or (d["new_file"] != deleted_rel and d["match_file"] != deleted_rel)
                 ]
+            _invalidate_comics_scan()
             return {
                 "success": True,
                 "removed_empty_dirs": [
@@ -1461,6 +1577,8 @@ def _process_uploaded_file(file, target: str = "downloads") -> tuple[dict, int]:
             "type": file_type,
             "converted": needs_convert,
         }
+        if target == "comics":
+            _invalidate_comics_scan()
         if dup_result:
             response["duplicate"] = dup_result
         return response, 200
@@ -2112,14 +2230,14 @@ INDEX_HTML = (
   <div class="section-header collapsed" data-section="comics" onclick="toggleSection(this)" title="点击折叠/展开"
        style="margin-top:{% if videos or slides %}10{% else %}0{% endif %}px">
     <span class="arrow">▼</span> 🖼️ 二次元图片
-    <span class="section-count">{{ comics_images | length }} 张</span>
+    <span class="section-count">{{ comics_total }} 张</span>
   </div>
-  <div class="collapsible-body card-grid collapsed">
+  <div class="collapsible-body card-grid collapsed" id="comicsGrid" data-total="{{ comics_total }}">
   {% if comics_images %}
   {% for c in comics_images %}
     <div class="card media-card comics-card{% if c.is_landscape %} landscape-card{% endif %}" data-search="{{ (c.name ~ ' ' ~ c.relpath)|e }}">
       <a class="card-inner" href="{{ url_for('view_comics_image', filepath=c.relpath) }}">
-        <img class="card-thumb" src="{{ url_for('raw_comics_file', filepath=c.relpath) }}" loading="lazy" alt="" width="180" height="320">
+        <img class="card-thumb" src="{{ url_for('comics_thumbnail', filepath=c.relpath) }}" loading="lazy" alt="" width="180" height="320">
         <div class="vname">{{ c.name }}</div>
         <div class="meta" style="margin-top:4px">
           <span class="stat">{{ c.relpath }}</span>
@@ -2132,6 +2250,7 @@ INDEX_HTML = (
   {% else %}
   <div class="comics-empty-state">暂无二次元图片</div>
   {% endif %}
+  {% if comics_images and comics_total > comics_images|length %}<div id="comicsLoadSentinel" aria-live="polite" style="grid-column:1 / -1;height:1px"></div>{% endif %}
   </div>
 
   {% if empty %}
@@ -2425,6 +2544,51 @@ if (searchClear) searchClear.addEventListener('click', function() {
   updateSearch();
   mediaSearch.focus();
 });
+// Comics are fetched ahead of the viewport in bounded pages.  Keep only
+// thumbnail URLs in cards; the viewer requests originals on demand.
+(function() {
+  var grid = document.getElementById('comicsGrid');
+  var sentinel = document.getElementById('comicsLoadSentinel');
+  if (!grid || !sentinel) return;
+  var offset = grid.querySelectorAll('.comics-card').length;
+  var loading = false;
+  function card(image) {
+    var card = document.createElement('div');
+    card.className = 'card media-card comics-card' + (image.is_landscape ? ' landscape-card' : '');
+    card.dataset.search = image.name + ' ' + image.relpath;
+    card.innerHTML = '<a class="card-inner" href="' + image.view_url + '">' +
+      '<img class="card-thumb" src="' + image.thumb_url + '" loading="lazy" alt="" width="180" height="320">' +
+      '<div class="vname"></div><div class="meta" style="margin-top:4px"><span class="stat"></span><span class="stat"></span></div></a>' +
+      '<button class="del-btn" title="删除">✕</button>';
+    card.querySelector('.vname').textContent = image.name;
+    card.querySelectorAll('.stat')[0].textContent = image.relpath;
+    card.querySelectorAll('.stat')[1].textContent = image.size_fmt;
+    card.querySelector('.del-btn').addEventListener('click', function(event) {
+      confirmDelete(event, image.relpath, '二次元图片 ' + image.name, '/api/comics/delete');
+    });
+    return card;
+  }
+  function loadMore() {
+    if (loading || offset >= Number(grid.dataset.total || 0)) return;
+    loading = true;
+    fetch('/api/comics?offset=' + offset + '&limit=60').then(function(response) {
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      return response.json();
+    }).then(function(data) {
+      data.images.forEach(function(image) { grid.appendChild(card(image)); });
+      offset += data.images.length;
+      if (!data.has_more) sentinel.remove();
+      updateSearch();
+    }).catch(function() {
+      sentinel.textContent = '加载失败，点击重试';
+      sentinel.style.cursor = 'pointer';
+      sentinel.onclick = function() { sentinel.textContent = ''; loadMore(); };
+    }).finally(function() { loading = false; });
+  }
+  new IntersectionObserver(function(entries) {
+    if (entries.some(function(entry) { return entry.isIntersecting; })) loadMore();
+  }, {rootMargin: '300% 0px'}).observe(sentinel);
+})();
 var savedSectionState = null;
 function restoreSectionState() {
   if (savedSectionState === null) {
@@ -3008,7 +3172,7 @@ IMAGE_VIEWER_HTML = (
 
   <div class="gallery-wrapper">
     <button class="nav-btn nav-prev" id="prevBtn" type="button" onclick="navigate(-1)" aria-label="上一张">‹</button>
-    <img id="mainImg" src="{{ images[current_index].raw_url }}" alt="{{ images[current_index].name }}">
+    <img id="mainImg" src="{{ current_raw_url | default(images[current_index].raw_url) }}" alt="{{ images[current_index].name }}">
     <button class="nav-btn nav-next" id="nextBtn" type="button" onclick="navigate(1)" aria-label="下一张">›</button>
   </div>
 
@@ -3017,16 +3181,16 @@ IMAGE_VIEWER_HTML = (
     <span class="meta" id="imgName">{{ images[current_index].name }}</span>
     <span class="meta" id="imgSize">{{ images[current_index].size_fmt }}</span>
     <div class="viewer-actions">
-      <a class="btn" id="downloadBtn" href="{{ images[current_index].raw_url }}" download>⬇ 下载图片</a>
+      <a class="btn" id="downloadBtn" href="{{ current_raw_url | default(images[current_index].raw_url) }}" download>⬇ 下载图片</a>
     </div>
   </div>
 
   <div class="thumb-strip" id="thumbStrip">
-    {% for img in images %}
-    <img src="{{ img.raw_url }}"
-         class="{{ 'active' if loop.index0 == current_index }}"
-         data-index="{{ loop.index0 }}"
-         onclick="jumpTo({{ loop.index0 }})"
+    {% for img in thumb_images %}
+    <img src="{{ img.thumb_url | default(img.raw_url) }}"
+         class="{{ 'active' if img.relpath == images[current_index].relpath }}"
+         data-index="{{ img.index if is_comics else loop.index0 }}"
+         onclick="jumpTo(this.dataset.index)"
          loading="lazy"
          alt=""
          title="{{ img.name }}">
@@ -3037,6 +3201,7 @@ IMAGE_VIEWER_HTML = (
 
 <script>
 const IMAGES = {{ images | tojson }};
+const IS_COMICS = {{ is_comics | default(false) | tojson }};
 let _idx = {{ current_index }};
 const mainImg = document.getElementById('mainImg');
 const counter = document.getElementById('counter');
@@ -3045,28 +3210,52 @@ const imgSize = document.getElementById('imgSize');
 const downloadBtn = document.getElementById('downloadBtn');
 const prevBtn = document.getElementById('prevBtn');
 const nextBtn = document.getElementById('nextBtn');
-const thumbs = document.querySelectorAll('#thumbStrip img');
+const thumbStrip = document.getElementById('thumbStrip');
 const gallery = document.querySelector('.gallery-wrapper');
+
+function rawUrl(img) {
+  if (!IS_COMICS) return img.raw_url;
+  return '/comics/raw/' + img.relpath.split('/').map(encodeURIComponent).join('/');
+}
+
+function renderThumbs() {
+  if (!IS_COMICS) return;
+  thumbStrip.textContent = '';
+  const start = Math.max(0, _idx - 30);
+  const end = Math.min(IMAGES.length, _idx + 31);
+  for (let index = start; index < end; index += 1) {
+    const img = IMAGES[index];
+    const thumb = document.createElement('img');
+    thumb.src = '/comics/thumb/' + img.relpath.split('/').map(encodeURIComponent).join('/');
+    thumb.className = index === _idx ? 'active' : '';
+    thumb.dataset.index = index;
+    thumb.loading = 'lazy';
+    thumb.alt = '';
+    thumb.title = img.name;
+    thumb.onclick = function() { jumpTo(index); };
+    thumbStrip.appendChild(thumb);
+  }
+}
 
 function show(i) {
   _idx = Math.max(0, Math.min(i, IMAGES.length - 1));
   const img = IMAGES[_idx];
-  mainImg.src = img.raw_url;
+  mainImg.src = rawUrl(img);
   mainImg.alt = img.name;
   counter.textContent = (_idx + 1) + " / " + IMAGES.length;
   imgName.textContent = img.name;
   imgSize.textContent = img.size_fmt;
-  downloadBtn.href = img.raw_url;
+  downloadBtn.href = rawUrl(img);
   prevBtn.disabled = (_idx === 0);
   nextBtn.disabled = (_idx === IMAGES.length - 1);
-  thumbs.forEach(t => t.classList.toggle('active', parseInt(t.dataset.index) === _idx));
+  renderThumbs();
   // Scroll thumbnail into view
   const activeThumb = document.querySelector('#thumbStrip img.active');
   if (activeThumb) activeThumb.scrollIntoView({behavior: 'smooth', block: 'nearest', inline: 'center'});
   [_idx - 1, _idx + 1].forEach(function(adjacent) {
     if (IMAGES[adjacent]) {
       const preload = new Image();
-      preload.src = IMAGES[adjacent].raw_url;
+      preload.src = rawUrl(IMAGES[adjacent]);
     }
   });
 }
