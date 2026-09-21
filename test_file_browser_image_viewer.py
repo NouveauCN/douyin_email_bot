@@ -93,7 +93,7 @@ class ImageViewerTests(unittest.TestCase):
         finally:
             outside.unlink(missing_ok=True)
 
-    def test_comics_gallery_scans_nested_images_in_order_without_delete(self):
+    def test_comics_gallery_scans_nested_images_and_exposes_delete(self):
         nested = self.comics_dir / "nested"
         nested.mkdir()
         (self.comics_dir / "plain.png").write_bytes(_TEST_PNG)
@@ -109,7 +109,52 @@ class ImageViewerTests(unittest.TestCase):
         self.assertIn('/comics/image/plain.png', page)
         self.assertIn('/comics/image/nested/nested.jpg', page)
         comics_card = page[page.index('class="card media-card comics-card"'):]
-        self.assertNotIn('class="del-btn"', comics_card.split('</div>\n  </div>', 1)[0])
+        self.assertIn('class="del-btn"', comics_card)
+        self.assertIn("/api/comics/delete", comics_card)
+
+    def test_comics_delete_removes_image_and_empty_nested_parents(self):
+        nested = self.comics_dir / "nested" / "deeper"
+        nested.mkdir(parents=True)
+        image = nested / "delete-me.png"
+        image.write_bytes(_TEST_PNG)
+
+        response = self.client.post(
+            "/api/comics/delete",
+            json={"path": "nested/deeper/delete-me.png"},
+            headers={"Origin": "http://localhost"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["success"])
+        self.assertFalse(image.exists())
+        self.assertFalse((self.comics_dir / "nested" / "deeper").exists())
+        self.assertFalse((self.comics_dir / "nested").exists())
+        self.assertTrue(self.comics_dir.exists())
+
+    def test_comics_delete_rejects_root_non_images_and_external_symlinks(self):
+        (self.comics_dir / "nested").mkdir()
+        (self.comics_dir / "nested" / "note.txt").write_text("keep")
+        outside = Path(self.tempdir.name).parent / f"outside-delete-{Path(self.tempdir.name).name}.png"
+        outside.write_bytes(_TEST_PNG)
+        link = self.comics_dir / "outside.png"
+        try:
+            link.symlink_to(outside)
+        except OSError as exc:
+            outside.unlink(missing_ok=True)
+            self.skipTest(f"symlink unavailable: {exc}")
+        try:
+            for path, expected in ((".", 403), ("nested", 400), ("nested/note.txt", 400), ("outside.png", 403), ("../outside.png", 403)):
+                with self.subTest(path=path):
+                    response = self.client.post(
+                        "/api/comics/delete",
+                        json={"path": path},
+                        headers={"Origin": "http://localhost"},
+                    )
+                    self.assertEqual(response.status_code, expected)
+            self.assertTrue(outside.exists())
+            self.assertTrue(link.is_symlink())
+        finally:
+            outside.unlink(missing_ok=True)
 
     def test_landscape_images_span_two_gallery_columns(self):
         slide = self.slides_dir / "landscape.png"

@@ -96,9 +96,12 @@ sufficient.
 - The file browser reads `/app/comics/pics` as a separate comics gallery source
   and may upload directly into that original source (no parallel upload
   directory). Its `/comics/raw/...` and `/comics/image/...` routes must
-  validate resolved paths within that source. Comics uploads are authorized
-  only after the same path validation; comics paths must remain blocked for
-  delete, crop, and dedup operations.
+  validate resolved paths within that source. Comics uploads and deletion are
+  authorized only after the same path validation. Deletion is limited to one
+  validated, supported image file under the comics source; the source root,
+  directories, and paths outside the source must be rejected. Empty parent
+  directories may be cleaned up afterward. Comics crop and dedup operations
+  remain disallowed.
 
 ## F2 Bootstrap Invariant
 
