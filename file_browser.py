@@ -463,10 +463,10 @@ def _safe_comics_subpath(subpath: str) -> Path:
     return p
 
 
-def _cleanup_empty_parents(start: Path) -> list[Path]:
-    """Remove empty parent directories under the download root."""
+def _cleanup_empty_parents(start: Path, root: Path | None = None) -> list[Path]:
+    """Remove empty parent directories below ``root`` (but never ``root``)."""
     removed = []
-    root = _DOWNLOAD_DIR.resolve()
+    root = (root or _DOWNLOAD_DIR).resolve()
     current = start.resolve()
 
     while current != root and root in current.parents:
@@ -1018,6 +1018,54 @@ def api_delete():
             return _delete_locked(target, download_root)
     except MediaFileLockBusy:
         return {"success": False, "error": "媒体文件正在处理中，请稍后重试"}, 409
+    finally:
+        _MEDIA_SEMAPHORE.release()
+
+
+@app.route("/api/comics/delete", methods=["POST"])
+def api_comics_delete():
+    """Delete exactly one image from the original comics source directory."""
+    data = request.get_json(silent=True) or {}
+    subpath = data.get("path", "")
+    if not isinstance(subpath, str) or not subpath.strip():
+        return {"success": False, "error": "缺少 path 参数"}, 400
+
+    # Resolve for traversal/external-symlink checks, but retain the lexical
+    # path so an internal symlink cannot cause deletion of its target.
+    lexical = _COMICS_DIR / subpath.strip()
+    target = _safe_comics_subpath(subpath.strip())
+    comics_root = _COMICS_DIR.resolve()
+    if target == comics_root:
+        return {"success": False, "error": "不允许删除二次元根目录"}, 403
+    try:
+        lexical.relative_to(_COMICS_DIR)
+    except ValueError:
+        return {"success": False, "error": "Path traversal denied"}, 403
+    if lexical.is_symlink():
+        return {"success": False, "error": "不允许删除符号链接"}, 403
+    if not target.exists():
+        return {"success": False, "error": "图片不存在"}, 404
+    if not target.is_file() or target.suffix.lower() not in _IMAGE_EXTS:
+        return {"success": False, "error": "仅允许删除图片文件"}, 400
+    if not _try_acquire_media_slot():
+        return _media_busy_response()
+
+    try:
+        with media_file_lock(target, root=_COMICS_DIR, timeout=0.25):
+            target.unlink()
+            removed_dirs = _cleanup_empty_parents(target.parent, comics_root)
+            return {
+                "success": True,
+                "removed_empty_dirs": [
+                    str(path.relative_to(comics_root)).replace("\\", "/")
+                    for path in removed_dirs
+                ],
+            }
+    except MediaFileLockBusy:
+        return {"success": False, "error": "媒体文件正在处理中，请稍后重试"}, 409
+    except OSError as exc:
+        log.error("Failed to delete comics image %s: %s", target, exc)
+        return {"success": False, "error": str(exc)}, 500
     finally:
         _MEDIA_SEMAPHORE.release()
 
@@ -1987,7 +2035,7 @@ INDEX_HTML = (
           <span class="stat">{{ s.size_fmt }}</span>
         </div>
       </a>
-      <button class="del-btn" onclick="confirmDelete(event, '{{ s.relpath|e }}', '图片 {{ s.name|e }}')" title="删除">✕</button>
+      <button class="del-btn" onclick="confirmDelete(event, '{{ s.relpath|e }}', '图片 {{ s.name|e }}', '/api/delete')" title="删除">✕</button>
     </div>
   {% endfor %}
   </div>
@@ -2010,6 +2058,7 @@ INDEX_HTML = (
           <span class="stat">{{ c.size_fmt }}</span>
         </div>
       </a>
+      <button class="del-btn" onclick="confirmDelete(event, '{{ c.relpath|e }}', '二次元图片 {{ c.name|e }}', '/api/comics/delete')" title="删除">✕</button>
     </div>
   {% endfor %}
   {% else %}
@@ -2371,11 +2420,12 @@ function removeDeletedCard(card) {
   }
 }
 restoreSectionState();
-function confirmDelete(event, path, label) {
+function confirmDelete(event, path, label, endpoint) {
   event.stopPropagation();
   event.preventDefault();
   if (!confirm('确定删除 ' + label + '？此操作不可撤销。')) return;
-  fetch('/api/delete', {
+  var deleteEndpoint = endpoint === '/api/comics/delete' ? endpoint : '/api/delete';
+  fetch(deleteEndpoint, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({path: path})
