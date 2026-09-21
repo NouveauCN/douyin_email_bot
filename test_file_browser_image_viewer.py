@@ -51,6 +51,13 @@ class ImageViewerTests(unittest.TestCase):
         self.assertIn("/raw/slides/02.png", page)
         self.assertIn('const IMAGES = [{', page)
 
+    def test_image_viewer_contains_mobile_safe_controls(self):
+        page = self.client.get("/image/slides/02.png").get_data(as_text=True)
+
+        self.assertIn("min-height: min(65svh, 520px)", page)
+        self.assertIn(".gallery-wrapper img { max-height: 65svh;", page)
+        self.assertIn(".nav-btn { width: 44px; height: 44px;", page)
+
     def test_home_and_browse_link_to_embedded_viewer(self):
         home = self.client.get("/").get_data(as_text=True)
         browse = self.client.get("/browse/slides").get_data(as_text=True)
