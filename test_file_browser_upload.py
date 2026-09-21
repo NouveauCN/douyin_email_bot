@@ -54,6 +54,17 @@ class UploadFormTests(unittest.TestCase):
         self.assertIn('name="target"', page)
         self.assertIn("二次元（仅图片）", page)
 
+    def test_index_contains_mobile_layout_rules(self):
+        page = self.client.get("/").get_data(as_text=True)
+
+        self.assertIn("env(safe-area-inset-left)", page)
+        self.assertIn("grid-template-columns: repeat(2, minmax(0, 1fr))", page)
+        self.assertIn(".card.landscape-card { grid-column: span 1; }", page)
+        self.assertIn("@media (max-width:340px)", page)
+        self.assertIn(".upload-form { display: grid;", page)
+        self.assertIn(".browse-search { display: grid;", page)
+        self.assertIn(".top-tabs { display: grid; grid-template-columns: repeat(3", page)
+
     def test_empty_home_exposes_comics_gallery(self):
         response = self.client.get("/")
         page = response.get_data(as_text=True)

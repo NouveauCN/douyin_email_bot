@@ -1718,6 +1718,13 @@ _COMMON_CSS = """
   .del-btn:hover { background: #fe2c55; color: #fff; }
   .card { position: relative; }
   video:focus, img:focus { outline: none; }
+  @media (max-width:640px) {
+    body { padding: max(8px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right)) max(12px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left)); }
+    .container { padding: 0 4px; }
+    .btn { min-height: 44px; padding: 10px 14px; font-size: 16px; display: inline-flex; align-items: center; justify-content: center; }
+    .back-link { min-height: 44px; display: inline-flex; align-items: center; font-size: 16px; }
+    h1 { font-size: 20px; }
+  }
 """
 
 INDEX_HTML = (
@@ -1745,7 +1752,27 @@ INDEX_HTML = (
   }
   .card.landscape-card { grid-column: span 2; }
   .card.landscape-card .card-thumb { aspect-ratio: 16 / 9; }
-  @media (max-width:440px) { .card.landscape-card { grid-column: span 1; } }
+  @media (max-width:640px) {
+    .top-tabs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; margin-bottom: 16px; }
+    .top-tab { min-height: 44px; padding: 8px 4px; font-size: 16px; }
+    .upload-form { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; align-items: stretch; }
+    .upload-form select { grid-column: 1 / -1; min-height: 44px; font-size: 16px; }
+    .upload-form > label[for="uploadInput"], .upload-submit { width: 100%; }
+    .upload-status { grid-column: 1 / -1; min-height: 22px; font-size: 13px; }
+    .browse-search { display: grid; grid-template-columns: 1fr; gap: 6px; margin-bottom: 14px; }
+    .browse-search label { font-size: 16px; }
+    .browse-search input { min-width: 0; width: 100%; min-height: 44px; padding: 9px 12px; font-size: 16px; }
+    .search-status { min-height: 20px; font-size: 13px; }
+    .card-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-bottom: 24px; }
+    .card { border-radius: 8px; padding: 8px; }
+    .card-thumb { border-radius: 6px; margin-bottom: 6px; }
+    .card.landscape-card { grid-column: span 1; }
+    .card .vname { font-size: 14px; }
+    .section-header { min-height: 44px; margin-bottom: 8px; font-size: 16px; }
+  }
+  @media (max-width:340px) {
+    .card-grid { grid-template-columns: 1fr; }
+  }
   .card .vname { font-size: 14px; color: #333; word-break: break-all; line-height: 1.3; }
   /* ── Pending duplicates ── */
   .dup-section { margin-bottom: 24px; }
@@ -2512,6 +2539,14 @@ BROWSE_HTML = (
     margin-left: 6px; transition: background 0.15s;
   }
   .dl-btn:hover { background: #ddd; }
+  @media (max-width:640px) {
+    .file-row { display: grid; grid-template-columns: 36px minmax(0, 1fr); gap: 8px; padding: 10px; }
+    .file-icon { grid-row: span 1; width: 36px; }
+    .file-action { grid-column: 2; display: flex; gap: 6px; flex-wrap: wrap; width: 100%; }
+    .play-btn, .dl-btn { flex: 1 1 112px; min-height: 44px; margin-left: 0; padding: 10px 8px; font-size: 16px; text-align: center; display: inline-flex; align-items: center; justify-content: center; }
+    .file-info .fname { font-size: 16px; }
+    .file-info .fmeta { font-size: 13px; }
+  }
 </style>
 </head>
 <body>
@@ -2586,6 +2621,12 @@ VIDEO_HTML = (
   .crop-status {
     width: 100%; font-size: 13px; color: #777; padding: 10px 12px;
     background: #fff; border-radius: 8px; display: none;
+  }
+  @media (max-width:640px) {
+    .video-wrapper { border-radius: 8px; max-height: 65svh; margin-bottom: 10px; }
+    .info-bar { padding: 12px; gap: 8px; }
+    .actions { gap: 8px; }
+    .actions .btn { flex: 1 1 140px; }
   }
 </style>
 </head>
@@ -2738,6 +2779,19 @@ IMAGE_VIEWER_HTML = (
   .thumb-strip img.active { border-color: #fe2c55; opacity: 1; }
   .thumb-strip img:hover { opacity: 0.85; }
   .key-hint { font-size: 11px; color: #999; text-align: center; margin-top: 10px; }
+  @media (max-width:640px) {
+    .gallery-wrapper { min-height: min(65svh, 520px); border-radius: 8px; margin-bottom: 10px; }
+    .gallery-wrapper img { max-height: 65svh; max-width: calc(100% - 88px); }
+    .nav-btn { width: 44px; height: 44px; font-size: 28px; }
+    .nav-prev { left: 6px; } .nav-next { right: 6px; }
+    .gallery-info { padding: 12px; gap: 8px; }
+    .gallery-info .counter { font-size: 16px; }
+    .gallery-info .meta { max-width: 100%; font-size: 13px; overflow-wrap: anywhere; }
+    .viewer-actions { gap: 6px; }
+    .viewer-actions .btn { flex: 1 1 140px; }
+    .thumb-strip { padding: 8px 0; }
+    .thumb-strip img { width: 56px; height: 56px; }
+  }
 </style>
 </head>
 <body>
