@@ -877,7 +877,7 @@ def view_image(filepath):
 
 @app.route("/comics/image/<path:filepath>")
 def view_comics_image(filepath):
-    """Render the read-only comics image gallery."""
+    """Render the comics image gallery."""
     safe = _safe_comics_subpath(filepath)
     if not safe.is_file() or safe.suffix.lower() not in _IMAGE_EXTS:
         abort(404, "Image not found")
@@ -1790,6 +1790,10 @@ INDEX_HTML = (
   .upload-submit { background: #25a55a; }
   .upload-submit:disabled { cursor: wait; opacity: 0.55; }
   .upload-status { font-size: 12px; color: #999; word-break: break-all; }
+  .browse-search { display:flex; gap:8px; align-items:center; margin:0 0 18px; flex-wrap:wrap; }
+  .browse-search label { color:#777; font-size:13px; }
+  .browse-search input { min-width:min(360px, 100%); flex:1; border:1px solid #ddd; border-radius:8px; padding:9px 12px; font:inherit; }
+  .search-status { color:#888; font-size:12px; }
   .comics-empty-state { color: #999; padding: 24px 20px; text-align: center; }
   .top-tabs { display:flex; gap:8px; margin:0 0 22px; }
   .top-tab { border:1px solid #ddd; border-radius:8px; padding:8px 18px; background:#fff; color:#777; cursor:pointer; font-size:13px; }
@@ -1870,6 +1874,13 @@ INDEX_HTML = (
     </span>
   </form>
 
+  <div class="browse-search" role="search">
+    <label for="mediaSearch">🔎 搜索</label>
+    <input id="mediaSearch" type="search" autocomplete="off"
+           placeholder="文件名、相对路径或作者">
+    <span id="searchStatus" class="search-status" aria-live="polite"></span>
+  </div>
+
   <!-- Pending duplicates section (populated by JS) -->
   <div id="dupSection"></div>
 
@@ -1880,7 +1891,7 @@ INDEX_HTML = (
   </div>
   <div class="collapsible-body card-grid collapsed">
   {% for v in videos %}
-    <div class="card">
+    <div class="card media-card" data-search="{{ (v.name ~ ' ' ~ v.relpath ~ ' ' ~ v.author)|e }}">
       <a class="card-inner" href="{{ url_for('view_video', filepath=v.relpath) }}">
         <img class="card-thumb" src="{{ url_for('thumb', filepath=v.relpath) }}" loading="lazy" alt="" width="180" height="320">
         <div class="vname">{{ v.name }}</div>
@@ -1903,7 +1914,7 @@ INDEX_HTML = (
   </div>
   <div class="collapsible-body card-grid collapsed">
   {% for s in slides %}
-    <div class="card{% if s.is_landscape %} landscape-card{% endif %}">
+    <div class="card media-card{% if s.is_landscape %} landscape-card{% endif %}" data-search="{{ (s.name ~ ' ' ~ s.relpath)|e }}">
       <a class="card-inner" href="{{ url_for('view_image', filepath=s.relpath) }}">
         <img class="card-thumb" src="{{ url_for('raw_file', filepath=s.relpath) }}" loading="lazy" alt="" width="180" height="320">
         <div class="vname">{{ s.name }}</div>
@@ -1923,11 +1934,10 @@ INDEX_HTML = (
     <span class="arrow">▼</span> 🖼️ 二次元图片
     <span class="section-count">{{ comics_images | length }} 张</span>
   </div>
-  <div class="collapsible-body collapsed">
+  <div class="collapsible-body card-grid collapsed">
   {% if comics_images %}
-  <div class="card-grid">
   {% for c in comics_images %}
-    <div class="card comics-card{% if c.is_landscape %} landscape-card{% endif %}">
+    <div class="card media-card comics-card{% if c.is_landscape %} landscape-card{% endif %}" data-search="{{ (c.name ~ ' ' ~ c.relpath)|e }}">
       <a class="card-inner" href="{{ url_for('view_comics_image', filepath=c.relpath) }}">
         <img class="card-thumb" src="{{ url_for('raw_comics_file', filepath=c.relpath) }}" loading="lazy" alt="" width="180" height="320">
         <div class="vname">{{ c.name }}</div>
@@ -1938,7 +1948,6 @@ INDEX_HTML = (
       </a>
     </div>
   {% endfor %}
-  </div>
   {% else %}
   <div class="comics-empty-state">暂无二次元图片</div>
   {% endif %}
@@ -2136,6 +2145,54 @@ function toggleSection(header) {
   header.classList.toggle('collapsed');
   header.nextElementSibling.classList.toggle('collapsed');
 }
+var searchExpandedSections = [];
+function updateSearch() {
+  var input = document.getElementById('mediaSearch');
+  var status = document.getElementById('searchStatus');
+  if (!input || !status) return;
+  var query = input.value.trim().toLocaleLowerCase();
+  var total = 0;
+  document.querySelectorAll('.section-header[data-section]').forEach(function(header) {
+    var body = header.nextElementSibling;
+    if (!body || !body.classList.contains('card-grid')) return;
+    var cards = Array.from(body.querySelectorAll('.media-card'));
+    var visible = 0;
+    cards.forEach(function(card) {
+      var matches = !query || (card.dataset.search || '').toLocaleLowerCase().indexOf(query) !== -1;
+      card.style.display = matches ? '' : 'none';
+      if (matches) visible += 1;
+    });
+    total += visible;
+    var count = header.querySelector('.section-count');
+    if (count) count.textContent = visible + (header.dataset.section === 'videos' ? ' 个' : ' 张');
+    if (query && visible && header.classList.contains('collapsed')) {
+      header.classList.remove('collapsed');
+      body.classList.remove('collapsed');
+      if (searchExpandedSections.indexOf(header.dataset.section) === -1) {
+        searchExpandedSections.push(header.dataset.section);
+      }
+    }
+  });
+  if (!query) {
+    searchExpandedSections.forEach(function(section) {
+      var header = document.querySelector('.section-header[data-section="' + section + '"]');
+      if (header && !header.classList.contains('collapsed')) toggleSection(header);
+    });
+    searchExpandedSections = [];
+    document.querySelectorAll('.media-card').forEach(function(card) { card.style.display = ''; });
+    document.querySelectorAll('.section-header[data-section]').forEach(function(header) {
+      var body = header.nextElementSibling;
+      if (!body || !body.classList.contains('card-grid')) return;
+      var count = header.querySelector('.section-count');
+      if (count) count.textContent = body.querySelectorAll('.media-card').length + (header.dataset.section === 'videos' ? ' 个' : ' 张');
+    });
+    status.textContent = '';
+  } else {
+    status.textContent = '匹配 ' + total + ' 项';
+  }
+}
+var mediaSearch = document.getElementById('mediaSearch');
+if (mediaSearch) mediaSearch.addEventListener('input', updateSearch);
 var savedSectionState = null;
 function restoreSectionState() {
   if (savedSectionState === null) {

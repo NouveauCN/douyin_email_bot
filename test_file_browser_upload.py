@@ -83,7 +83,10 @@ class UploadFormTests(unittest.TestCase):
             '    <span class="arrow">▼</span> 🖼️ 图片',
             page,
         )
-        self.assertEqual(page.count('class="collapsible-body card-grid collapsed"'), 2)
+        self.assertEqual(page.count('class="collapsible-body card-grid collapsed"'), 3)
+        self.assertIn('id="mediaSearch"', page)
+        self.assertIn('function updateSearch()', page)
+        self.assertIn('data-search="sample.mp4 author/sample.mp4 author"', page)
         self.assertIn("header.className = 'section-header collapsed';", page)
         self.assertIn(
             "body.className = 'collapsible-body dup-section collapsed';", page
@@ -105,6 +108,19 @@ class UploadFormTests(unittest.TestCase):
         self.assertIn('data-section="videos"', page)
         self.assertIn('data-section="images"', page)
         self.assertIn('data-section="comics"', page)
+
+    def test_comics_gallery_uses_same_card_grid_and_search_metadata(self):
+        self.comics_dir.mkdir()
+        (self.comics_dir / "artist").mkdir()
+        (self.comics_dir / "artist" / "hero.png").write_bytes(_TEST_PNG)
+
+        page = self.client.get("/").get_data(as_text=True)
+
+        self.assertIn('data-section="comics"', page)
+        self.assertIn('class="collapsible-body card-grid collapsed"', page)
+        self.assertIn('class="card media-card comics-card', page)
+        self.assertIn('data-search="hero.png artist/hero.png"', page)
+        self.assertNotIn('class="collapsible-body collapsed"', page)
 
     def test_enhanced_mobile_upload_returns_json(self):
         response = self.client.post(
