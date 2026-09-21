@@ -2,6 +2,7 @@
 
 import base64
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from urllib.parse import quote
@@ -30,13 +31,19 @@ class ImageViewerTests(unittest.TestCase):
         self.comics_dir = self.download_dir / "comics" / "pics"
         self.comics_dir.mkdir(parents=True)
         self.comics_patch = patch.object(file_browser, "_COMICS_DIR", self.comics_dir)
+        self.thumb_cache = self.download_dir / "thumb-cache"
+        self.thumb_cache_patch = patch.object(
+            file_browser, "_COMICS_THUMB_CACHE", self.thumb_cache
+        )
         self.download_patch.start()
         self.comics_patch.start()
+        self.thumb_cache_patch.start()
         self.client = file_browser.app.test_client()
 
     def tearDown(self):
         self.download_patch.stop()
         self.comics_patch.stop()
+        self.thumb_cache_patch.stop()
         self.tempdir.cleanup()
 
     def test_image_page_embeds_viewer_and_starts_at_requested_image(self):
@@ -223,6 +230,82 @@ class ImageViewerTests(unittest.TestCase):
 
         self.assertIn("二次元图片", page)
         self.assertIn("暂无二次元图片", page)
+
+    def test_comics_api_paginates_initial_and_followup_pages_in_stable_order(self):
+        for index in range(185):
+            (self.comics_dir / f"{index:03d}.png").write_bytes(_TEST_PNG)
+
+        initial = self.client.get("/api/comics")
+        self.assertEqual(initial.status_code, 200)
+        first = initial.get_json()
+        self.assertEqual(first["offset"], 0)
+        self.assertEqual(first["limit"], 120)
+        self.assertEqual(first["total"], 185)
+        self.assertTrue(first["has_more"])
+        self.assertEqual(len(first["images"]), 120)
+        self.assertEqual(first["images"][0]["relpath"], "000.png")
+        self.assertEqual(first["images"][-1]["relpath"], "119.png")
+
+        middle = self.client.get("/api/comics?offset=120&limit=60").get_json()
+        self.assertEqual(middle["limit"], 60)
+        self.assertEqual(len(middle["images"]), 60)
+        self.assertEqual(middle["images"][0]["relpath"], "120.png")
+        self.assertTrue(middle["has_more"])
+
+        last = self.client.get("/api/comics?offset=180&limit=60").get_json()
+        self.assertEqual(len(last["images"]), 5)
+        self.assertFalse(last["has_more"])
+        self.assertEqual(last["images"][-1]["relpath"], "184.png")
+
+    def test_comics_thumbnail_is_cached_and_rebuilt_when_source_changes(self):
+        image = self.comics_dir / "thumb.png"
+        file_browser.Image.new("RGB", (8, 12), (255, 0, 0)).save(image)
+
+        first = self.client.get("/comics/thumb/thumb.png")
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.mimetype, "image/webp")
+        self.assertIn("immutable", first.headers["Cache-Control"])
+        cached = list(self.thumb_cache.glob("*.webp"))
+        self.assertEqual(len(cached), 1)
+        first_bytes = first.data
+
+        time.sleep(0.001)
+        file_browser.Image.new("RGB", (8, 12), (0, 0, 255)).save(image)
+        second = self.client.get("/comics/thumb/thumb.png")
+        self.assertEqual(second.status_code, 200)
+        self.assertNotEqual(second.data, first_bytes)
+        self.assertEqual(len(list(self.thumb_cache.glob("*.webp"))), 2)
+
+    def test_comics_viewer_serializes_compact_metadata_and_bounded_thumbs(self):
+        for index in range(100):
+            (self.comics_dir / f"viewer-{index:03d}.png").write_bytes(_TEST_PNG)
+
+        page = self.client.get("/comics/image/viewer-050.png").get_data(as_text=True)
+        self.assertLessEqual(page.count('<img src="/comics/thumb/'), 61)
+        self.assertNotIn('"raw_url"', page)
+        self.assertIn("function rawUrl(img)", page)
+
+    def test_thumbnail_cleanup_ignores_concurrent_temp_files(self):
+        final = self.thumb_cache / "final.webp"
+        temporary = self.thumb_cache / "building.tmp"
+        self.thumb_cache.mkdir()
+        final.write_bytes(b"final")
+        temporary.write_bytes(b"temporary" * 100)
+        with patch.object(file_browser, "_COMICS_THUMB_MAX_BYTES", 1):
+            file_browser._cleanup_comics_thumbnail_cache()
+        self.assertFalse(final.exists())
+        self.assertTrue(temporary.exists())
+
+    def test_homepage_uses_comics_thumbnails_and_prefetches_early(self):
+        for index in range(121):
+            (self.comics_dir / f"page-{index:03d}.png").write_bytes(_TEST_PNG)
+
+        page = self.client.get("/").get_data(as_text=True)
+        self.assertEqual(page.count('/comics/thumb/'), 120)
+        self.assertIn("/api/comics?offset=", page)
+        self.assertIn("limit=60", page)
+        self.assertIn("rootMargin: '300% 0px'", page)
+        self.assertIn('id="comicsLoadSentinel" aria-live="polite" style="grid-column:1 / -1;height:1px"', page)
 
 
 if __name__ == "__main__":
