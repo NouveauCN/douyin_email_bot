@@ -78,7 +78,9 @@ services:
       - "${LAN_BIND_ADDRESS:-192.168.1.94}:8081:8081"
     volumes:
       - /srv/nas_data/douyin_downloads:/app/downloads
-      - /srv/nas_data/comics:/app/comics:ro
+      # The file browser may upload directly into the original comics source.
+      # The bot does not mount this path.
+      - /srv/nas_data/comics:/app/comics
       - runtime_settings:/app/runtime-settings
       - firefox_profile:/app/firefox_profile
       - ./config.yaml:/app/config.yaml:ro

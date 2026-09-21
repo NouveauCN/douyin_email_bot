@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import threading
+import uuid
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -1196,7 +1197,21 @@ def _upload_response(payload: dict, status: int = 200):
     )
 
 
-def _process_uploaded_file(file) -> tuple[dict, int]:
+def _next_upload_destination(directory: Path, filename: str) -> Path:
+    """Choose a non-existing destination without ever overwriting media."""
+    candidate = directory / filename
+    if not candidate.exists():
+        return candidate
+    stem, suffix = candidate.stem, candidate.suffix
+    index = 1
+    while True:
+        candidate = directory / f"{stem}_{index}{suffix}"
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
+def _process_uploaded_file(file, target: str = "downloads") -> tuple[dict, int]:
     """Validate and save one uploaded file, returning its payload and status."""
     original_name = Path(file.filename).name
     if "." in original_name:
@@ -1230,22 +1245,42 @@ def _process_uploaded_file(file) -> tuple[dict, int]:
             400,
         )
 
+    if target == "comics" and file_type != "image":
+        return (
+            {
+                "success": False,
+                "original_filename": original_name,
+                "error": "二次元目录仅支持图片上传",
+            },
+            400,
+        )
+    if target not in {"downloads", "comics"}:
+        return (
+            {
+                "success": False,
+                "original_filename": original_name,
+                "error": "无效的上传目标",
+            },
+            400,
+        )
+
     safe_stem = re.sub(r"[^\w\-.\\u4e00-\\u9fff]", "_", stem).strip("_") or "upload"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     new_name = f"{timestamp}_{safe_stem}{out_ext}"
 
-    dest_dir = _DOWNLOAD_DIR / subdir
+    root = _COMICS_DIR if target == "comics" else _DOWNLOAD_DIR
+    dest_dir = root if target == "comics" else root / subdir
     dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / new_name
+    dest = _next_upload_destination(dest_dir, new_name)
 
     # For conversion: save as temp file first, then convert
     if needs_convert:
-        tmp_name = f"{timestamp}_{safe_stem}{ext}"
+        tmp_name = f".{dest.name}.{uuid.uuid4().hex}{ext}"
         tmp_path = dest_dir / tmp_name
     else:
-        tmp_path = None
+        tmp_path = dest_dir / f".{dest.name}.{uuid.uuid4().hex}.upload"
 
-    file_lock = media_file_lock(dest, root=_DOWNLOAD_DIR, timeout=0.25)
+    file_lock = media_file_lock(dest, root=root, timeout=0.25)
     try:
         file_lock.acquire()
     except MediaFileLockBusy:
@@ -1259,15 +1294,16 @@ def _process_uploaded_file(file) -> tuple[dict, int]:
         )
 
     try:
-        save_path = tmp_path if needs_convert else dest
+        save_path = tmp_path
         file.save(str(save_path))
         log.info("Saved upload: %s (%s)", save_path, _format_size(save_path.stat().st_size))
 
         if needs_convert:
             log.info("Converting %s → %s ...", tmp_path.name, new_name)
-            if not _convert_video(tmp_path, dest):
+            converted_path = dest_dir / f".{dest.name}.{uuid.uuid4().hex}.converted"
+            if not _convert_video(tmp_path, converted_path):
                 # Clean up both files on failure
-                for p in (tmp_path, dest):
+                for p in (tmp_path, converted_path, dest):
                     try:
                         p.unlink()
                     except OSError:
@@ -1280,49 +1316,53 @@ def _process_uploaded_file(file) -> tuple[dict, int]:
                     },
                     500,
                 )
+            os.replace(converted_path, dest)
             # Remove the original after successful conversion
             try:
                 tmp_path.unlink()
             except OSError:
                 pass
             log.info("Conversion complete: %s", new_name)
+        else:
+            os.replace(tmp_path, dest)
 
-        relpath = str(dest.relative_to(_DOWNLOAD_DIR)).replace("\\", "/")
+        relpath = str(dest.relative_to(root)).replace("\\", "/")
         log.info("Uploaded [%s]: %s (%s)", file_type, relpath, _format_size(dest.stat().st_size))
 
-        # ── Dedup check ──
+        # ── Dedup checks cover only the downloads tree. ──
         dup_result = None
-        try:
-            img = _media_to_image(dest)
-            new_dhash = _compute_dhash(img)
-            new_thumb = _compute_thumbnail(img)
-            with _DEDUP_LOCK:
-                for existing_rel, (existing_dhash, existing_thumb) in _DEDUP_INDEX.items():
-                    if _hamming(new_dhash, existing_dhash) > _DHASH_THRESHOLD:
-                        continue
-                    mse_val = _mse(new_thumb, existing_thumb)
-                    if mse_val < _MSE_THRESHOLD:
-                        similarity = max(0, 100 - int(mse_val / _MSE_THRESHOLD * 100))
-                        dup_result = {
-                            "duplicate_of": existing_rel,
-                            "dhash_dist": _hamming(new_dhash, existing_dhash),
-                            "mse": round(mse_val, 1),
-                            "similarity_pct": similarity,
-                        }
-                        _PENDING_DUPS.append({
-                            "new_file": relpath,
-                            "match_file": existing_rel,
-                            "dhash_dist": dup_result["dhash_dist"],
-                            "mse": dup_result["mse"],
-                            "similarity_pct": similarity,
-                        })
-                        log.info("Duplicate candidate: %s ≈ %s (dist=%d, mse=%.1f)",
-                                 relpath, existing_rel, dup_result["dhash_dist"], dup_result["mse"])
-                        break
-                if not dup_result:
-                    _DEDUP_INDEX[relpath] = (new_dhash, new_thumb)
-        except Exception as e:
-            log.warning("Dedup check skipped for %s: %s", relpath, e)
+        if target != "comics":
+            try:
+                img = _media_to_image(dest)
+                new_dhash = _compute_dhash(img)
+                new_thumb = _compute_thumbnail(img)
+                with _DEDUP_LOCK:
+                    for existing_rel, (existing_dhash, existing_thumb) in _DEDUP_INDEX.items():
+                        if _hamming(new_dhash, existing_dhash) > _DHASH_THRESHOLD:
+                            continue
+                        mse_val = _mse(new_thumb, existing_thumb)
+                        if mse_val < _MSE_THRESHOLD:
+                            similarity = max(0, 100 - int(mse_val / _MSE_THRESHOLD * 100))
+                            dup_result = {
+                                "duplicate_of": existing_rel,
+                                "dhash_dist": _hamming(new_dhash, existing_dhash),
+                                "mse": round(mse_val, 1),
+                                "similarity_pct": similarity,
+                            }
+                            _PENDING_DUPS.append({
+                                "new_file": relpath,
+                                "match_file": existing_rel,
+                                "dhash_dist": dup_result["dhash_dist"],
+                                "mse": dup_result["mse"],
+                                "similarity_pct": similarity,
+                            })
+                            log.info("Duplicate candidate: %s ≈ %s (dist=%d, mse=%.1f)",
+                                     relpath, existing_rel, dup_result["dhash_dist"], dup_result["mse"])
+                            break
+                    if not dup_result:
+                        _DEDUP_INDEX[relpath] = (new_dhash, new_thumb)
+            except Exception as e:
+                log.warning("Dedup check skipped for %s: %s", relpath, e)
 
         response = {
             "success": True,
@@ -1345,12 +1385,21 @@ def _process_uploaded_file(file) -> tuple[dict, int]:
             "error": str(e),
         }, 500
     finally:
+        for candidate in (tmp_path, locals().get("converted_path")):
+            if candidate is not None:
+                try:
+                    candidate.unlink()
+                except OSError:
+                    pass
         file_lock.release()
 
 
 @app.route("/api/upload", methods=["POST"])
 def api_upload():
-    """Upload one or more files; images → slides/, videos → uploads/."""
+    """Upload files to the ordinary downloads tree or the comics gallery."""
+    target = request.form.get("target", "downloads")
+    if target not in {"downloads", "comics"}:
+        return _upload_response({"success": False, "error": "无效的上传目标"}, 400)
     if "file" not in request.files:
         return _upload_response({"success": False, "error": "缺少 file 参数"}, 400)
 
@@ -1377,12 +1426,13 @@ def api_upload():
             # Serialize upload publish/convert transactions.  This lock is
             # intentionally separate from per-file processing locks and never
             # spans network downloads (uploads are already local input).
+            upload_root = _COMICS_DIR if target == "comics" else _DOWNLOAD_DIR
             with media_file_lock(
-                _DOWNLOAD_DIR / ".upload-transaction",
-                root=_DOWNLOAD_DIR,
+                upload_root / ".upload-transaction",
+                root=upload_root,
                 timeout=0.25,
             ):
-                processed = [_process_uploaded_file(file) for file in files]
+                processed = [_process_uploaded_file(file, target) for file in files]
         except MediaFileLockBusy:
             return _upload_response(
                 {"success": False, "error": "媒体目录正在处理中，请稍后重试"}, 409
@@ -1799,6 +1849,11 @@ INDEX_HTML = (
 
   <form id="uploadForm" class="upload-form" action="{{ url_for('api_upload') }}"
         method="post" enctype="multipart/form-data">
+    <label for="uploadTarget">上传到</label>
+    <select id="uploadTarget" name="target">
+      <option value="downloads">图片 / 视频</option>
+      <option value="comics">二次元（仅图片）</option>
+    </select>
     <input class="upload-input" type="file" id="uploadInput" name="file"
            accept="video/*,image/*" multiple required>
     <label class="btn" for="uploadInput">📁 选择文件</label>
@@ -2169,7 +2224,18 @@ function setUploadStatus(message, background, color) {
 }
 var uploadForm = document.getElementById('uploadForm');
 var uploadInput = document.getElementById('uploadInput');
+var uploadTarget = document.getElementById('uploadTarget');
 var uploadSubmit = document.getElementById('uploadSubmit');
+uploadTarget.addEventListener('change', function() {
+  var isComics = uploadTarget.value === 'comics';
+  uploadInput.accept = isComics ? 'image/*' : 'video/*,image/*';
+  uploadInput.value = '';
+  setUploadStatus(
+    isComics ? '二次元目录仅支持图片' : '就绪',
+    isComics ? '#e8f4fd' : '',
+    isComics ? '#236a96' : ''
+  );
+});
 uploadInput.addEventListener('change', function() {
   if (uploadInput.files.length) {
     var selection = uploadInput.files.length === 1
