@@ -1855,6 +1855,25 @@ INDEX_HTML = (
   .setting-actions { display:flex; gap:5px; white-space:nowrap; }
   .setting-action { border:0; border-radius:6px; padding:7px 9px; color:#666; cursor:pointer; background:#eee; font-size:12px; }
   @media (max-width:640px) { .setting-row { grid-template-columns:1fr; } .setting-actions { justify-content:flex-end; } }
+  /* Mobile overflow guard: this block intentionally follows all component rules. */
+  @media (max-width:640px) {
+    html, body { max-width:100%; min-width:0; overflow-x:hidden; }
+    body { width:100%; }
+    .container, .tab-panel, .web-login-panel, .settings-group {
+      width:100%; max-width:100%; min-width:0;
+    }
+    .top-tabs, .upload-form, .browse-search, .settings-toolbar,
+    .web-login-form { max-width:100%; min-width:0; }
+    .upload-form { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); }
+    .upload-form > *, .browse-search > *, .top-tabs > *,
+    .settings-toolbar > *, .web-login-form > * { min-width:0; max-width:100%; }
+    .browse-search { display:grid; grid-template-columns:minmax(0,1fr); }
+    .browse-search input, .browse-search select, .search-clear,
+    .upload-form select, .upload-form label, .upload-form button { width:100%; max-width:100%; }
+    .browse-search input { min-width:0; }
+    .card-grid { min-width:0; max-width:100%; }
+    .card { min-width:0; max-width:100%; }
+  }
 </style>
 </head>
 <body>
