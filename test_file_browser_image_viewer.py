@@ -101,7 +101,7 @@ class ImageViewerTests(unittest.TestCase):
         self.assertLess(page.index("🖼️ 图片"), page.index("二次元图片"))
         self.assertIn('/comics/image/plain.png', page)
         self.assertIn('/comics/image/nested/nested.jpg', page)
-        comics_card = page[page.index('class="card comics-card"'):]
+        comics_card = page[page.index('class="card media-card comics-card"'):]
         self.assertNotIn('class="del-btn"', comics_card.split('</div>\n  </div>', 1)[0])
 
     def test_landscape_images_span_two_gallery_columns(self):
@@ -112,8 +112,8 @@ class ImageViewerTests(unittest.TestCase):
 
         page = self.client.get("/").get_data(as_text=True)
 
-        self.assertIn('class="card landscape-card"', page)
-        self.assertIn('class="card comics-card landscape-card"', page)
+        self.assertIn('class="card media-card landscape-card"', page)
+        self.assertIn('class="card media-card comics-card landscape-card"', page)
         self.assertIn('.card.landscape-card { grid-column: span 2; }', page)
         self.assertIn('.card.landscape-card .card-thumb { aspect-ratio: 16 / 9; }', page)
         self.assertIn("function markLandscapeCard(image)", page)
