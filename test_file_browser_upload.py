@@ -65,6 +65,19 @@ class UploadFormTests(unittest.TestCase):
         self.assertIn(".browse-search { display: grid;", page)
         self.assertIn(".top-tabs { display: grid; grid-template-columns: repeat(3", page)
 
+    def test_index_places_final_mobile_overflow_guard_after_component_rules(self):
+        page = self.client.get("/").get_data(as_text=True)
+
+        marker = "/* Mobile overflow guard: this block intentionally follows all component rules. */"
+        marker_pos = page.index(marker)
+        self.assertGreater(marker_pos, page.index(".upload-form {\n    margin-bottom:"))
+        self.assertGreater(marker_pos, page.index(".browse-search { display:flex;"))
+        guard = page[marker_pos:]
+        self.assertIn("html, body { max-width:100%; min-width:0; overflow-x:hidden; }", guard)
+        self.assertIn(".upload-form { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); }", guard)
+        self.assertIn(".browse-search { display:grid; grid-template-columns:minmax(0,1fr); }", guard)
+        self.assertIn(".browse-search input { min-width:0; }", guard)
+
     def test_index_exposes_manual_regex_search_and_helpers(self):
         page = self.client.get("/").get_data(as_text=True)
 
