@@ -629,6 +629,11 @@ _DHASH_THRESHOLD = 5
 _MSE_THRESHOLD = 50.0
 
 
+def _dedup_key(root: str, relpath: str) -> str:
+    """Namespace dedup paths so the two media roots cannot cross-match."""
+    return f"comics:{relpath}" if root == "comics" else relpath
+
+
 def _collect_images(directory: Path) -> list[dict]:
     """Collect supported images in one directory, excluding unsafe symlinks."""
     root = _DOWNLOAD_DIR.resolve()
@@ -722,6 +727,27 @@ def _build_dedup_index():
                 _DEDUP_INDEX[rel] = (_compute_dhash(img), _compute_thumbnail(img))
             except Exception as e:
                 log.warning("Dedup index: skipping %s — %s", f, e)
+    # Comics are an independent image-only namespace.  Resolve every file
+    # before indexing so external symlinks cannot enter the comparison set.
+    comics_root = _COMICS_DIR.resolve()
+    if _COMICS_DIR.is_dir():
+        for directory, _, filenames in os.walk(_COMICS_DIR, followlinks=False):
+            for filename in sorted(filenames):
+                f = Path(directory) / filename
+                if f.suffix.lower() not in _IMAGE_EXTS:
+                    continue
+                try:
+                    resolved = f.resolve()
+                    resolved.relative_to(comics_root)
+                    if not resolved.is_file():
+                        continue
+                    rel = resolved.relative_to(comics_root).as_posix()
+                    img = _media_to_image(resolved)
+                    _DEDUP_INDEX[_dedup_key("comics", rel)] = (
+                        _compute_dhash(img), _compute_thumbnail(img)
+                    )
+                except (OSError, ValueError) as e:
+                    log.warning("Comics dedup index: skipping %s — %s", f, e)
     log.info("Dedup index built: %d files", len(_DEDUP_INDEX))
 
 
@@ -1054,6 +1080,15 @@ def api_comics_delete():
         with media_file_lock(target, root=_COMICS_DIR, timeout=0.25):
             target.unlink()
             removed_dirs = _cleanup_empty_parents(target.parent, comics_root)
+            deleted_rel = target.relative_to(comics_root).as_posix()
+            deleted_key = _dedup_key("comics", deleted_rel)
+            with _DEDUP_LOCK:
+                _DEDUP_INDEX.pop(deleted_key, None)
+                _PENDING_DUPS[:] = [
+                    d for d in _PENDING_DUPS
+                    if d.get("root", "downloads") != "comics"
+                    or (d["new_file"] != deleted_rel and d["match_file"] != deleted_rel)
+                ]
             return {
                 "success": True,
                 "removed_empty_dirs": [
@@ -1377,38 +1412,42 @@ def _process_uploaded_file(file, target: str = "downloads") -> tuple[dict, int]:
         relpath = str(dest.relative_to(root)).replace("\\", "/")
         log.info("Uploaded [%s]: %s (%s)", file_type, relpath, _format_size(dest.stat().st_size))
 
-        # ── Dedup checks cover only the downloads tree. ──
+        # ── Dedup checks stay within the selected media root. ──
         dup_result = None
-        if target != "comics":
+        if target in {"downloads", "comics"}:
             try:
                 img = _media_to_image(dest)
                 new_dhash = _compute_dhash(img)
                 new_thumb = _compute_thumbnail(img)
                 with _DEDUP_LOCK:
-                    for existing_rel, (existing_dhash, existing_thumb) in _DEDUP_INDEX.items():
+                    namespace = "comics:" if target == "comics" else ""
+                    for existing_key, (existing_dhash, existing_thumb) in _DEDUP_INDEX.items():
+                        if existing_key.startswith("comics:") != bool(namespace):
+                            continue
                         if _hamming(new_dhash, existing_dhash) > _DHASH_THRESHOLD:
                             continue
                         mse_val = _mse(new_thumb, existing_thumb)
                         if mse_val < _MSE_THRESHOLD:
                             similarity = max(0, 100 - int(mse_val / _MSE_THRESHOLD * 100))
                             dup_result = {
-                                "duplicate_of": existing_rel,
+                                "duplicate_of": existing_key.removeprefix(namespace),
                                 "dhash_dist": _hamming(new_dhash, existing_dhash),
                                 "mse": round(mse_val, 1),
                                 "similarity_pct": similarity,
                             }
                             _PENDING_DUPS.append({
+                                "root": target,
                                 "new_file": relpath,
-                                "match_file": existing_rel,
+                                "match_file": existing_key.removeprefix(namespace),
                                 "dhash_dist": dup_result["dhash_dist"],
                                 "mse": dup_result["mse"],
                                 "similarity_pct": similarity,
                             })
                             log.info("Duplicate candidate: %s ≈ %s (dist=%d, mse=%.1f)",
-                                     relpath, existing_rel, dup_result["dhash_dist"], dup_result["mse"])
+                                     relpath, existing_key, dup_result["dhash_dist"], dup_result["mse"])
                             break
                     if not dup_result:
-                        _DEDUP_INDEX[relpath] = (new_dhash, new_thumb)
+                        _DEDUP_INDEX[_dedup_key(target, relpath)] = (new_dhash, new_thumb)
             except Exception as e:
                 log.warning("Dedup check skipped for %s: %s", relpath, e)
 
@@ -1525,10 +1564,12 @@ def api_list_dups():
     with _DEDUP_LOCK:
         pending_dups = list(_PENDING_DUPS)
     for d in pending_dups:
-        new_info = _file_info(d["new_file"])
-        match_info = _file_info(d["match_file"])
+        root = d.get("root", "downloads")
+        new_info = _file_info(d["new_file"], root)
+        match_info = _file_info(d["match_file"], root)
         if new_info and match_info:
             result.append({
+                "root": root,
                 "new_file": new_info,
                 "match_file": match_info,
                 "dhash_dist": d["dhash_dist"],
@@ -1545,37 +1586,49 @@ def api_dup_delete():
 
     data = request.get_json(silent=True) or {}
     path = data.get("path", "").strip()
+    root_name = data.get("root", "downloads")
+    if root_name not in {"downloads", "comics"}:
+        return {"success": False, "error": "无效的媒体目录"}, 400
     if not path:
         return {"success": False, "error": "缺少 path 参数"}, 400
 
     # Find the pending entry by either new_file or match_file
     entry = None
     for d in _PENDING_DUPS:
-        if d["new_file"] == path or d["match_file"] == path:
+        if d.get("root", "downloads") == root_name and (d["new_file"] == path or d["match_file"] == path):
             entry = d
             break
     if not entry:
         return {"success": False, "error": "未找到对应的重复记录"}, 404
 
-    target = _safe_subpath(path)
+    lexical = _COMICS_DIR / path if root_name == "comics" else None
+    target = _safe_comics_subpath(path) if root_name == "comics" else _safe_subpath(path)
     if not target.exists():
         return {"success": False, "error": "文件不存在"}, 404
+    if root_name == "comics" and (
+        lexical is None
+        or lexical.is_symlink()
+        or target.suffix.lower() not in _IMAGE_EXTS
+        or not target.is_file()
+    ):
+        return {"success": False, "error": "仅允许删除二次元图片"}, 403
     if not _try_acquire_media_slot():
         return _media_busy_response()
-
-    file_lock = media_file_lock(target, root=_DOWNLOAD_DIR, timeout=0.25)
+    lock_root = _COMICS_DIR if root_name == "comics" else _DOWNLOAD_DIR
+    file_lock = media_file_lock(target, root=lock_root, timeout=0.25)
     try:
         file_lock.acquire()
         target.unlink()
-        _cleanup_empty_parents(target.parent)
+        _cleanup_empty_parents(target.parent, lock_root)
 
         # If deleting the match (existing) file, index the new file
         if path == entry["match_file"]:
-            new_target = _safe_subpath(entry["new_file"])
+            new_target = (_safe_comics_subpath(entry["new_file"])
+                          if root_name == "comics" else _safe_subpath(entry["new_file"]))
             if new_target.exists():
                 img = _media_to_image(new_target)
                 with _DEDUP_LOCK:
-                    _DEDUP_INDEX[entry["new_file"]] = (
+                    _DEDUP_INDEX[_dedup_key(root_name, entry["new_file"])] = (
                         _compute_dhash(img),
                         _compute_thumbnail(img),
                     )
@@ -1587,7 +1640,7 @@ def api_dup_delete():
 
         with _DEDUP_LOCK:
             _PENDING_DUPS = [d for d in _PENDING_DUPS if d != entry]
-            _DEDUP_INDEX.pop(path, None)
+            _DEDUP_INDEX.pop(_dedup_key(root_name, path), None)
         return {"success": True}
     except MediaFileLockBusy:
         return {"success": False, "error": "媒体文件正在处理中，请稍后重试"}, 409
@@ -1604,25 +1657,37 @@ def api_dup_keep():
     """Mark as not a duplicate — keep file and add to dedup index."""
     data = request.get_json(silent=True) or {}
     path = data.get("path", "").strip()
+    root_name = data.get("root", "downloads")
+    if root_name not in {"downloads", "comics"}:
+        return {"success": False, "error": "无效的媒体目录"}, 400
     if not path:
         return {"success": False, "error": "缺少 path 参数"}, 400
 
-    target = _safe_subpath(path)
+    lexical = _COMICS_DIR / path if root_name == "comics" else None
+    target = _safe_comics_subpath(path) if root_name == "comics" else _safe_subpath(path)
     if not target.exists():
         return {"success": False, "error": "文件不存在"}, 404
+    if root_name == "comics" and (
+        lexical is None
+        or lexical.is_symlink()
+        or target.suffix.lower() not in _IMAGE_EXTS
+        or not target.is_file()
+    ):
+        return {"success": False, "error": "仅允许保留二次元图片"}, 403
     if not _try_acquire_media_slot():
         return _media_busy_response()
-
-    file_lock = media_file_lock(target, root=_DOWNLOAD_DIR, timeout=0.25)
+    lock_root = _COMICS_DIR if root_name == "comics" else _DOWNLOAD_DIR
+    file_lock = media_file_lock(target, root=lock_root, timeout=0.25)
     try:
         file_lock.acquire()
         # Add to dedup index
         img = _media_to_image(target)
         with _DEDUP_LOCK:
-            _DEDUP_INDEX[path] = (_compute_dhash(img), _compute_thumbnail(img))
+            _DEDUP_INDEX[_dedup_key(root_name, path)] = (_compute_dhash(img), _compute_thumbnail(img))
             # Remove from pending
             global _PENDING_DUPS
-            _PENDING_DUPS = [d for d in _PENDING_DUPS if d["new_file"] != path]
+            _PENDING_DUPS = [d for d in _PENDING_DUPS
+                             if not (d.get("root", "downloads") == root_name and d["new_file"] == path)]
         log.info("Dup-kept: %s → added to index", path)
         return {"success": True}
     except MediaFileLockBusy:
@@ -1635,9 +1700,9 @@ def api_dup_keep():
         _MEDIA_SEMAPHORE.release()
 
 
-def _file_info(relpath: str) -> dict | None:
+def _file_info(relpath: str, root_name: str = "downloads") -> dict | None:
     """Build a small info dict for a file by relative path."""
-    target = _DOWNLOAD_DIR / relpath
+    target = (_COMICS_DIR / relpath) if root_name == "comics" else (_DOWNLOAD_DIR / relpath)
     try:
         if not target.is_file():
             return None
@@ -1648,6 +1713,9 @@ def _file_info(relpath: str) -> dict | None:
             "size": st.st_size,
             "size_fmt": _format_size(st.st_size),
             "is_video": target.suffix.lower() in _VIDEO_EXTS,
+            "root": root_name,
+            "raw_url": (url_for("raw_comics_file", filepath=relpath)
+                        if root_name == "comics" else url_for("raw_file", filepath=relpath)),
         }
     except OSError:
         return None
@@ -2563,7 +2631,7 @@ function loadDups() {
         if (d.new_file.is_video) {
           newFile.innerHTML = '<div class="thumb" style="background:#ddd;display:flex;align-items:center;justify-content:center;font-size:32px">🎬</div>';
         } else {
-          newFile.innerHTML = '<img class="thumb" src="/raw/' + d.new_file.relpath + '" loading="lazy" width="120" height="213">';
+          newFile.innerHTML = '<img class="thumb" src="' + d.new_file.raw_url + '" loading="lazy" width="120" height="213">';
         }
         newFile.innerHTML += '<div class="fname">📥 ' + d.new_file.name + '</div>' +
           '<div class="fsize">' + d.new_file.size_fmt + '</div>';
@@ -2579,7 +2647,7 @@ function loadDups() {
         if (d.match_file.is_video) {
           matchFile.innerHTML = '<div class="thumb" style="background:#ddd;display:flex;align-items:center;justify-content:center;font-size:32px">🎬</div>';
         } else {
-          matchFile.innerHTML = '<img class="thumb" src="/raw/' + d.match_file.relpath + '" loading="lazy" width="120" height="213">';
+          matchFile.innerHTML = '<img class="thumb" src="' + d.match_file.raw_url + '" loading="lazy" width="120" height="213">';
         }
         matchFile.innerHTML += '<div class="fname">📁 ' + d.match_file.name + '</div>' +
           '<div class="fsize">' + d.match_file.size_fmt + '</div>';
@@ -2602,14 +2670,14 @@ function loadDups() {
         keepNewBtn.className = 'keep-btn';
         keepNewBtn.textContent = '⭐ 保留新版';
         keepNewBtn.title = '删除旧文件，保留新上传的文件';
-        keepNewBtn.onclick = function() { resolveDup(d.match_file.relpath, 'delete', '旧文件 ' + d.match_file.name); };
+        keepNewBtn.onclick = function() { resolveDup(d.match_file.relpath, 'delete', '旧文件 ' + d.match_file.name, d.root); };
         actions.appendChild(keepNewBtn);
 
         var keepOldBtn = document.createElement('button');
         keepOldBtn.className = 'del-btn2';
         keepOldBtn.textContent = '📁 保留旧版';
         keepOldBtn.title = '删除新文件，保留已有的文件';
-        keepOldBtn.onclick = function() { resolveDup(d.new_file.relpath, 'delete', '新文件 ' + d.new_file.name); };
+        keepOldBtn.onclick = function() { resolveDup(d.new_file.relpath, 'delete', '新文件 ' + d.new_file.name, d.root); };
         actions.appendChild(keepOldBtn);
 
         var keepBothBtn = document.createElement('button');
@@ -2617,7 +2685,7 @@ function loadDups() {
         keepBothBtn.style.background = '#3498db';
         keepBothBtn.textContent = '✅ 都保留';
         keepBothBtn.title = '两个文件都保留';
-        keepBothBtn.onclick = function() { resolveDup(d.new_file.relpath, 'keep'); };
+        keepBothBtn.onclick = function() { resolveDup(d.new_file.relpath, 'keep', null, d.root); };
         actions.appendChild(keepBothBtn);
 
         card.appendChild(actions);
@@ -2628,13 +2696,13 @@ function loadDups() {
       restoreSectionState();
     }).catch(function() {});
 }
-function resolveDup(path, action, label) {
+function resolveDup(path, action, label, root) {
   if (action === 'delete' && !confirm('确定删除' + (label || '这个文件') + '吗？')) return;
   var endpoint = action === 'delete' ? '/api/dup/delete' : '/api/dup/keep';
   fetch(endpoint, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({path: path})
+    body: JSON.stringify({path: path, root: root || 'downloads'})
   }).then(function(r) { return r.json(); }).then(function(data) {
     if (data.success) reloadPreservingSections();
     else alert('操作失败: ' + (data.error || '未知错误'));

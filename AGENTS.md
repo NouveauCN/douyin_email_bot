@@ -100,8 +100,9 @@ sufficient.
   authorized only after the same path validation. Deletion is limited to one
   validated, supported image file under the comics source; the source root,
   directories, and paths outside the source must be rejected. Empty parent
-  directories may be cleaned up afterward. Comics crop and dedup operations
-  remain disallowed.
+  directories may be cleaned up afterward. Comics deduplication is allowed only
+  for strictly validated paths within the comics source and must remain scoped
+  to the comics namespace; comics crop operations remain disallowed.
 
 ## F2 Bootstrap Invariant
 
