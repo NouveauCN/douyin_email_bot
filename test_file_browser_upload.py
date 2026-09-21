@@ -213,6 +213,69 @@ class UploadFormTests(unittest.TestCase):
         self.assertEqual(invalid.status_code, 400)
         self.assertIn("无效", invalid.get_json()["error"])
 
+    def test_comics_upload_creates_scoped_duplicate_candidate(self):
+        first = self.client.post(
+            "/api/upload",
+            data={"target": "comics", "file": (io.BytesIO(_TEST_PNG), "first.png")},
+            headers={"X-Requested-With": "XMLHttpRequest"},
+        )
+        second = self.client.post(
+            "/api/upload",
+            data={"target": "comics", "file": (io.BytesIO(_TEST_PNG), "second.png")},
+            headers={"X-Requested-With": "XMLHttpRequest"},
+        )
+
+        self.assertTrue(first.get_json()["success"])
+        duplicate = second.get_json()["duplicate"]
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(duplicate["duplicate_of"].count("comics:"), 0)
+        pending = self.client.get("/api/dups").get_json()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["root"], "comics")
+        self.assertTrue(pending[0]["new_file"]["raw_url"].startswith("/comics/raw/"))
+
+    def test_comics_duplicate_keep_and_delete_are_root_scoped(self):
+        for name in ("first.png", "second.png"):
+            self.client.post(
+                "/api/upload",
+                data={"target": "comics", "file": (io.BytesIO(_TEST_PNG), name)},
+                headers={"X-Requested-With": "XMLHttpRequest"},
+            )
+        pending = self.client.get("/api/dups").get_json()[0]
+        new_path = pending["new_file"]["relpath"]
+        old_path = pending["match_file"]["relpath"]
+
+        keep = self.client.post("/api/dup/keep", json={"root": "comics", "path": new_path})
+        self.assertEqual(keep.status_code, 200)
+        self.assertTrue(keep.get_json()["success"])
+
+        # Recreate a candidate and verify deleting the old side is confined to comics.
+        file_browser._PENDING_DUPS.append({
+            "root": "comics", "new_file": new_path, "match_file": old_path,
+            "dhash_dist": 0, "mse": 0.0, "similarity_pct": 100,
+        })
+        delete = self.client.post("/api/dup/delete", json={"root": "comics", "path": old_path})
+        self.assertEqual(delete.status_code, 200)
+        self.assertFalse((self.comics_dir / old_path).exists())
+        self.assertTrue((self.comics_dir / new_path).exists())
+
+    def test_comics_files_are_not_crop_targets(self):
+        self.comics_dir.mkdir(parents=True)
+        image = self.comics_dir / "anime.png"
+        image.write_bytes(_TEST_PNG)
+        response = self.client.post("/api/crop/preview", json={"path": "../original-comics/anime.png"})
+        self.assertEqual(response.status_code, 403)
+
+    def test_comics_dup_actions_reject_invalid_root_and_traversal(self):
+        invalid_root = self.client.post(
+            "/api/dup/keep", json={"root": "downloads", "path": "../outside.png"}
+        )
+        self.assertEqual(invalid_root.status_code, 403)
+        invalid_namespace = self.client.post(
+            "/api/dup/keep", json={"root": "other", "path": "anime.png"}
+        )
+        self.assertEqual(invalid_namespace.status_code, 400)
+
     def test_native_form_upload_redirects_to_status_page(self):
         response = self.client.post(
             "/api/upload",
