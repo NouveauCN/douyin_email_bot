@@ -743,6 +743,21 @@ _FULL_SCAN_JOB: dict = {
 }
 
 
+def _full_scan_running() -> bool:
+    with _FULL_SCAN_LOCK:
+        return _FULL_SCAN_JOB.get("status") == "running"
+
+
+def _reject_if_full_scan_running():
+    """409 while a full scan rewrites fingerprints; otherwise None."""
+    if _full_scan_running():
+        return {
+            "success": False,
+            "error": "全量扫描进行中，该操作已拦截，请等待扫描完成",
+        }, 409
+    return None
+
+
 def _dedup_key(root: str, relpath: str) -> str:
     """Namespace dedup paths so the two media roots cannot cross-match."""
     return f"comics:{relpath}" if root == "comics" else relpath
@@ -1610,6 +1625,9 @@ def thumb(filepath):
 @app.route("/api/delete", methods=["POST"])
 def api_delete():
     """Delete a file or directory under downloads. JSON: {"path": "author/..."}."""
+    blocked = _reject_if_full_scan_running()
+    if blocked:
+        return blocked
     data = request.get_json(silent=True) or {}
     subpath = data.get("path", "").strip()
     if not subpath:
@@ -1636,6 +1654,9 @@ def api_delete():
 @app.route("/api/comics/delete", methods=["POST"])
 def api_comics_delete():
     """Delete exactly one image from the original comics source directory."""
+    blocked = _reject_if_full_scan_running()
+    if blocked:
+        return blocked
     data = request.get_json(silent=True) or {}
     subpath = data.get("path", "")
     if not isinstance(subpath, str) or not subpath.strip():
@@ -1812,6 +1833,9 @@ def api_crop_preview():
 @app.route("/api/crop/apply", methods=["POST"])
 def api_crop_apply():
     """Apply an automatic crop or a user-confirmed review candidate."""
+    blocked = _reject_if_full_scan_running()
+    if blocked:
+        return blocked
     data = request.get_json(silent=True) or {}
     target = _crop_target_from_request()
     force_review = data.get("force_review") is True
@@ -2045,7 +2069,11 @@ def _process_uploaded_file(file, target: str = "downloads") -> tuple[dict, int]:
                             "mse": round(mse_val, 1),
                             "similarity_pct": similarity,
                         }
-                        if similarity >= 100.0:
+                        if similarity >= 100.0 and not _full_scan_running():
+                            # Perfect duplicates still auto-resolve outside a
+                            # full scan; during one they fall back to a pending
+                            # so no manual-path deletion races the fingerprint
+                            # rewrite.
                             victim = _auto_resolve_duplicate(
                                 _dedup_key(target, relpath), existing_key, target,
                             )
@@ -2316,6 +2344,9 @@ def api_full_scan_status():
 @app.route("/api/dup/delete", methods=["POST"])
 def api_dup_delete():
     """Delete one file from a duplicate pair — path may be new or match."""
+    blocked = _reject_if_full_scan_running()
+    if blocked:
+        return blocked
     global _PENDING_DUPS, _DEDUP_INDEX
 
     data = request.get_json(silent=True) or {}
@@ -2389,6 +2420,9 @@ def api_dup_delete():
 @app.route("/api/dup/keep", methods=["POST"])
 def api_dup_keep():
     """Mark as not a duplicate — keep file and add to dedup index."""
+    blocked = _reject_if_full_scan_running()
+    if blocked:
+        return blocked
     data = request.get_json(silent=True) or {}
     path = data.get("path", "").strip()
     root_name = data.get("root", "downloads")
