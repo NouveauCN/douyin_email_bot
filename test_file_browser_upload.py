@@ -20,6 +20,19 @@ _TEST_PNG = base64.b64decode(
 )
 
 
+def _flat_png(color) -> bytes:
+    """A solid-color PNG; small color deltas stay below dedup thresholds."""
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (32, 32), color).save(buffer, "PNG")
+    return buffer.getvalue()
+
+
+_NEAR_A = (240, 240, 240)
+_NEAR_B = (238, 238, 238)  # mse≈4 → ~92% — pending, not auto-resolved
+
+
 class UploadFormTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
@@ -235,12 +248,12 @@ class UploadFormTests(unittest.TestCase):
     def test_comics_upload_creates_scoped_duplicate_candidate(self):
         first = self.client.post(
             "/api/upload",
-            data={"target": "comics", "file": (io.BytesIO(_TEST_PNG), "first.png")},
+            data={"target": "comics", "file": (io.BytesIO(_flat_png(_NEAR_A)), "first.png")},
             headers={"X-Requested-With": "XMLHttpRequest"},
         )
         second = self.client.post(
             "/api/upload",
-            data={"target": "comics", "file": (io.BytesIO(_TEST_PNG), "second.png")},
+            data={"target": "comics", "file": (io.BytesIO(_flat_png(_NEAR_B)), "second.png")},
             headers={"X-Requested-With": "XMLHttpRequest"},
         )
 
@@ -254,10 +267,13 @@ class UploadFormTests(unittest.TestCase):
         self.assertTrue(pending[0]["new_file"]["raw_url"].startswith("/comics/raw/"))
 
     def test_comics_duplicate_keep_and_delete_are_root_scoped(self):
-        for name in ("first.png", "second.png"):
+        for name, payload in (
+            ("first.png", _flat_png(_NEAR_A)),
+            ("second.png", _flat_png(_NEAR_B)),
+        ):
             self.client.post(
                 "/api/upload",
-                data={"target": "comics", "file": (io.BytesIO(_TEST_PNG), name)},
+                data={"target": "comics", "file": (io.BytesIO(payload), name)},
                 headers={"X-Requested-With": "XMLHttpRequest"},
             )
         pending = self.client.get("/api/dups").get_json()[0]
@@ -317,8 +333,8 @@ class UploadFormTests(unittest.TestCase):
             "/api/upload",
             data={
                 "file": [
-                    (io.BytesIO(_TEST_PNG), "first.png"),
-                    (io.BytesIO(_TEST_PNG), "second.png"),
+                    (io.BytesIO(_flat_png((250, 10, 10))), "first.png"),
+                    (io.BytesIO(_flat_png((10, 250, 10))), "second.png"),
                 ]
             },
             headers={"X-Requested-With": "XMLHttpRequest"},
@@ -508,12 +524,12 @@ class DedupRefreshTests(unittest.TestCase):
         self.assertNotIn("slides/flat.png", file_browser._DEDUP_MANIFEST)
 
     def test_new_download_matching_indexed_file_becomes_pending(self):
-        self._write("slides/base.png", _TEST_PNG)
+        self._write("slides/base.png", _flat_png(_NEAR_A))
         file_browser._build_dedup_index()
 
-        # Simulates the bot dropping a duplicate after startup.
+        # Simulates the bot dropping a near-duplicate after startup.
         new_rel = "季风的学长/20260925_235959_BV1xpbj6YEqk.png"
-        self._write(new_rel, _TEST_PNG)
+        self._write(new_rel, _flat_png(_NEAR_B))
         with file_browser._DEDUP_LOCK:
             file_browser._refresh_download_dedup_index(flag_duplicates=True)
 
@@ -643,7 +659,7 @@ class DedupRefreshTests(unittest.TestCase):
         self.assertIn("slides/old.png", file_browser._DEDUP_MANIFEST)
         self.assertEqual(file_browser._PENDING_DUPS, [])
 
-    def test_scan_flags_existing_identical_trio(self):
+    def test_scan_auto_resolves_identical_trio(self):
         self._write("slides/a.png", _TEST_PNG)
         self._write("slides/b.png", _TEST_PNG)
         self._write("slides/c.png", _TEST_PNG)
@@ -655,17 +671,22 @@ class DedupRefreshTests(unittest.TestCase):
         payload = response.get_json()
         self.assertEqual(response.status_code, 200)
         self.assertTrue(payload["success"])
-        self.assertEqual(payload["added"], 3)
-        self.assertEqual(len(file_browser._PENDING_DUPS), 3)
+        # Equal sizes: keep the oldest, auto-remove the other two.
+        self.assertEqual(payload["added"], 0)
+        self.assertEqual(payload["auto_removed"], 2)
+        self.assertEqual(file_browser._PENDING_DUPS, [])
+        self.assertTrue((self.download_dir / "slides/a.png").exists())
+        self.assertFalse((self.download_dir / "slides/b.png").exists())
+        self.assertFalse((self.download_dir / "slides/c.png").exists())
 
-        # A second scan must not duplicate existing pendings.
         again = self.client.post("/api/dups/scan", json={})
         self.assertEqual(again.get_json()["added"], 0)
+        self.assertEqual(again.get_json()["auto_removed"], 0)
 
     def test_keep_both_is_not_reflaged_by_scan(self):
-        self._write("slides/x.png", _TEST_PNG)
+        self._write("slides/x.png", _flat_png(_NEAR_A))
         file_browser._build_dedup_index()
-        self._write("slides/y.png", _TEST_PNG)
+        self._write("slides/y.png", _flat_png(_NEAR_B))
         with file_browser._DEDUP_LOCK:
             file_browser._refresh_download_dedup_index(flag_duplicates=True)
         self.assertEqual(len(file_browser._PENDING_DUPS), 1)
@@ -680,6 +701,42 @@ class DedupRefreshTests(unittest.TestCase):
         self.assertEqual(scan.get_json()["added"], 0)
         self.assertEqual(file_browser._PENDING_DUPS, [])
 
+    def test_auto_resolve_keeps_oldest_when_sizes_are_equal(self):
+        old_rel = "slides/keep_old.png"
+        self._write(old_rel, _TEST_PNG)
+        file_browser._build_dedup_index()
+        new_rel = "slides/new_copy.png"
+        self._write(new_rel, _TEST_PNG)
+
+        with file_browser._DEDUP_LOCK:
+            file_browser._refresh_download_dedup_index(flag_duplicates=True)
+
+        self.assertEqual(file_browser._PENDING_DUPS, [])
+        self.assertTrue((self.download_dir / old_rel).exists())
+        self.assertFalse((self.download_dir / new_rel).exists())
+
+    def test_auto_resolve_keeps_larger_file_when_sizes_differ(self):
+        small_rel = "slides/small.png"
+        self._write(small_rel, _flat_png(_NEAR_A))
+        file_browser._build_dedup_index()
+        # Same rendered pixels (same fingerprint) but a larger byte size;
+        # PIL ignores trailing bytes after IEND.
+        big_rel = "slides/big.png"
+        self._write(big_rel, _flat_png(_NEAR_A) + b"\x00" * 64)
+
+        with file_browser._DEDUP_LOCK:
+            file_browser._refresh_download_dedup_index(flag_duplicates=True)
+
+        self.assertEqual(file_browser._PENDING_DUPS, [])
+        self.assertFalse((self.download_dir / small_rel).exists())
+        self.assertTrue((self.download_dir / big_rel).exists())
+
+    def test_action_reload_requests_scroll_to_top(self):
+        page = self.client.get("/").get_data(as_text=True)
+
+        self.assertIn("fileBrowserScrollReset", page)
+        self.assertIn("window.scrollTo(0, 0)", page)
+
     def test_startup_skips_unchanged_fingerprints(self):
         self._write("comics/img.png", _TEST_PNG)
         self._write("slides/a.png", _TEST_PNG)
@@ -692,9 +749,9 @@ class DedupRefreshTests(unittest.TestCase):
         spy.assert_not_called()
 
     def test_dup_delete_removes_paired_backup(self):
-        self._write("slides/old.png", _TEST_PNG)
+        self._write("slides/old.png", _flat_png(_NEAR_A))
         file_browser._build_dedup_index()
-        self._write("slides/new.png", _TEST_PNG)
+        self._write("slides/new.png", _flat_png(_NEAR_B))
         self._write("slides/new_original.bak", b"bak")
         with file_browser._DEDUP_LOCK:
             file_browser._refresh_download_dedup_index(flag_duplicates=True)

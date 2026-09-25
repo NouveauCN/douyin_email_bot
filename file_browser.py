@@ -1004,15 +1004,103 @@ def _load_dedup_state() -> None:
     )
 
 
-def _scan_existing_duplicates() -> int:
+def _auto_resolve_duplicate(new_key: str, match_key: str, root_name: str) -> str | None:
+    """Delete one side of a perfect pair; caller holds _DEDUP_LOCK.
+
+    Equal byte sizes keep the old (match) file; otherwise the larger file
+    wins. Returns the removed rel, or None when the victim is busy or
+    missing so the caller can fall back to a pending confirmation.
+    """
+    new_rel = new_key.removeprefix("comics:")
+    match_rel = match_key.removeprefix("comics:")
+    root_dir = _COMICS_DIR if root_name == "comics" else _DOWNLOAD_DIR
+    new_path = root_dir / new_rel
+    match_path = root_dir / match_rel
+    try:
+        new_size = new_path.stat().st_size
+        match_size = match_path.stat().st_size
+    except OSError:
+        return None
+    if new_size <= match_size:
+        victim_rel, victim_path, victim_key = new_rel, new_path, new_key
+    else:
+        victim_rel, victim_path, victim_key = match_rel, match_path, match_key
+    try:
+        with media_file_lock(victim_path, root=root_dir, timeout=0.25):
+            victim_path.unlink()
+            if root_name == "downloads":
+                _remove_paired_backup(victim_path)
+    except MediaFileLockBusy:
+        return None
+    except OSError as exc:
+        log.warning("Auto-resolve could not remove %s: %s", victim_rel, exc)
+        return None
+    kept_key = match_key if victim_key == new_key else new_key
+    if victim_key in _DEDUP_INDEX:
+        _DEDUP_INDEX.pop(victim_key, None)
+    if kept_key not in _DEDUP_INDEX:
+        try:
+            _DEDUP_INDEX[kept_key] = _compute_media_fingerprint(
+                root_dir / kept_key.removeprefix("comics:")
+            )
+        except Exception as exc:
+            log.warning("Auto-resolve could not index %s: %s", kept_key, exc)
+    _DEDUP_MANIFEST.pop(victim_key, None)
+    _PENDING_DUPS[:] = [
+        d for d in _PENDING_DUPS
+        if not (d.get("root", "downloads") == root_name
+                and victim_rel in (d.get("new_file"), d.get("match_file")))
+    ]
+    kept_rel = kept_key.removeprefix("comics:")
+    log.info("Auto-removed 100%% duplicate: %s (kept %s)", victim_rel, kept_rel)
+    return victim_rel
+
+
+def _sweep_perfect_pending() -> tuple[int, bool]:
+    """Auto-resolve pending pairs at 100% similarity; caller holds the lock.
+
+    Returns (auto_removed, changed). Pendings whose files vanished are
+    dropped as stale.
+    """
+    auto_removed = 0
+    changed = False
+    for entry in list(_PENDING_DUPS):
+        try:
+            pct = float(entry.get("similarity_pct", 0))
+        except (TypeError, ValueError):
+            pct = 0.0
+        if pct < 100.0:
+            continue
+        root_name = entry.get("root", "downloads")
+        root_dir = _COMICS_DIR if root_name == "comics" else _DOWNLOAD_DIR
+        new_rel = entry["new_file"]
+        match_rel = entry["match_file"]
+        if not (root_dir / new_rel).is_file() or not (root_dir / match_rel).is_file():
+            _PENDING_DUPS.remove(entry)
+            changed = True
+            continue
+        victim = _auto_resolve_duplicate(
+            _dedup_key(root_name, new_rel), _dedup_key(root_name, match_rel),
+            root_name,
+        )
+        if victim is not None:
+            auto_removed += 1
+            changed = True
+    return auto_removed, changed
+
+
+def _scan_existing_duplicates() -> tuple[int, int]:
     """Pairwise-compare indexed files and flag matches; caller holds _DEDUP_LOCK.
 
     Covers files that predate detection or arrived while the process was
     down. Pairs already pending or confirmed as distinct are skipped, and
-    videos are never paired with images. The newer file becomes new_file;
-    similarity is the worst aligned-frame percentage.
+    videos are never paired with images. Perfect pairs are auto-resolved
+    (newer file as new_file); others become pendings whose similarity is
+    the worst aligned-frame percentage. Returns (added, auto_removed).
     """
     added = 0
+    swept, _changed = _sweep_perfect_pending()
+    auto_removed = swept
     for is_comics in (False, True):
         root_name = "comics" if is_comics else "downloads"
         entries = [
@@ -1028,8 +1116,11 @@ def _scan_existing_duplicates() -> int:
             for d in _PENDING_DUPS
             if d.get("root", "downloads") == root_name
         }
+        removed: set[str] = set()
         for index, (key_a, frames_a) in enumerate(entries):
             for key_b, frames_b in entries[index + 1:]:
+                if key_a in removed or key_b in removed:
+                    continue
                 if _media_kind(key_a) != _media_kind(key_b):
                     continue
                 pair = frozenset((key_a, key_b))
@@ -1044,6 +1135,14 @@ def _scan_existing_duplicates() -> int:
                 new_key, match_key = (
                     (key_a, key_b) if newer_a >= newer_b else (key_b, key_a)
                 )
+                if similarity >= 100.0:
+                    victim = _auto_resolve_duplicate(new_key, match_key, root_name)
+                    if victim is not None:
+                        removed.add(new_key if victim == new_key.removeprefix("comics:")
+                                    else match_key)
+                        auto_removed += 1
+                        continue
+                    # Busy victim falls through to a pending confirmation.
                 _PENDING_DUPS.append({
                     "root": root_name,
                     "new_file": new_key.removeprefix("comics:"),
@@ -1056,7 +1155,7 @@ def _scan_existing_duplicates() -> int:
                 added += 1
                 log.info("Duplicate candidate: %s ≈ %s (dist=%d, mse=%.1f, worst=%.1f%%)",
                          new_key, match_key, dist, mse_val, similarity)
-    return added
+    return added, auto_removed
 
 
 def _refresh_download_dedup_index(*, flag_duplicates: bool) -> None:
@@ -1072,6 +1171,10 @@ def _refresh_download_dedup_index(*, flag_duplicates: bool) -> None:
     if not _DOWNLOAD_DIR.is_dir():
         return
     changed = False
+    swept, swept_changed = _sweep_perfect_pending()
+    if swept:
+        log.info("Auto-removed %d perfect duplicate(s) pending confirmation", swept)
+    changed = changed or swept_changed
     seen: set[str] = set()
     for path in _iter_media_files(_DOWNLOAD_DIR, _VIDEO_EXTS | _IMAGE_EXTS):
         rel = str(path.relative_to(_DOWNLOAD_DIR)).replace("\\", "/")
@@ -1097,6 +1200,12 @@ def _refresh_download_dedup_index(*, flag_duplicates: bool) -> None:
             )
         if match:
             existing_key, dist, mse_val, similarity = match
+            if similarity >= 100.0:
+                victim = _auto_resolve_duplicate(rel, existing_key, "downloads")
+                if victim is not None:
+                    changed = True
+                    continue
+                # Busy victim falls through to a pending confirmation.
             already_pending = any(
                 d.get("root", "downloads") == "downloads" and d["new_file"] == rel
                 for d in _PENDING_DUPS
@@ -1903,7 +2012,8 @@ def _process_uploaded_file(file, target: str = "downloads") -> tuple[dict, int]:
             os.replace(tmp_path, dest)
 
         relpath = str(dest.relative_to(root)).replace("\\", "/")
-        log.info("Uploaded [%s]: %s (%s)", file_type, relpath, _format_size(dest.stat().st_size))
+        dest_size = dest.stat().st_size
+        log.info("Uploaded [%s]: %s (%s)", file_type, relpath, _format_size(dest_size))
 
         # ── Dedup checks stay within the selected media root. ──
         dup_result = None
@@ -1924,16 +2034,29 @@ def _process_uploaded_file(file, target: str = "downloads") -> tuple[dict, int]:
                             "mse": round(mse_val, 1),
                             "similarity_pct": similarity,
                         }
-                        _PENDING_DUPS.append({
-                            "root": target,
-                            "new_file": relpath,
-                            "match_file": existing_key.removeprefix(namespace),
-                            "dhash_dist": dist,
-                            "mse": dup_result["mse"],
-                            "similarity_pct": similarity,
-                        })
-                        log.info("Duplicate candidate: %s ≈ %s (dist=%d, mse=%.1f, worst=%.1f%%)",
-                                 relpath, existing_key, dist, mse_val, similarity)
+                        if similarity >= 100.0:
+                            victim = _auto_resolve_duplicate(
+                                _dedup_key(target, relpath), existing_key, target,
+                            )
+                            if victim is not None:
+                                dup_result["auto_removed"] = victim
+                                dup_result["kept"] = (
+                                    existing_key.removeprefix(namespace)
+                                    if victim == relpath else relpath
+                                )
+                                log.info("Upload 100%% duplicate auto-resolved: removed %s, kept %s",
+                                         victim, dup_result["kept"])
+                        if "auto_removed" not in dup_result:
+                            _PENDING_DUPS.append({
+                                "root": target,
+                                "new_file": relpath,
+                                "match_file": existing_key.removeprefix(namespace),
+                                "dhash_dist": dist,
+                                "mse": dup_result["mse"],
+                                "similarity_pct": similarity,
+                            })
+                            log.info("Duplicate candidate: %s ≈ %s (dist=%d, mse=%.1f, worst=%.1f%%)",
+                                     relpath, existing_key, dist, mse_val, similarity)
                     if not dup_result:
                         _DEDUP_INDEX[_dedup_key(target, relpath)] = new_frames
                     _save_dedup_state()
@@ -1945,8 +2068,8 @@ def _process_uploaded_file(file, target: str = "downloads") -> tuple[dict, int]:
             "original_filename": original_name,
             "filename": new_name,
             "relpath": relpath,
-            "size": dest.stat().st_size,
-            "size_fmt": _format_size(dest.stat().st_size),
+            "size": dest_size,
+            "size_fmt": _format_size(dest_size),
             "type": file_type,
             "converted": needs_convert,
         }
@@ -2072,11 +2195,11 @@ def api_list_dups():
 
 @app.route("/api/dups/scan", methods=["POST"])
 def api_scan_dups():
-    """Pairwise-scan indexed media and add new duplicate confirmations."""
+    """Pairwise-scan indexed media; perfect pairs are auto-resolved."""
     with _DEDUP_LOCK:
-        added = _scan_existing_duplicates()
+        added, auto_removed = _scan_existing_duplicates()
         _save_dedup_state()
-    return {"success": True, "added": added}
+    return {"success": True, "added": added, "auto_removed": auto_removed}
 
 
 @app.route("/api/dup/delete", methods=["POST"])
@@ -3023,6 +3146,9 @@ function reloadPreservingSections() {
   });
   try {
     sessionStorage.setItem('fileBrowserSectionState', JSON.stringify(state));
+    // Browser scroll restoration after an action lands mid-page (often in a
+    // section that was collapsed); force the next load back to the top.
+    sessionStorage.setItem('fileBrowserScrollReset', '1');
   } catch (e) {}
   location.reload();
 }
@@ -3050,6 +3176,14 @@ function removeDeletedCard(card) {
   }
 }
 restoreSectionState();
+window.addEventListener('load', function() {
+  try {
+    if (sessionStorage.getItem('fileBrowserScrollReset')) {
+      sessionStorage.removeItem('fileBrowserScrollReset');
+      window.scrollTo(0, 0);
+    }
+  } catch (e) {}
+});
 function confirmDelete(event, path, label, endpoint) {
   event.stopPropagation();
   event.preventDefault();
@@ -3115,11 +3249,18 @@ uploadForm.addEventListener('submit', function(event) {
       var data = result.data;
       if (data.file_count) {
         if (data.success_count) {
-          var dupCount = (data.files || []).filter(function(item) {
+          var matched = (data.files || []).filter(function(item) {
             return item.duplicate;
+          });
+          var autoCount = matched.filter(function(item) {
+            return item.duplicate.auto_removed;
           }).length;
-          var batchMessage = dupCount
-            ? '⚠️ ' + data.message + '；' + dupCount + ' 个疑似重复，已加入待确认列表'
+          var dupCount = matched.length - autoCount;
+          var parts = [];
+          if (autoCount) parts.push(autoCount + ' 个100%重复已自动清理');
+          if (dupCount) parts.push(dupCount + ' 个疑似重复已加入待确认列表');
+          var batchMessage = parts.length
+            ? '♻️ ' + data.message + '；' + parts.join('；')
             : '✅ ' + data.message;
           if (data.failed_count) batchMessage += '；失败：' + data.error;
           setUploadStatus(
@@ -3138,10 +3279,19 @@ uploadForm.addEventListener('submit', function(event) {
       if (result.ok && data.success) {
         var label = data.type === 'video' ? '视频' : '图片';
         if (data.duplicate) {
-          setUploadStatus(
-            '⚠️ 重复候选！相似度 ' + data.duplicate.similarity_pct + '%，刷新中...',
-            '#fff3cd', '#856404'
-          );
+          if (data.duplicate.auto_removed) {
+            setUploadStatus(
+              '♻️ 100% 重复已自动清理（保留 ' +
+                String(data.duplicate.kept).split('/').pop() + '），刷新中...',
+              '#d4edda', '#155724'
+            );
+          } else {
+            setUploadStatus(
+              '⚠️ 重复候选！相似度 ' +
+                Number(data.duplicate.similarity_pct).toFixed(1) + '%，刷新中...',
+              '#fff3cd', '#856404'
+            );
+          }
         } else {
           setUploadStatus(
             '✅ ' + label + ' ' + data.filename + ' 上传成功！刷新中...',
@@ -3290,9 +3440,10 @@ if (dedupScanBtn) dedupScanBtn.addEventListener('click', function() {
   }).then(function(r) { return r.json(); }).then(function(data) {
     dedupScanBtn.disabled = false;
     if (!data.success) { status.textContent = data.error || '扫描失败'; return; }
-    status.textContent = data.added
-      ? '发现 ' + data.added + ' 组疑似重复'
-      : '未发现新的重复';
+    var scanParts = [];
+    if (data.auto_removed) scanParts.push('自动清理 ' + data.auto_removed + ' 组100%重复');
+    if (data.added) scanParts.push('发现 ' + data.added + ' 组待确认');
+    status.textContent = scanParts.length ? scanParts.join('；') : '未发现新的重复';
     loadDups();
   }).catch(function(e) {
     dedupScanBtn.disabled = false;
