@@ -2,11 +2,13 @@
 
 import base64
 import io
+import json
 import os
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from subprocess import CompletedProcess
 from unittest.mock import patch
 
 import file_browser
@@ -535,6 +537,111 @@ class DedupRefreshTests(unittest.TestCase):
         self.assertEqual(file_browser._PENDING_DUPS, [])
         self.assertIn("slides/a.png", file_browser._DEDUP_INDEX)
         self.assertIn("slides/b.png", file_browser._DEDUP_INDEX)
+
+    def test_similarity_keeps_one_decimal(self):
+        self.assertEqual(file_browser._similarity_from_mse(0.0), 100.0)
+        self.assertEqual(file_browser._similarity_from_mse(0.5), 99.0)
+        self.assertEqual(file_browser._similarity_from_mse(25.0), 50.0)
+
+    def test_match_fingerprints_reports_worst_frame(self):
+        good = (0b1010, bytes([10]) * 1024)
+        worse = (0b1010, bytes([16]) * 1024)  # mse 36 — passes but imperfect
+        left = [good, good]
+        right = [good, worse]
+
+        result = file_browser._match_fingerprints(left, right)
+
+        self.assertIsNotNone(result)
+        dist, mse_val, pct = result
+        self.assertEqual(dist, 0)
+        self.assertEqual(mse_val, file_browser._mse(good[1], worse[1]))
+        self.assertEqual(pct, file_browser._similarity_from_mse(mse_val))
+        self.assertLess(pct, 100.0)
+        # Any pair beyond threshold rejects the whole match.
+        broken = (0, bytes([250]) * 1024)
+        self.assertIsNone(file_browser._match_fingerprints([good], [broken]))
+
+    def test_video_never_matches_image(self):
+        image_fingerprint = file_browser._compute_media_fingerprint(
+            self._write("slides/solo.png", _TEST_PNG)
+        )
+        # Same bytes, but stored under a video key: kind must block it.
+        file_browser._DEDUP_INDEX["某作者/solo.mp4"] = list(image_fingerprint)
+        file_browser._DEDUP_INDEX["slides/solo.png"] = list(image_fingerprint)
+        file_browser._DEDUP_MANIFEST.update({
+            "某作者/solo.mp4": (1, 1),
+            "slides/solo.png": (2, 2),
+        })
+
+        scan = self.client.post("/api/dups/scan", json={})
+
+        self.assertEqual(scan.get_json()["added"], 0)
+        self.assertEqual(file_browser._PENDING_DUPS, [])
+
+        upload = self.client.post(
+            "/api/upload",
+            data={"target": "downloads", "file": (io.BytesIO(_TEST_PNG), "copy.png")},
+            headers={"X-Requested-With": "XMLHttpRequest"},
+        )
+        # The video key is listed first; a missing kind check would match it.
+        self.assertEqual(
+            upload.get_json()["duplicate"]["duplicate_of"], "slides/solo.png"
+        )
+
+    def test_video_fingerprint_samples_five_frames(self):
+        from io import BytesIO as _BytesIO
+
+        from PIL import Image as _Image
+
+        buffer = _BytesIO()
+        _Image.new("RGB", (64, 64), (200, 100, 50)).save(buffer, "JPEG")
+        fake = CompletedProcess(args=[], returncode=0, stdout=buffer.getvalue(), stderr=b"")
+
+        with (
+            patch.object(file_browser, "_video_duration", return_value=10.0),
+            patch.object(file_browser.subprocess, "run", return_value=fake) as run,
+        ):
+            frames = file_browser._compute_media_fingerprint(Path("clip.mp4"))
+
+        self.assertEqual(run.call_count, 5)
+        self.assertEqual(len(frames), 5)
+        expected_img = _Image.open(_BytesIO(buffer.getvalue())).convert("RGB")
+        expected = (file_browser._compute_dhash(expected_img),
+                    file_browser._compute_thumbnail(expected_img))
+        self.assertTrue(all(frame == expected for frame in frames))
+
+    def test_v1_state_wraps_images_and_recomputes_videos(self):
+        state = {
+            "version": 1,
+            "fingerprint_version": 1,
+            "index": {
+                "slides/old.png": [12345, base64.b64encode(b"x" * 1024).decode()],
+                "作者/old.mp4": [54321, base64.b64encode(b"y" * 1024).decode()],
+            },
+            "manifest": {
+                "slides/old.png": [111, 222],
+                "作者/old.mp4": [333, 444],
+            },
+            "pending": [
+                {"root": "downloads", "new_file": "a.mp4", "match_file": "b.png",
+                 "dhash_dist": 0, "mse": 0.0, "similarity_pct": 100},
+            ],
+            "resolved_pairs": [],
+        }
+        state_path = file_browser._DEDUP_STATE_FILE
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        file_browser._load_dedup_state()
+
+        self.assertEqual(
+            file_browser._DEDUP_INDEX["slides/old.png"],
+            [(12345, b"x" * 1024)],
+        )
+        self.assertNotIn("作者/old.mp4", file_browser._DEDUP_INDEX)
+        self.assertNotIn("作者/old.mp4", file_browser._DEDUP_MANIFEST)
+        self.assertIn("slides/old.png", file_browser._DEDUP_MANIFEST)
+        self.assertEqual(file_browser._PENDING_DUPS, [])
 
     def test_scan_flags_existing_identical_trio(self):
         self._write("slides/a.png", _TEST_PNG)
