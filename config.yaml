@@ -41,8 +41,10 @@ douyin:
 
 # Bilibili download settings (via yutto)
 bilibili:
-  # Download save path (NAS path for Docker container visibility; absolute path)
-  download_path: "/srv/nas_data/douyin_downloads/bilibili"
+  # Shared download root (same directory as douyin.download_path), so final
+  # videos publish as <root>/<author>/<timestamp>_<BV>.mp4 exactly like Douyin.
+  # yutto stages raw output in <root>/bilibili/. NAS path; absolute path.
+  download_path: "/srv/nas_data/douyin_downloads"
   # Max wall-clock time for one yutto process (seconds)
   timeout: 3600
   # Default video quality. 127 requests the highest available stream (8K tier,

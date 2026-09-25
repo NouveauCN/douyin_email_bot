@@ -174,7 +174,7 @@ class BilibiliConfig:
     auth is loaded from BILIBILI_AUTH env var, not YAML.
     """
 
-    download_path: str = "./downloads/bilibili"
+    download_path: str = "./downloads"
     auth: str = ""          # From BILIBILI_AUTH env var
     auth_file: str = ""     # From BILIBILI_AUTH_FILE env var
     timeout: int = 3600
@@ -301,7 +301,7 @@ def load_config(path: Path) -> AppConfig:
 
     # ── Bilibili ──
     bilibili_raw = raw.get("bilibili", {})
-    _bili_dl_path = Path(_setting_value("bilibili.download_path", "BILIBILI_DOWNLOAD_PATH", managed, dotenv, bilibili_raw.get("download_path"), str(_dl_path / "bilibili")))
+    _bili_dl_path = Path(_setting_value("bilibili.download_path", "BILIBILI_DOWNLOAD_PATH", managed, dotenv, bilibili_raw.get("download_path"), str(_dl_path)))
     if not _bili_dl_path.is_absolute():
         _bili_dl_path = path.parent / _bili_dl_path
     bilibili = BilibiliConfig(

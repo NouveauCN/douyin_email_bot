@@ -10,11 +10,11 @@ from config_loader import BilibiliConfig
 def test_download_uses_shared_media_root_for_videos_and_moved_covers(tmp_path, monkeypatch):
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:8888")
     shared_root = tmp_path / "downloads"
-    download_dir = shared_root / "bilibili"
-    video = download_dir / "video.mp4"
+    staging_dir = shared_root / "bilibili"
+    video = staging_dir / "video.mp4"
     cover = shared_root / "slides" / "bilibili_cover.jpg"
     downloader = BilibiliDownloader(
-        BilibiliConfig(download_path=str(download_dir), timeout=30)
+        BilibiliConfig(download_path=str(shared_root), timeout=30)
     )
 
     with (
@@ -32,6 +32,8 @@ def test_download_uses_shared_media_root_for_videos_and_moved_covers(tmp_path, m
     assert result["success"] is True
     process.assert_called_once_with([video, cover], shared_root)
     command = run.call_args.args[0]
+    assert command[command.index("--dir") + 1] == str(staging_dir)
+    assert run.call_args.kwargs["cwd"] == staging_dir
     assert command[command.index("--proxy") + 1] == "no"
     assert run.call_args.kwargs["env"]["HTTPS_PROXY"] == ""
     assert run.call_args.kwargs["env"]["NO_PROXY"] == "*"

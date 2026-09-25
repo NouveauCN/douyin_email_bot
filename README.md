@@ -198,7 +198,7 @@ LAN 地址由 `LAN_BIND_ADDRESS` 显式指定。
 
 ## B站下载
 
-B站链接由 [yutto](https://github.com/yutto-dev/yutto) CLI 下载，支持 BV/av 投稿视频、番剧 ep/ss 以及 b23.tv 短链接。默认保存到 `downloads/bilibili/`。
+B站链接由 [yutto](https://github.com/yutto-dev/yutto) CLI 下载，支持 BV/av 投稿视频、番剧 ep/ss 以及 b23.tv 短链接。保存在与抖音相同的下载根目录：`downloads/<作者>/<时间戳>_<BV号>.mp4`；yutto 的原始输出先暂存到 `downloads/bilibili/`，发布时再移入作者目录。
 
 注意：yutto 与 F2 的部分依赖版本约束冲突，因此 Docker 镜像会从 `dependency-locks/yutto/uv.lock` 把完整锁定的 yutto 环境安装到独立的 `/opt/yutto`，再通过 `yutto` 命令提供给机器人。不要把 yutto 加回主项目的 `pyproject.toml`；主环境与 yutto 隔离环境分别使用各自的 `pyproject.toml` 和 `uv.lock`，Docker 只做冻结安装。
 
@@ -266,7 +266,7 @@ Bot 会通过 `douyin.cookie` 的 hot reload 立即读取，Cookie 内容不会�
 | `email.smtp_timeout` | int | `30` | SMTP 连接与发送超时（秒）；由 managed settings/YAML 控制，只有显式外部环境变量注入时锁定 |
 | `douyin.cookie` | str | `""` | **必填**（managed settings 或 `.env` `DOUYIN_COOKIE`），抖音登录 cookie |
 | `douyin.download_path` | str | `"/srv/nas_data/douyin_downloads"` | 视频下载目录（提交配置） |
-| `bilibili.download_path` | str | `"/srv/nas_data/douyin_downloads/bilibili"` | B站视频下载目录（提交配置） |
+| `bilibili.download_path` | str | `"/srv/nas_data/douyin_downloads"` | B站视频下载根目录，与抖音目录相同（提交配置） |
 | `bilibili.auth` | str | `""` | 可选（managed settings 或 `.env` `BILIBILI_AUTH`），B站登录 cookie |
 | `bilibili.auth_file` | str | `""` | 可选（env `BILIBILI_AUTH_FILE`），yutto 扫码登录认证文件 |
 | `bilibili.video_quality` | int | `127` | yutto 视频清晰度，127=请求最高可用画质 |

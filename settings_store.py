@@ -136,8 +136,8 @@ _SETTING_HELP: dict[str, dict[str, str | None]] = {
     },
     "bilibili.download_path": {
         "label": "哔哩哔哩下载目录",
-        "description": "哔哩哔哩视频和封面保存的根目录，由部署环境管理。",
-        "example": "./downloads/bilibili",
+        "description": "哔哩哔哩视频和封面保存的根目录（与抖音目录相同），由部署环境管理。",
+        "example": "./downloads",
     },
     "bilibili.auth": {
         "label": "哔哩哔哩登录凭据",
@@ -356,7 +356,7 @@ DEFAULT_VALUES: dict[str, Any] = {
     "email.send_replies": True,
     "douyin.cookie": "", "douyin.naming": "{create}_{aweme_id}",
     "douyin.folderize": True, "douyin.timeout": 30, "douyin.max_retries": 3,
-    "douyin.max_tasks": 5, "bilibili.download_path": "./downloads/bilibili",
+    "douyin.max_tasks": 5, "bilibili.download_path": "./downloads",
     "bilibili.auth": "", "bilibili.auth_file": "", "bilibili.timeout": 3600,
     "bilibili.batch": False, "bilibili.video_quality": 127,
     "bilibili.yutto_bin": "yutto", "bot.allowed_senders": [],
