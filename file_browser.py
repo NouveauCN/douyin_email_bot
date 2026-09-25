@@ -730,6 +730,17 @@ _DEDUP_STATE_FILE = Path(
 ) / "dedup_state.json"
 _DHASH_THRESHOLD = 5
 _MSE_THRESHOLD = 50.0
+_FULL_SCAN_LOCK = threading.Lock()
+_FULL_SCAN_JOB: dict = {
+    "status": "idle",  # idle | running | done | failed
+    "phase": "",       # fingerprint | compare
+    "processed": 0,
+    "total": 0,
+    "added": 0,
+    "auto_removed": 0,
+    "failures": 0,
+    "error": None,
+}
 
 
 def _dedup_key(root: str, relpath: str) -> str:
@@ -2202,6 +2213,106 @@ def api_scan_dups():
     return {"success": True, "added": added, "auto_removed": auto_removed}
 
 
+def _iter_comics_media():
+    """Yield comic image paths that resolve inside the comics root."""
+    if not _COMICS_DIR.is_dir():
+        return
+    comics_root = _COMICS_DIR.resolve()
+    for directory, _, filenames in os.walk(_COMICS_DIR, followlinks=False):
+        for filename in sorted(filenames):
+            candidate = Path(directory) / filename
+            if candidate.suffix.lower() not in _IMAGE_EXTS:
+                continue
+            try:
+                resolved = candidate.resolve()
+                resolved.relative_to(comics_root)
+            except (OSError, ValueError):
+                continue
+            if resolved.is_file():
+                yield resolved
+
+
+def _run_full_scan() -> None:
+    """Re-fingerprint every media file, then pairwise-compare; background."""
+    try:
+        jobs: list[tuple[Path, str]] = [
+            (path, "downloads")
+            for path in _iter_media_files(_DOWNLOAD_DIR, _VIDEO_EXTS | _IMAGE_EXTS)
+        ]
+        jobs.extend((path, "comics") for path in _iter_comics_media())
+        with _FULL_SCAN_LOCK:
+            _FULL_SCAN_JOB.update(
+                status="running", phase="fingerprint",
+                processed=0, total=len(jobs),
+                added=0, auto_removed=0, failures=0, error=None,
+            )
+        comics_root = _COMICS_DIR.resolve()
+        failures = 0
+        for index, (path, root_name) in enumerate(jobs):
+            try:
+                if root_name == "comics":
+                    rel = path.relative_to(comics_root).as_posix()
+                else:
+                    rel = str(path.relative_to(_DOWNLOAD_DIR)).replace("\\", "/")
+                stat = path.stat()
+                frames = _compute_media_fingerprint(path)
+            except Exception:
+                failures += 1
+                log.warning("Full scan: fingerprint failed for %s", path, exc_info=True)
+            else:
+                key = _dedup_key(root_name, rel)
+                with _DEDUP_LOCK:
+                    _DEDUP_INDEX[key] = frames
+                    _DEDUP_MANIFEST[key] = (stat.st_mtime_ns, stat.st_size)
+                    if (index + 1) % 25 == 0:
+                        _save_dedup_state()
+            with _FULL_SCAN_LOCK:
+                _FULL_SCAN_JOB["processed"] = index + 1
+        with _FULL_SCAN_LOCK:
+            _FULL_SCAN_JOB["phase"] = "compare"
+        with _DEDUP_LOCK:
+            added, auto_removed = _scan_existing_duplicates()
+            _save_dedup_state()
+        with _FULL_SCAN_LOCK:
+            _FULL_SCAN_JOB.update(
+                status="done", added=added, auto_removed=auto_removed,
+                failures=failures,
+            )
+        log.info(
+            "Full scan finished: %d files, %d pending, %d auto-removed, %d failures",
+            len(jobs), added, auto_removed, failures,
+        )
+    except Exception as exc:
+        log.exception("Full scan failed")
+        with _FULL_SCAN_LOCK:
+            _FULL_SCAN_JOB.update(status="failed", error=str(exc))
+
+
+@app.route("/api/dups/full-scan", methods=["POST"])
+def api_full_scan_start():
+    """Start a background full rescan unless one is already running."""
+    with _FULL_SCAN_LOCK:
+        if _FULL_SCAN_JOB["status"] == "running":
+            return {"success": True, "started": False, "job": dict(_FULL_SCAN_JOB)}
+        _FULL_SCAN_JOB.update(
+            status="running", phase="fingerprint",
+            processed=0, total=0, added=0, auto_removed=0,
+            failures=0, error=None,
+        )
+        job = dict(_FULL_SCAN_JOB)
+    threading.Thread(
+        target=_run_full_scan, name="dedup-full-scan", daemon=True,
+    ).start()
+    return {"success": True, "started": True, "job": job}
+
+
+@app.route("/api/dups/full-scan")
+def api_full_scan_status():
+    """Report full-scan progress for the progress bar."""
+    with _FULL_SCAN_LOCK:
+        return dict(_FULL_SCAN_JOB)
+
+
 @app.route("/api/dup/delete", methods=["POST"])
 def api_dup_delete():
     """Delete one file from a duplicate pair — path may be new or match."""
@@ -2695,9 +2806,16 @@ INDEX_HTML = (
     <span id="searchStatus" class="search-status" aria-live="polite"></span>
   </div>
 
-  <div style="display:flex;gap:10px;align-items:center;margin-bottom:14px">
+  <div style="display:flex;gap:10px;align-items:center;margin-bottom:14px;flex-wrap:wrap">
     <button type="button" class="setting-action" id="dedupScanBtn">🔍 扫描已有重复</button>
+    <button type="button" class="setting-action" id="dedupFullScanBtn" title="重新计算所有文件的指纹后再比对，耗时较长">🔬 全量扫描</button>
     <span id="dedupScanStatus" class="search-status" aria-live="polite"></span>
+    <div id="dedupProgress" style="display:none;flex:1;min-width:220px;max-width:440px">
+      <div style="background:#e8e8e8;border-radius:6px;height:10px;overflow:hidden">
+        <div id="dedupProgressFill" style="background:#3498db;height:100%;width:0%;transition:width .4s;border-radius:6px"></div>
+      </div>
+      <span id="dedupProgressText" class="search-status" aria-live="polite"></span>
+    </div>
   </div>
 
   <!-- Pending duplicates section (populated by JS) -->
@@ -3450,6 +3568,69 @@ if (dedupScanBtn) dedupScanBtn.addEventListener('click', function() {
     status.textContent = '请求失败: ' + e.message;
   });
 });
+// ── Full rescan with progress bar ──
+var fullScanBtn = document.getElementById('dedupFullScanBtn');
+var fullScanTimer = null;
+function renderFullScanJob(job) {
+  var bar = document.getElementById('dedupProgress');
+  var fill = document.getElementById('dedupProgressFill');
+  var text = document.getElementById('dedupProgressText');
+  var status = document.getElementById('dedupScanStatus');
+  if (!job || job.status === 'idle') {
+    bar.style.display = 'none';
+    if (fullScanBtn) fullScanBtn.disabled = false;
+    return;
+  }
+  if (job.status === 'running') {
+    bar.style.display = '';
+    if (fullScanBtn) fullScanBtn.disabled = true;
+    var pct = job.total > 0 ? Math.floor(job.processed / job.total * 100) : 0;
+    fill.style.width = pct + '%';
+    text.textContent = job.phase === 'compare'
+      ? '比对中… ' + pct + '%'
+      : '指纹计算中 ' + job.processed + '/' + (job.total || '…');
+    return;
+  }
+  bar.style.display = 'none';
+  if (fullScanBtn) fullScanBtn.disabled = false;
+  if (job.status === 'done') {
+    var doneParts = [];
+    if (job.auto_removed) doneParts.push('自动清理 ' + job.auto_removed + ' 组100%重复');
+    if (job.added) doneParts.push('发现 ' + job.added + ' 组待确认');
+    if (job.failures) doneParts.push(job.failures + ' 个文件指纹失败');
+    status.textContent = '全量扫描完成' + (doneParts.length ? '：' + doneParts.join('；') : '，无新增');
+  } else if (job.status === 'failed') {
+    status.textContent = '全量扫描失败：' + (job.error || '未知错误');
+  }
+}
+function pollFullScan() {
+  fetch('/api/dups/full-scan').then(function(r) { return r.json(); }).then(function(job) {
+    renderFullScanJob(job);
+    if (job.status === 'running') {
+      fullScanTimer = setTimeout(pollFullScan, 1000);
+    } else {
+      if (fullScanTimer) { clearTimeout(fullScanTimer); fullScanTimer = null; }
+      if (job.status === 'done') loadDups();
+    }
+  }).catch(function() {
+    if (!fullScanTimer) fullScanTimer = setTimeout(pollFullScan, 2000);
+  });
+}
+if (fullScanBtn) fullScanBtn.addEventListener('click', function() {
+  var status = document.getElementById('dedupScanStatus');
+  status.textContent = '启动全量扫描…';
+  fetch('/api/dups/full-scan', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: '{}'
+  }).then(function(r) { return r.json(); }).then(function(data) {
+    if (!data.success) { status.textContent = data.error || '启动失败'; return; }
+    renderFullScanJob(data.job);
+    if (!fullScanTimer) fullScanTimer = setTimeout(pollFullScan, 1000);
+  }).catch(function(e) { status.textContent = '请求失败: ' + e.message; });
+});
+// Pick up a scan that is already running after a reload.
+pollFullScan();
 </script>
 </body>
 </html>"""  # noqa: E501

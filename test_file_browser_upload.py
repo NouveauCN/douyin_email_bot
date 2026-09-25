@@ -5,6 +5,7 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -48,6 +49,11 @@ class UploadFormTests(unittest.TestCase):
         self.manifest_patch = patch.object(file_browser, "_DEDUP_MANIFEST", {})
         self.pending_patch = patch.object(file_browser, "_PENDING_DUPS", [])
         self.resolved_patch = patch.object(file_browser, "_DEDUP_RESOLVED_PAIRS", set())
+        self.fullscan_patch = patch.object(
+            file_browser, "_FULL_SCAN_JOB",
+            {"status": "idle", "phase": "", "processed": 0, "total": 0,
+             "added": 0, "auto_removed": 0, "failures": 0, "error": None},
+        )
         self.state_patch = patch.object(
             file_browser,
             "_DEDUP_STATE_FILE",
@@ -57,12 +63,14 @@ class UploadFormTests(unittest.TestCase):
         self.manifest_patch.start()
         self.pending_patch.start()
         self.resolved_patch.start()
+        self.fullscan_patch.start()
         self.state_patch.start()
         self.client = file_browser.app.test_client()
         self.client.environ_base["HTTP_ORIGIN"] = "http://localhost"
 
     def tearDown(self):
         self.state_patch.stop()
+        self.fullscan_patch.stop()
         self.resolved_patch.stop()
         self.pending_patch.stop()
         self.manifest_patch.stop()
@@ -474,6 +482,11 @@ class DedupRefreshTests(unittest.TestCase):
             patch.object(file_browser, "_PENDING_DUPS", []),
             patch.object(file_browser, "_DEDUP_RESOLVED_PAIRS", set()),
             patch.object(
+                file_browser, "_FULL_SCAN_JOB",
+                {"status": "idle", "phase": "", "processed": 0, "total": 0,
+                 "added": 0, "auto_removed": 0, "failures": 0, "error": None},
+            ),
+            patch.object(
                 file_browser,
                 "_DEDUP_STATE_FILE",
                 Path(self.tempdir.name) / "browser_cache" / "dedup_state.json",
@@ -731,6 +744,36 @@ class DedupRefreshTests(unittest.TestCase):
         self.assertFalse((self.download_dir / small_rel).exists())
         self.assertTrue((self.download_dir / big_rel).exists())
 
+    def test_full_scan_recomputes_fingerprints_and_reports_progress(self):
+        self._write("slides/full_a.png", _TEST_PNG)
+        self._write("slides/full_b.png", _TEST_PNG)
+        file_browser._build_dedup_index()
+
+        original = file_browser._compute_media_fingerprint
+        with patch.object(
+            file_browser, "_compute_media_fingerprint", wraps=original
+        ) as spy:
+            start = self.client.post("/api/dups/full-scan", json={})
+            self.assertTrue(start.get_json()["success"])
+            self.assertTrue(start.get_json()["started"])
+
+            job = None
+            for _ in range(200):
+                job = self.client.get("/api/dups/full-scan").get_json()
+                if job["status"] in ("done", "failed"):
+                    break
+                time.sleep(0.05)
+
+        self.assertEqual(job["status"], "done")
+        self.assertEqual(job["total"], 2)
+        self.assertEqual(job["processed"], 2)
+        self.assertEqual(spy.call_count, 2)
+        # Identical pair: compare phase auto-resolves keeping the older file.
+        self.assertEqual(job["added"], 0)
+        self.assertEqual(job["auto_removed"], 1)
+        self.assertTrue((self.download_dir / "slides/full_a.png").exists())
+        self.assertFalse((self.download_dir / "slides/full_b.png").exists())
+
     def test_action_reload_requests_scroll_to_top(self):
         page = self.client.get("/").get_data(as_text=True)
 
@@ -855,6 +898,9 @@ class DedupRefreshTests(unittest.TestCase):
         self.assertIn("'/video/' : '/image/'", page)
         self.assertIn('id="dedupScanBtn"', page)
         self.assertIn("'/api/dups/scan'", page)
+        self.assertIn('id="dedupFullScanBtn"', page)
+        self.assertIn("dedupProgressFill", page)
+        self.assertIn("'/api/dups/full-scan'", page)
         dup_source = page.split("function dupFileHtml(")[1].split("function loadDups")[0]
         self.assertNotIn("🎬", dup_source)
         self.assertIn("target=\"_blank\"", dup_source)
