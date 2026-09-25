@@ -23,7 +23,7 @@ import uuid
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
 
 from PIL import Image
 
@@ -539,6 +539,16 @@ def _video_thumbnail_filter(video: Path) -> str:
     return portrait
 
 
+def _iter_video_files(root: Path):
+    """Yield video files under a directory, pruning hidden subdirectories."""
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = sorted(name for name in dirnames if not name.startswith("."))
+        for filename in sorted(filenames):
+            path = Path(dirpath) / filename
+            if path.is_file() and path.suffix.lower() in _VIDEO_EXTS:
+                yield path
+
+
 def _scan_downloads() -> dict:
     """Scan the downloads directory and return flat lists of videos and slides."""
     videos = []
@@ -564,19 +574,19 @@ def _scan_downloads() -> dict:
                         "is_landscape": _is_landscape_image(img),
                     })
         else:
-            # Author folder — collect all video files
-            for vid in sorted(entry.iterdir(), reverse=True):
-                if vid.is_file() and vid.suffix.lower() in _VIDEO_EXTS:
-                    relpath = str(vid.relative_to(_DOWNLOAD_DIR)).replace("\\", "/")
-                    date_str = _format_date(vid.name[:8]) if len(vid.name) >= 8 else ""
-                    videos.append({
-                        "name": vid.name,
-                        "author": entry.name,
-                        "relpath": relpath,
-                        "size": vid.stat().st_size,
-                        "size_fmt": _format_size(vid.stat().st_size),
-                        "date": date_str,
-                    })
+            # Videos may nest deeper than one level (bilibili/<author>/),
+            # so walk the whole subtree instead of only direct children.
+            for vid in _iter_video_files(entry):
+                relpath = str(vid.relative_to(_DOWNLOAD_DIR)).replace("\\", "/")
+                date_str = _format_date(vid.name[:8]) if len(vid.name) >= 8 else ""
+                videos.append({
+                    "name": vid.name,
+                    "author": vid.parent.name,
+                    "relpath": relpath,
+                    "size": vid.stat().st_size,
+                    "size_fmt": _format_size(vid.stat().st_size),
+                    "date": date_str,
+                })
 
     # Sort by filename descending (YYYYMMDD prefix = newest first)
     videos.sort(key=lambda v: v["name"], reverse=True)
@@ -843,21 +853,21 @@ def _collect_videos(author: str | None = None) -> list[dict]:
     if not _DOWNLOAD_DIR.is_dir():
         return videos
     for entry in sorted(_DOWNLOAD_DIR.iterdir()):
-        if not entry.is_dir() or entry.name == "slides":
+        if not entry.is_dir() or entry.name == "slides" or entry.name.startswith("."):
             continue
-        if author and entry.name != author:
-            continue
-        for vid in sorted(entry.iterdir()):
-            if vid.is_file() and vid.suffix.lower() in _VIDEO_EXTS:
-                relpath = str(vid.relative_to(_DOWNLOAD_DIR)).replace("\\", "/")
-                videos.append({
-                    "name": vid.name,
-                    "author": entry.name,
-                    "relpath": relpath,
-                    "size": vid.stat().st_size,
-                    "size_fmt": _format_size(vid.stat().st_size),
-                    "date": _format_date(vid.name[:8]) if len(vid.name) >= 8 else "",
-                })
+        for vid in _iter_video_files(entry):
+            video_author = vid.parent.name
+            if author and video_author != author:
+                continue
+            relpath = str(vid.relative_to(_DOWNLOAD_DIR)).replace("\\", "/")
+            videos.append({
+                "name": vid.name,
+                "author": video_author,
+                "relpath": relpath,
+                "size": vid.stat().st_size,
+                "size_fmt": _format_size(vid.stat().st_size),
+                "date": _format_date(vid.name[:8]) if len(vid.name) >= 8 else "",
+            })
     return videos
 
 
@@ -926,6 +936,10 @@ def view_video(filepath):
     size_fmt = _format_size(safe.stat().st_size)
     date = _format_date(filename[:8]) if len(filename) >= 8 else ""
     parent = safe.parent.name
+    # Pass the relative path unquoted so url_for encodes it exactly once;
+    # nested videos need the full path (bilibili/<author>) to resolve.
+    parent_rel = safe.parent.relative_to(_DOWNLOAD_DIR.resolve())
+    parent_path = "" if parent_rel == Path(".") else parent_rel.as_posix()
 
     return render_template_string(
         VIDEO_HTML,
@@ -934,7 +948,7 @@ def view_video(filepath):
         size_fmt=size_fmt,
         date=date,
         parent=parent,
-        parent_path=quote(parent, safe=""),
+        parent_path=parent_path,
         mime=_mime_type(filename),
     )
 
