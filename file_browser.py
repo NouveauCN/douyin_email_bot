@@ -539,13 +539,13 @@ def _video_thumbnail_filter(video: Path) -> str:
     return portrait
 
 
-def _iter_video_files(root: Path):
-    """Yield video files under a directory, pruning hidden subdirectories."""
+def _iter_media_files(root: Path, exts: set[str]):
+    """Yield media files under a directory, pruning hidden subdirectories."""
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         dirnames[:] = sorted(name for name in dirnames if not name.startswith("."))
         for filename in sorted(filenames):
             path = Path(dirpath) / filename
-            if path.is_file() and path.suffix.lower() in _VIDEO_EXTS:
+            if path.is_file() and path.suffix.lower() in exts:
                 yield path
 
 
@@ -576,7 +576,7 @@ def _scan_downloads() -> dict:
         else:
             # Videos may nest deeper than one level (bilibili/<author>/),
             # so walk the whole subtree instead of only direct children.
-            for vid in _iter_video_files(entry):
+            for vid in _iter_media_files(entry, _VIDEO_EXTS):
                 relpath = str(vid.relative_to(_DOWNLOAD_DIR)).replace("\\", "/")
                 date_str = _format_date(vid.name[:8]) if len(vid.name) >= 8 else ""
                 videos.append({
@@ -706,6 +706,7 @@ _VIDEO_CONVERT_EXTS = {".mov", ".mkv", ".avi"}
 
 _IMAGE_EXTS = {".webp", ".jpg", ".jpeg", ".png", ".gif"}
 _DEDUP_INDEX: dict[str, tuple[int, bytes]] = {}  # relpath → (dhash, 32×32 thumb bytes)
+_DEDUP_MANIFEST: dict[str, tuple[int, int]] = {}  # relpath → (mtime_ns, size) at fingerprint time
 _PENDING_DUPS: list[dict] = []  # pending duplicate confirmations
 _DHASH_THRESHOLD = 5
 _MSE_THRESHOLD = 50.0
@@ -787,28 +788,43 @@ def _mse(a: bytes, b: bytes) -> float:
     return sum((a[i] - b[i]) ** 2 for i in range(n)) / n
 
 
+def _refresh_download_dedup_index() -> None:
+    """Sync download-root fingerprints with disk; caller must hold _DEDUP_LOCK.
+
+    Picks up media created after the startup build (bot downloads land in
+    the shared tree without notifying this process) and nested layouts a
+    one-level scan would miss, and drops entries whose files are gone.
+    """
+    if not _DOWNLOAD_DIR.is_dir():
+        return
+    seen: set[str] = set()
+    for path in _iter_media_files(_DOWNLOAD_DIR, _VIDEO_EXTS | _IMAGE_EXTS):
+        rel = str(path.relative_to(_DOWNLOAD_DIR)).replace("\\", "/")
+        seen.add(rel)
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if _DEDUP_MANIFEST.get(rel) == (stat.st_mtime_ns, stat.st_size):
+            continue
+        try:
+            image = _media_to_image(path)
+            _DEDUP_INDEX[rel] = (_compute_dhash(image), _compute_thumbnail(image))
+        except Exception as exc:
+            log.warning("Dedup index: skipping %s — %s", rel, exc)
+        _DEDUP_MANIFEST[rel] = (stat.st_mtime_ns, stat.st_size)
+    for stale in list(_DEDUP_MANIFEST.keys() - seen):
+        _DEDUP_MANIFEST.pop(stale, None)
+        _DEDUP_INDEX.pop(stale, None)
+
+
 def _build_dedup_index():
     """Scan all media files under downloads/ and build the dedup index."""
     global _DEDUP_INDEX
     _DEDUP_INDEX.clear()
-    if not _DOWNLOAD_DIR.is_dir():
-        return
-    for entry in sorted(_DOWNLOAD_DIR.iterdir()):
-        if not entry.is_dir() or entry.name.startswith("."):
-            continue
-        # slides/ contains images, author dirs contain videos
-        for f in sorted(entry.iterdir()):
-            if not f.is_file():
-                continue
-            ext = f.suffix.lower()
-            if ext not in (_VIDEO_EXTS | _IMAGE_EXTS):
-                continue
-            try:
-                rel = str(f.relative_to(_DOWNLOAD_DIR)).replace("\\", "/")
-                img = _media_to_image(f)
-                _DEDUP_INDEX[rel] = (_compute_dhash(img), _compute_thumbnail(img))
-            except Exception as e:
-                log.warning("Dedup index: skipping %s — %s", f, e)
+    _DEDUP_MANIFEST.clear()
+    with _DEDUP_LOCK:
+        _refresh_download_dedup_index()
     # Comics are an independent image-only namespace.  Resolve every file
     # before indexing so external symlinks cannot enter the comparison set.
     comics_root = _COMICS_DIR.resolve()
@@ -855,7 +871,7 @@ def _collect_videos(author: str | None = None) -> list[dict]:
     for entry in sorted(_DOWNLOAD_DIR.iterdir()):
         if not entry.is_dir() or entry.name == "slides" or entry.name.startswith("."):
             continue
-        for vid in _iter_video_files(entry):
+        for vid in _iter_media_files(entry, _VIDEO_EXTS):
             video_author = vid.parent.name
             if author and video_author != author:
                 continue
@@ -1510,6 +1526,13 @@ def _process_uploaded_file(file, target: str = "downloads") -> tuple[dict, int]:
         save_path = tmp_path
         file.save(str(save_path))
         log.info("Saved upload: %s (%s)", save_path, _format_size(save_path.stat().st_size))
+
+        if target == "downloads":
+            # Refresh before dest exists so the upload cannot match itself,
+            # and so files downloaded after startup join the comparison set.
+            # Temp files are dot-prefixed and invisible to the walker.
+            with _DEDUP_LOCK:
+                _refresh_download_dedup_index()
 
         if needs_convert:
             log.info("Converting %s → %s ...", tmp_path.name, new_name)
@@ -2208,7 +2231,7 @@ INDEX_HTML = (
         <img class="card-thumb" src="{{ url_for('thumb', filepath=v.relpath) }}" loading="lazy" alt="" width="180" height="320">
         <div class="vname">{{ v.name }}</div>
         <div class="meta" style="margin-top:4px">
-          <span class="stat">{{ v.author }}</span>
+          <span class="stat">{{ v.date }}</span>
           <span class="stat">{{ v.size_fmt }}</span>
         </div>
       </a>

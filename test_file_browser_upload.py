@@ -28,14 +28,17 @@ class UploadFormTests(unittest.TestCase):
         self.comics_patch = patch.object(file_browser, "_COMICS_DIR", self.comics_dir)
         self.comics_patch.start()
         self.index_patch = patch.object(file_browser, "_DEDUP_INDEX", {})
+        self.manifest_patch = patch.object(file_browser, "_DEDUP_MANIFEST", {})
         self.pending_patch = patch.object(file_browser, "_PENDING_DUPS", [])
         self.index_patch.start()
+        self.manifest_patch.start()
         self.pending_patch.start()
         self.client = file_browser.app.test_client()
         self.client.environ_base["HTTP_ORIGIN"] = "http://localhost"
 
     def tearDown(self):
         self.pending_patch.stop()
+        self.manifest_patch.stop()
         self.index_patch.stop()
         self.download_patch.stop()
         self.comics_patch.stop()
@@ -423,6 +426,88 @@ class UploadFormTests(unittest.TestCase):
             "/api/crop/preview", json={"path": "../../outside.mp4"}
         )
         self.assertEqual(response.status_code, 403)
+
+
+class DedupRefreshTests(unittest.TestCase):
+    """Downloaded files must join the dedup index even after startup."""
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.download_dir = Path(self.tempdir.name)
+        self._patches = [
+            patch.object(file_browser, "_DOWNLOAD_DIR", self.download_dir),
+            patch.object(file_browser, "_COMICS_DIR", self.download_dir / "comics"),
+            patch.object(file_browser, "_DEDUP_INDEX", {}),
+            patch.object(file_browser, "_DEDUP_MANIFEST", {}),
+            patch.object(file_browser, "_PENDING_DUPS", []),
+        ]
+        for patcher in self._patches:
+            patcher.start()
+        self.client = file_browser.app.test_client()
+        self.client.environ_base["HTTP_ORIGIN"] = "http://localhost"
+
+    def tearDown(self):
+        for patcher in reversed(self._patches):
+            patcher.stop()
+        self.tempdir.cleanup()
+
+    def _write(self, rel: str, data: bytes) -> Path:
+        path = self.download_dir / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return path
+
+    def test_build_indexes_nested_and_flat_media(self):
+        self._write("slides/flat.png", _TEST_PNG)
+        self._write("bilibili/作者/nested.png", _TEST_PNG)
+        self._write(".hidden/hidden.png", _TEST_PNG)
+
+        file_browser._build_dedup_index()
+
+        keys = set(file_browser._DEDUP_INDEX)
+        self.assertIn("slides/flat.png", keys)
+        self.assertIn("bilibili/作者/nested.png", keys)
+        self.assertFalse(any("hidden" in key for key in keys))
+        self.assertIn("bilibili/作者/nested.png", file_browser._DEDUP_MANIFEST)
+
+    def test_refresh_picks_up_new_files_and_drops_deleted_ones(self):
+        flat = self._write("slides/flat.png", _TEST_PNG)
+        file_browser._build_dedup_index()
+
+        self._write("slides/added.png", _TEST_PNG)
+        with file_browser._DEDUP_LOCK:
+            file_browser._refresh_download_dedup_index()
+        self.assertIn("slides/added.png", file_browser._DEDUP_INDEX)
+
+        flat.unlink()
+        with file_browser._DEDUP_LOCK:
+            file_browser._refresh_download_dedup_index()
+        self.assertNotIn("slides/flat.png", file_browser._DEDUP_INDEX)
+        self.assertNotIn("slides/flat.png", file_browser._DEDUP_MANIFEST)
+
+    def test_upload_flags_duplicate_created_after_index_build(self):
+        # Built while empty — simulates a bot download landing after startup.
+        file_browser._build_dedup_index()
+        self._write("slides/base.png", _TEST_PNG)
+
+        response = self.client.post(
+            "/api/upload",
+            data={"target": "downloads", "file": (io.BytesIO(_TEST_PNG), "copy.png")},
+            headers={"X-Requested-With": "XMLHttpRequest"},
+        )
+
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["duplicate"]["duplicate_of"], "slides/base.png")
+
+    def test_video_card_shows_date_marker_instead_of_author(self):
+        self._write("某作者/20260102_030405_abc.mp4", b"x")
+
+        html = self.client.get("/").get_data(as_text=True)
+
+        self.assertIn('<span class="stat">2026-01-02</span>', html)
+        self.assertNotIn('<span class="stat">某作者</span>', html)
 
 
 if __name__ == "__main__":
