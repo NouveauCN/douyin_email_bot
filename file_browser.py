@@ -11,7 +11,9 @@ Usage:
 """
 
 import argparse
+import base64
 import hashlib
+import json
 import logging
 import os
 import re
@@ -721,6 +723,9 @@ _IMAGE_EXTS = {".webp", ".jpg", ".jpeg", ".png", ".gif"}
 _DEDUP_INDEX: dict[str, tuple[int, bytes]] = {}  # relpath → (dhash, 32×32 thumb bytes)
 _DEDUP_MANIFEST: dict[str, tuple[int, int]] = {}  # relpath → (mtime_ns, size) at fingerprint time
 _PENDING_DUPS: list[dict] = []  # pending duplicate confirmations
+_DEDUP_STATE_FILE = Path(
+    os.environ.get("FILE_BROWSER_CACHE_DIR", "/app/browser_cache")
+) / "dedup_state.json"
 _DHASH_THRESHOLD = 5
 _MSE_THRESHOLD = 50.0
 
@@ -819,6 +824,56 @@ def _find_dedup_match(
     return None
 
 
+def _save_dedup_state() -> None:
+    """Persist fingerprints, manifest, and pendings; caller holds _DEDUP_LOCK."""
+    try:
+        _DEDUP_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "index": {
+                key: [dhash, base64.b64encode(thumb).decode("ascii")]
+                for key, (dhash, thumb) in _DEDUP_INDEX.items()
+            },
+            "manifest": {
+                key: [mtime_ns, size]
+                for key, (mtime_ns, size) in _DEDUP_MANIFEST.items()
+            },
+            "pending": list(_PENDING_DUPS),
+        }
+        tmp_path = _DEDUP_STATE_FILE.with_name(_DEDUP_STATE_FILE.name + ".tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp_path, _DEDUP_STATE_FILE)
+    except OSError as exc:
+        log.warning("Could not persist dedup state: %s", exc)
+
+
+def _load_dedup_state() -> None:
+    """Restore persisted state; a missing or corrupt file starts fresh."""
+    try:
+        payload = json.loads(_DEDUP_STATE_FILE.read_text(encoding="utf-8"))
+        if payload.get("version") != 1:
+            return
+        index = {
+            key: (int(dhash), base64.b64decode(thumb_b64))
+            for key, (dhash, thumb_b64) in payload.get("index", {}).items()
+        }
+        manifest = {
+            key: (int(mtime_ns), int(size))
+            for key, (mtime_ns, size) in payload.get("manifest", {}).items()
+        }
+        pending = payload.get("pending", [])
+        if not isinstance(pending, list):
+            pending = []
+    except (OSError, ValueError, TypeError) as exc:
+        log.warning("Ignoring corrupt dedup state: %s", exc)
+        return
+    _DEDUP_INDEX.clear()
+    _DEDUP_INDEX.update(index)
+    _DEDUP_MANIFEST.clear()
+    _DEDUP_MANIFEST.update(manifest)
+    _PENDING_DUPS[:] = [d for d in pending if isinstance(d, dict)]
+
+
 def _refresh_download_dedup_index(*, flag_duplicates: bool) -> None:
     """Sync download-root fingerprints with disk; caller must hold _DEDUP_LOCK.
 
@@ -831,6 +886,7 @@ def _refresh_download_dedup_index(*, flag_duplicates: bool) -> None:
     """
     if not _DOWNLOAD_DIR.is_dir():
         return
+    changed = False
     seen: set[str] = set()
     for path in _iter_media_files(_DOWNLOAD_DIR, _VIDEO_EXTS | _IMAGE_EXTS):
         rel = str(path.relative_to(_DOWNLOAD_DIR)).replace("\\", "/")
@@ -841,6 +897,7 @@ def _refresh_download_dedup_index(*, flag_duplicates: bool) -> None:
             continue
         if _DEDUP_MANIFEST.get(rel) == (stat.st_mtime_ns, stat.st_size):
             continue
+        changed = True
         try:
             image = _media_to_image(path)
             dhash = _compute_dhash(image)
@@ -876,16 +933,21 @@ def _refresh_download_dedup_index(*, flag_duplicates: bool) -> None:
     for stale in list(_DEDUP_MANIFEST.keys() - seen):
         _DEDUP_MANIFEST.pop(stale, None)
         _DEDUP_INDEX.pop(stale, None)
+        changed = True
+    if changed:
+        _save_dedup_state()
 
 
 def _build_dedup_index():
-    """Scan all media files under downloads/ and build the dedup index."""
+    """Restore persisted fingerprints, then sync them with disk."""
     global _DEDUP_INDEX
     _DEDUP_INDEX.clear()
     _DEDUP_MANIFEST.clear()
+    _load_dedup_state()
     with _DEDUP_LOCK:
         # Startup indexes everything as clean: historical pairs must not
         # re-flag on every restart, only arrivals after startup are checked.
+        # Persisted fingerprints make this a stat-only diff when unchanged.
         _refresh_download_dedup_index(flag_duplicates=False)
     # Comics are an independent image-only namespace.  Resolve every file
     # before indexing so external symlinks cannot enter the comparison set.
@@ -908,6 +970,8 @@ def _build_dedup_index():
                     )
                 except (OSError, ValueError) as e:
                     log.warning("Comics dedup index: skipping %s — %s", f, e)
+    with _DEDUP_LOCK:
+        _save_dedup_state()
     log.info("Dedup index built: %d files", len(_DEDUP_INDEX))
 
 
@@ -1296,6 +1360,7 @@ def api_comics_delete():
                     if d.get("root", "downloads") != "comics"
                     or (d["new_file"] != deleted_rel and d["match_file"] != deleted_rel)
                 ]
+                _save_dedup_state()
             _invalidate_comics_scan()
             return {
                 "success": True,
@@ -1347,6 +1412,7 @@ def _delete_locked(target: Path, download_root: Path):
                 _PENDING_DUPS = [d for d in _PENDING_DUPS
                                  if d["new_file"] != deleted_rel
                                  and d["match_file"] != deleted_rel]
+            _save_dedup_state()
 
         return {
             "success": True,
@@ -1658,6 +1724,7 @@ def _process_uploaded_file(file, target: str = "downloads") -> tuple[dict, int]:
                                  relpath, existing_key, dist, mse_val)
                     if not dup_result:
                         _DEDUP_INDEX[_dedup_key(target, relpath)] = (new_dhash, new_thumb)
+                    _save_dedup_state()
             except Exception as e:
                 log.warning("Dedup check skipped for %s: %s", relpath, e)
 
@@ -1853,6 +1920,7 @@ def api_dup_delete():
         with _DEDUP_LOCK:
             _PENDING_DUPS = [d for d in _PENDING_DUPS if d != entry]
             _DEDUP_INDEX.pop(_dedup_key(root_name, path), None)
+            _save_dedup_state()
         return {"success": True}
     except MediaFileLockBusy:
         return {"success": False, "error": "媒体文件正在处理中，请稍后重试"}, 409
@@ -1900,6 +1968,7 @@ def api_dup_keep():
             global _PENDING_DUPS
             _PENDING_DUPS = [d for d in _PENDING_DUPS
                              if not (d.get("root", "downloads") == root_name and d["new_file"] == path)]
+            _save_dedup_state()
         log.info("Dup-kept: %s → added to index", path)
         return {"success": True}
     except MediaFileLockBusy:
@@ -2861,6 +2930,18 @@ uploadForm.addEventListener('submit', function(event) {
     });
 });
 // ── Pending duplicates ──
+function dupFileHtml(info, marker) {
+  // raw_url is already path-encoded; reuse it for thumb/viewer routes.
+  var pageUrl = info.raw_url.replace('/raw/', info.is_video ? '/video/' : '/image/');
+  var thumbUrl = info.is_video
+    ? info.raw_url.replace('/raw/', '/thumb/')
+    : info.raw_url;
+  return '<a href="' + pageUrl + '" target="_blank" rel="noopener"'
+    + ' style="display:block;text-decoration:none;color:inherit">'
+    + '<img class="thumb" src="' + thumbUrl + '" loading="lazy" width="120" height="213" alt="">'
+    + '<div class="fname">' + marker + info.name + '</div>'
+    + '<div class="fsize">' + info.size_fmt + '</div></a>';
+}
 function loadDups() {
   fetch('/api/dups')
     .then(function(r) { return r.json(); })
@@ -2891,13 +2972,7 @@ function loadDups() {
 
         var newFile = document.createElement('div');
         newFile.className = 'dup-file';
-        if (d.new_file.is_video) {
-          newFile.innerHTML = '<div class="thumb" style="background:#ddd;display:flex;align-items:center;justify-content:center;font-size:32px">🎬</div>';
-        } else {
-          newFile.innerHTML = '<img class="thumb" src="' + d.new_file.raw_url + '" loading="lazy" width="120" height="213">';
-        }
-        newFile.innerHTML += '<div class="fname">📥 ' + d.new_file.name + '</div>' +
-          '<div class="fsize">' + d.new_file.size_fmt + '</div>';
+        newFile.innerHTML = dupFileHtml(d.new_file, '📥 ');
         compare.appendChild(newFile);
 
         var vs = document.createElement('div');
@@ -2907,13 +2982,7 @@ function loadDups() {
 
         var matchFile = document.createElement('div');
         matchFile.className = 'dup-file';
-        if (d.match_file.is_video) {
-          matchFile.innerHTML = '<div class="thumb" style="background:#ddd;display:flex;align-items:center;justify-content:center;font-size:32px">🎬</div>';
-        } else {
-          matchFile.innerHTML = '<img class="thumb" src="' + d.match_file.raw_url + '" loading="lazy" width="120" height="213">';
-        }
-        matchFile.innerHTML += '<div class="fname">📁 ' + d.match_file.name + '</div>' +
-          '<div class="fsize">' + d.match_file.size_fmt + '</div>';
+        matchFile.innerHTML = dupFileHtml(d.match_file, '📁 ');
         compare.appendChild(matchFile);
 
         card.appendChild(compare);

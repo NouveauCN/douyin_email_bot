@@ -32,13 +32,20 @@ class UploadFormTests(unittest.TestCase):
         self.index_patch = patch.object(file_browser, "_DEDUP_INDEX", {})
         self.manifest_patch = patch.object(file_browser, "_DEDUP_MANIFEST", {})
         self.pending_patch = patch.object(file_browser, "_PENDING_DUPS", [])
+        self.state_patch = patch.object(
+            file_browser,
+            "_DEDUP_STATE_FILE",
+            Path(self.tempdir.name) / "browser_cache" / "dedup_state.json",
+        )
         self.index_patch.start()
         self.manifest_patch.start()
         self.pending_patch.start()
+        self.state_patch.start()
         self.client = file_browser.app.test_client()
         self.client.environ_base["HTTP_ORIGIN"] = "http://localhost"
 
     def tearDown(self):
+        self.state_patch.stop()
         self.pending_patch.stop()
         self.manifest_patch.stop()
         self.index_patch.stop()
@@ -444,6 +451,11 @@ class DedupRefreshTests(unittest.TestCase):
             patch.object(file_browser, "_DEDUP_INDEX", {}),
             patch.object(file_browser, "_DEDUP_MANIFEST", {}),
             patch.object(file_browser, "_PENDING_DUPS", []),
+            patch.object(
+                file_browser,
+                "_DEDUP_STATE_FILE",
+                Path(self.tempdir.name) / "browser_cache" / "dedup_state.json",
+            ),
         ]
         for patcher in self._patches:
             patcher.start()
@@ -520,6 +532,35 @@ class DedupRefreshTests(unittest.TestCase):
         self.assertIn("slides/a.png", file_browser._DEDUP_INDEX)
         self.assertIn("slides/b.png", file_browser._DEDUP_INDEX)
 
+    def test_dedup_state_persists_and_reloads(self):
+        self._write("slides/keep.png", _TEST_PNG)
+        file_browser._build_dedup_index()
+        before = file_browser._DEDUP_INDEX["slides/keep.png"]
+        file_browser._PENDING_DUPS.append({
+            "root": "downloads",
+            "new_file": "slides/keep.png",
+            "match_file": "slides/other.png",
+            "dhash_dist": 0,
+            "mse": 0.0,
+            "similarity_pct": 100,
+        })
+        with file_browser._DEDUP_LOCK:
+            file_browser._save_dedup_state()
+        self.assertTrue(file_browser._DEDUP_STATE_FILE.exists())
+
+        file_browser._DEDUP_INDEX.clear()
+        file_browser._DEDUP_MANIFEST.clear()
+        file_browser._PENDING_DUPS.clear()
+
+        file_browser._load_dedup_state()
+
+        self.assertEqual(file_browser._DEDUP_INDEX["slides/keep.png"], before)
+        self.assertIn("slides/keep.png", file_browser._DEDUP_MANIFEST)
+        self.assertEqual(len(file_browser._PENDING_DUPS), 1)
+        self.assertEqual(
+            file_browser._PENDING_DUPS[0]["match_file"], "slides/other.png"
+        )
+
     def test_upload_flags_duplicate_created_after_index_build(self):
         # Built while empty — simulates a bot download landing after startup.
         file_browser._build_dedup_index()
@@ -558,6 +599,16 @@ class DedupRefreshTests(unittest.TestCase):
 
         self.assertIn('<span class="stat">2026-09-25</span>', html)
         self.assertNotIn("bili-bi-li", html)
+
+    def test_dup_section_links_viewers_and_thumbnails(self):
+        page = self.client.get("/").get_data(as_text=True)
+
+        self.assertIn("function dupFileHtml(", page)
+        self.assertIn("replace('/raw/', '/thumb/')", page)
+        self.assertIn("'/video/' : '/image/'", page)
+        dup_source = page.split("function dupFileHtml(")[1].split("function loadDups")[0]
+        self.assertNotIn("🎬", dup_source)
+        self.assertIn("target=\"_blank\"", dup_source)
 
 
 if __name__ == "__main__":

@@ -439,6 +439,11 @@ sudo docker compose down
   `/app/runtime-settings` in `bot` and `file_browser`, with
   `RUNTIME_SETTINGS_DB=/app/runtime-settings/settings.sqlite3`. It is not the
   mail state volume and is never mounted into unrelated services.
+- `file_browser_cache` is a `file_browser`-only named volume mounted at
+  `/app/browser_cache`; it holds `dedup_state.json` (dedup fingerprints,
+  manifest, and pending duplicate confirmations) so restarts and rebuilds do
+  not re-fingerprint unchanged media or drop unresolved prompts. It is not
+  configuration, not the bot's state volume, and never holds credentials.
 - Bot and `file_browser` bind the host NAS root to `/app/downloads`.
 - `file_browser` mounts `/srv/nas_data/comics` read-write at `/app/comics` so
   its upload control can write directly to the original comics source, and

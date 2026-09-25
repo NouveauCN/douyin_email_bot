@@ -82,6 +82,8 @@ services:
       # The bot does not mount this path.
       - /srv/nas_data/comics:/app/comics
       - runtime_settings:/app/runtime-settings
+      # Dedup fingerprints and pending confirmations survive rebuilds here.
+      - file_browser_cache:/app/browser_cache
       - firefox_profile:/app/firefox_profile
       - ./config.yaml:/app/config.yaml:ro
       # Read-only bootstrap fallback so the Settings tab can report whether
@@ -175,6 +177,8 @@ volumes:
   state:
     driver: local
   runtime_settings:
+    driver: local
+  file_browser_cache:
     driver: local
   qq_gateway_state:
     driver: local
