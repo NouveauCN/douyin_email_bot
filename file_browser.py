@@ -499,11 +499,24 @@ def _format_size(size_bytes: int) -> str:
 
 
 def _format_date(prefix: str) -> str:
-    """YYYYMMDD → YYYY-MM-DD."""
+    """YYYYMMDD → YYYY-MM-DD; return '' when the prefix is not a real date."""
+    if len(prefix) < 8 or not prefix[:8].isdigit():
+        return ""
+    month, day = int(prefix[4:6]), int(prefix[6:8])
+    if not 1 <= month <= 12 or not 1 <= day <= 31:
+        return ""
+    return f"{prefix[:4]}-{prefix[4:6]}-{prefix[6:8]}"
+
+
+def _file_date(path: Path) -> str:
+    """Date marker: filename timestamp when present, else file modification date."""
+    date = _format_date(path.name[:8]) if len(path.name) >= 8 else ""
+    if date:
+        return date
     try:
-        return f"{prefix[:4]}-{prefix[4:6]}-{prefix[6:8]}"
-    except (IndexError, ValueError):
-        return prefix
+        return datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d")
+    except OSError:
+        return ""
 
 
 def _is_landscape_image(image: Path) -> bool:
@@ -564,7 +577,7 @@ def _scan_downloads() -> dict:
             for img in sorted(entry.iterdir(), reverse=True):
                 if img.is_file() and img.suffix.lower() in _IMAGE_EXTS:
                     relpath = str(img.relative_to(_DOWNLOAD_DIR)).replace("\\", "/")
-                    date_str = _format_date(img.name[:8]) if len(img.name) >= 8 else ""
+                    date_str = _file_date(img)
                     slides.append({
                         "name": img.name,
                         "relpath": relpath,
@@ -578,7 +591,7 @@ def _scan_downloads() -> dict:
             # so walk the whole subtree instead of only direct children.
             for vid in _iter_media_files(entry, _VIDEO_EXTS):
                 relpath = str(vid.relative_to(_DOWNLOAD_DIR)).replace("\\", "/")
-                date_str = _format_date(vid.name[:8]) if len(vid.name) >= 8 else ""
+                date_str = _file_date(vid)
                 videos.append({
                     "name": vid.name,
                     "author": vid.parent.name,
@@ -882,7 +895,7 @@ def _collect_videos(author: str | None = None) -> list[dict]:
                 "relpath": relpath,
                 "size": vid.stat().st_size,
                 "size_fmt": _format_size(vid.stat().st_size),
-                "date": _format_date(vid.name[:8]) if len(vid.name) >= 8 else "",
+                "date": _file_date(vid),
             })
     return videos
 
@@ -923,7 +936,7 @@ def browse(subpath):
                 "relpath": str(f.relative_to(_DOWNLOAD_DIR)).replace("\\", "/"),
                 "is_video": f.suffix.lower() in _VIDEO_EXTS,
                 "is_image": f.suffix.lower() in _IMAGE_EXTS,
-                "date": _format_date(f.name[:8]) if len(f.name) >= 8 else "",
+                "date": _file_date(f),
             })
 
     # Determine parent context
@@ -950,7 +963,7 @@ def view_video(filepath):
     relpath = str(safe.relative_to(_DOWNLOAD_DIR)).replace("\\", "/")
     filename = safe.name
     size_fmt = _format_size(safe.stat().st_size)
-    date = _format_date(filename[:8]) if len(filename) >= 8 else ""
+    date = _file_date(safe)
     parent = safe.parent.name
     # Pass the relative path unquoted so url_for encodes it exactly once;
     # nested videos need the full path (bilibili/<author>) to resolve.
@@ -2231,7 +2244,7 @@ INDEX_HTML = (
         <img class="card-thumb" src="{{ url_for('thumb', filepath=v.relpath) }}" loading="lazy" alt="" width="180" height="320">
         <div class="vname">{{ v.name }}</div>
         <div class="meta" style="margin-top:4px">
-          <span class="stat">{{ v.date }}</span>
+          <span class="stat">{{ v.author }}</span>
           <span class="stat">{{ v.size_fmt }}</span>
         </div>
       </a>
