@@ -723,6 +723,7 @@ _IMAGE_EXTS = {".webp", ".jpg", ".jpeg", ".png", ".gif"}
 _DEDUP_INDEX: dict[str, tuple[int, bytes]] = {}  # relpath → (dhash, 32×32 thumb bytes)
 _DEDUP_MANIFEST: dict[str, tuple[int, int]] = {}  # relpath → (mtime_ns, size) at fingerprint time
 _PENDING_DUPS: list[dict] = []  # pending duplicate confirmations
+_DEDUP_RESOLVED_PAIRS: set[frozenset[str]] = set()  # pairs kept as distinct by the user
 _DEDUP_STATE_FILE = Path(
     os.environ.get("FILE_BROWSER_CACHE_DIR", "/app/browser_cache")
 ) / "dedup_state.json"
@@ -839,6 +840,7 @@ def _save_dedup_state() -> None:
                 for key, (mtime_ns, size) in _DEDUP_MANIFEST.items()
             },
             "pending": list(_PENDING_DUPS),
+            "resolved_pairs": [sorted(pair) for pair in _DEDUP_RESOLVED_PAIRS],
         }
         tmp_path = _DEDUP_STATE_FILE.with_name(_DEDUP_STATE_FILE.name + ".tmp")
         tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -864,6 +866,9 @@ def _load_dedup_state() -> None:
         pending = payload.get("pending", [])
         if not isinstance(pending, list):
             pending = []
+        resolved = payload.get("resolved_pairs", [])
+        if not isinstance(resolved, list):
+            resolved = []
     except FileNotFoundError:
         return
     except (OSError, ValueError, TypeError) as exc:
@@ -874,6 +879,68 @@ def _load_dedup_state() -> None:
     _DEDUP_MANIFEST.clear()
     _DEDUP_MANIFEST.update(manifest)
     _PENDING_DUPS[:] = [d for d in pending if isinstance(d, dict)]
+    _DEDUP_RESOLVED_PAIRS.clear()
+    _DEDUP_RESOLVED_PAIRS.update(
+        frozenset((pair[0], pair[1]))
+        for pair in resolved
+        if isinstance(pair, list) and len(pair) == 2
+        and isinstance(pair[0], str) and isinstance(pair[1], str)
+    )
+
+
+def _scan_existing_duplicates() -> int:
+    """Pairwise-compare indexed files and flag matches; caller holds _DEDUP_LOCK.
+
+    Covers files that predate detection or arrived while the process was
+    down. Pairs already pending or confirmed as distinct are skipped; the
+    newer file becomes new_file.
+    """
+    added = 0
+    for is_comics in (False, True):
+        root_name = "comics" if is_comics else "downloads"
+        entries = [
+            (key, dhash, thumb)
+            for key, (dhash, thumb) in _DEDUP_INDEX.items()
+            if key.startswith("comics:") == is_comics
+        ]
+        open_pairs = {
+            frozenset((
+                _dedup_key(root_name, d["new_file"]),
+                _dedup_key(root_name, d["match_file"]),
+            ))
+            for d in _PENDING_DUPS
+            if d.get("root", "downloads") == root_name
+        }
+        for index, (key_a, dhash_a, thumb_a) in enumerate(entries):
+            for key_b, dhash_b, thumb_b in entries[index + 1:]:
+                pair = frozenset((key_a, key_b))
+                if pair in open_pairs or pair in _DEDUP_RESOLVED_PAIRS:
+                    continue
+                dist = _hamming(dhash_a, dhash_b)
+                if dist > _DHASH_THRESHOLD:
+                    continue
+                mse_val = _mse(thumb_a, thumb_b)
+                if mse_val >= _MSE_THRESHOLD:
+                    continue
+                newer_a = _DEDUP_MANIFEST.get(key_a, (0, 0))[0]
+                newer_b = _DEDUP_MANIFEST.get(key_b, (0, 0))[0]
+                new_key, match_key = (
+                    (key_a, key_b) if newer_a >= newer_b else (key_b, key_a)
+                )
+                similarity = max(0, 100 - int(mse_val / _MSE_THRESHOLD * 100))
+                _PENDING_DUPS.append({
+                    "root": root_name,
+                    "new_file": new_key.removeprefix("comics:"),
+                    "match_file": match_key.removeprefix("comics:"),
+                    "dhash_dist": dist,
+                    "mse": round(mse_val, 1),
+                    "similarity_pct": similarity,
+                })
+                open_pairs.add(pair)
+                added += 1
+                log.info("Duplicate candidate: %s ≈ %s (dist=%d, mse=%.1f)",
+                         new_key, match_key, dist, mse_val)
+    return added
 
 
 def _refresh_download_dedup_index(*, flag_duplicates: bool) -> None:
@@ -1890,6 +1957,15 @@ def api_list_dups():
     return result
 
 
+@app.route("/api/dups/scan", methods=["POST"])
+def api_scan_dups():
+    """Pairwise-scan indexed media and add new duplicate confirmations."""
+    with _DEDUP_LOCK:
+        added = _scan_existing_duplicates()
+        _save_dedup_state()
+    return {"success": True, "added": added}
+
+
 @app.route("/api/dup/delete", methods=["POST"])
 def api_dup_delete():
     """Delete one file from a duplicate pair — path may be new or match."""
@@ -1997,8 +2073,19 @@ def api_dup_keep():
         img = _media_to_image(target)
         with _DEDUP_LOCK:
             _DEDUP_INDEX[_dedup_key(root_name, path)] = (_compute_dhash(img), _compute_thumbnail(img))
-            # Remove from pending
+            # Remove from pending and remember the pair so a rescan will not
+            # flag two files the user chose to keep.
             global _PENDING_DUPS
+            kept = next(
+                (d for d in _PENDING_DUPS
+                 if d.get("root", "downloads") == root_name and d["new_file"] == path),
+                None,
+            )
+            if kept is not None:
+                _DEDUP_RESOLVED_PAIRS.add(frozenset((
+                    _dedup_key(root_name, path),
+                    _dedup_key(root_name, kept["match_file"]),
+                )))
             _PENDING_DUPS = [d for d in _PENDING_DUPS
                              if not (d.get("root", "downloads") == root_name and d["new_file"] == path)]
             _save_dedup_state()
@@ -2373,6 +2460,11 @@ INDEX_HTML = (
     </select>
     <button class="search-clear" id="searchClear" type="button" aria-label="清除搜索">清除</button>
     <span id="searchStatus" class="search-status" aria-live="polite"></span>
+  </div>
+
+  <div style="display:flex;gap:10px;align-items:center;margin-bottom:14px">
+    <button type="button" class="setting-action" id="dedupScanBtn">🔍 扫描已有重复</button>
+    <span id="dedupScanStatus" class="search-status" aria-live="polite"></span>
   </div>
 
   <!-- Pending duplicates section (populated by JS) -->
@@ -3076,6 +3168,27 @@ function resolveDup(path, action, label, root) {
 loadDups();
 // Surface automatic-download duplicates without requiring a manual reload.
 setInterval(loadDups, 15000);
+var dedupScanBtn = document.getElementById('dedupScanBtn');
+if (dedupScanBtn) dedupScanBtn.addEventListener('click', function() {
+  var status = document.getElementById('dedupScanStatus');
+  dedupScanBtn.disabled = true;
+  status.textContent = '扫描中…';
+  fetch('/api/dups/scan', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: '{}'
+  }).then(function(r) { return r.json(); }).then(function(data) {
+    dedupScanBtn.disabled = false;
+    if (!data.success) { status.textContent = data.error || '扫描失败'; return; }
+    status.textContent = data.added
+      ? '发现 ' + data.added + ' 组疑似重复'
+      : '未发现新的重复';
+    loadDups();
+  }).catch(function(e) {
+    dedupScanBtn.disabled = false;
+    status.textContent = '请求失败: ' + e.message;
+  });
+});
 </script>
 </body>
 </html>"""  # noqa: E501
