@@ -121,6 +121,30 @@ def test_multi_part_and_conflicting_names_are_unique(tmp_path):
     assert conflict[0].name == "20240101_010203_av123_2.mp4"
 
 
+def test_move_cover_files_shares_video_stem(tmp_path):
+    import time
+
+    from bilibili_downloader import _move_cover_files
+
+    staging = tmp_path / "bilibili"
+    staging.mkdir()
+    cover = staging / "民工力气大-poster.jpg"
+    cover.write_bytes(b"jpg")
+    started = time.time() - 1
+
+    moved = _move_cover_files(staging, started, "20260925_233355_BV1xpbj6YEqk")
+
+    assert [path.name for path in moved] == ["20260925_233355_BV1xpbj6YEqk.jpg"]
+    assert moved[0].parent == tmp_path / "slides"
+    assert not cover.exists()
+
+    # A colliding cover gets a unique sibling instead of a title-based name.
+    cover2 = staging / "民工力气大-poster.jpg"
+    cover2.write_bytes(b"jpg2")
+    moved2 = _move_cover_files(staging, started, "20260925_233355_BV1xpbj6YEqk")
+    assert moved2[0].name == "20260925_233355_BV1xpbj6YEqk_2.jpg"
+
+
 def test_returns_failure_when_yutto_succeeds_but_no_files_found(tmp_path, monkeypatch):
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:8888")
     download_dir = tmp_path / "bilibili"

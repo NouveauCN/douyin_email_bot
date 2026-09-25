@@ -220,8 +220,10 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   because its dependencies conflict with F2.
 - Preserve mp4 output, configured quality, `hevc,avc,av1` preference, and the
   current no-danmaku/no-subtitle/no-progress/no-color behavior.
-- Move cover sidecars to the sibling `slides/` directory with a `bilibili_`
-  prefix; covers must not count as video results.
+- Move cover sidecars to the sibling `slides/` directory, renamed to share
+  the video's `<YYYYMMDD_HHMMSS>_<BV>` stem (for example
+  `<stem>.jpg`), so name-sort pairs each cover with its download; covers
+  must not count as video results.
 - Run newly downloaded Bilibili videos and moved covers through the shared
   media processor without changing `files`, `covers`, or count metadata.
 - One URL may return multiple files. Preserve `files` and `file_count` metadata

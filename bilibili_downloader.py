@@ -104,7 +104,11 @@ class BilibiliDownloader:
 
         logger.debug("yutto output: %s", output[-3000:])
 
-        covers = _move_cover_files(staging_dir, started_at)
+        video_id = _extract_video_id(url)
+        started_stamp = _download_timestamp(started_at)
+        covers = _move_cover_files(
+            staging_dir, started_at, f"{started_stamp}_{video_id or 'unknown'}",
+        )
         files = _collect_downloaded_files(staging_dir, started_at)
 
         if not files:
@@ -116,14 +120,13 @@ class BilibiliDownloader:
                 _summarize_empty_yutto(output)
             )
 
-        video_id = _extract_video_id(url)
         author, _ = _fetch_bilibili_metadata(video_id)
         files = _rename_downloaded_files(
             files,
             download_dir,
             video_id or "unknown",
             author,
-            _download_timestamp(started_at),
+            started_stamp,
         )
         _process_downloaded_media([*files, *covers], shared_root)
         filepath = _format_file_result(files, download_dir)
@@ -373,7 +376,7 @@ def _collect_downloaded_files(download_dir: Path, started_at: float) -> list[Pat
     return sorted(files, key=lambda p: p.stat().st_mtime)
 
 
-def _move_cover_files(download_dir: Path, started_at: float) -> list[Path]:
+def _move_cover_files(download_dir: Path, started_at: float, stem: str) -> list[Path]:
     covers = _collect_files_by_ext(download_dir, started_at, _COVER_EXTS)
     if not covers:
         return []
@@ -383,7 +386,8 @@ def _move_cover_files(download_dir: Path, started_at: float) -> list[Path]:
 
     moved: list[Path] = []
     for cover in covers:
-        target = _unique_path(slides_dir / f"bilibili_{cover.name}")
+        # Share the video's <timestamp>_<BV> stem so name-sort pairs them.
+        target = _unique_path(slides_dir / f"{stem}{cover.suffix.lower()}")
         try:
             # yutto has already exited; lock only the source-to-slides
             # publication, never the subprocess itself.
