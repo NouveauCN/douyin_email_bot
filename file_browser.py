@@ -801,12 +801,33 @@ def _mse(a: bytes, b: bytes) -> float:
     return sum((a[i] - b[i]) ** 2 for i in range(n)) / n
 
 
-def _refresh_download_dedup_index() -> None:
+def _find_dedup_match(
+    dhash: int, thumb: bytes, is_comics: bool, exclude: str | None = None,
+) -> tuple[str, int, float] | None:
+    """Return (key, hamming, mse) for the first close entry in the namespace."""
+    for existing_key, (existing_dhash, existing_thumb) in _DEDUP_INDEX.items():
+        if existing_key.startswith("comics:") != is_comics:
+            continue
+        if existing_key == exclude:
+            continue
+        dist = _hamming(dhash, existing_dhash)
+        if dist > _DHASH_THRESHOLD:
+            continue
+        mse_val = _mse(thumb, existing_thumb)
+        if mse_val < _MSE_THRESHOLD:
+            return existing_key, dist, mse_val
+    return None
+
+
+def _refresh_download_dedup_index(*, flag_duplicates: bool) -> None:
     """Sync download-root fingerprints with disk; caller must hold _DEDUP_LOCK.
 
     Picks up media created after the startup build (bot downloads land in
     the shared tree without notifying this process) and nested layouts a
     one-level scan would miss, and drops entries whose files are gone.
+    With ``flag_duplicates``, a newly seen file that matches an already
+    indexed one becomes a pending duplicate instead of a clean entry —
+    that is how an automatic re-download surfaces a confirmation prompt.
     """
     if not _DOWNLOAD_DIR.is_dir():
         return
@@ -822,10 +843,36 @@ def _refresh_download_dedup_index() -> None:
             continue
         try:
             image = _media_to_image(path)
-            _DEDUP_INDEX[rel] = (_compute_dhash(image), _compute_thumbnail(image))
+            dhash = _compute_dhash(image)
+            thumb = _compute_thumbnail(image)
         except Exception as exc:
             log.warning("Dedup index: skipping %s — %s", rel, exc)
+            _DEDUP_MANIFEST[rel] = (stat.st_mtime_ns, stat.st_size)
+            continue
         _DEDUP_MANIFEST[rel] = (stat.st_mtime_ns, stat.st_size)
+        match = None
+        if flag_duplicates:
+            match = _find_dedup_match(dhash, thumb, is_comics=False, exclude=rel)
+        if match:
+            existing_key, dist, mse_val = match
+            already_pending = any(
+                d.get("root", "downloads") == "downloads" and d["new_file"] == rel
+                for d in _PENDING_DUPS
+            )
+            if not already_pending:
+                similarity = max(0, 100 - int(mse_val / _MSE_THRESHOLD * 100))
+                _PENDING_DUPS.append({
+                    "root": "downloads",
+                    "new_file": rel,
+                    "match_file": existing_key,
+                    "dhash_dist": dist,
+                    "mse": round(mse_val, 1),
+                    "similarity_pct": similarity,
+                })
+                log.info("Duplicate candidate: %s ≈ %s (dist=%d, mse=%.1f)",
+                         rel, existing_key, dist, mse_val)
+            continue
+        _DEDUP_INDEX[rel] = (dhash, thumb)
     for stale in list(_DEDUP_MANIFEST.keys() - seen):
         _DEDUP_MANIFEST.pop(stale, None)
         _DEDUP_INDEX.pop(stale, None)
@@ -837,7 +884,9 @@ def _build_dedup_index():
     _DEDUP_INDEX.clear()
     _DEDUP_MANIFEST.clear()
     with _DEDUP_LOCK:
-        _refresh_download_dedup_index()
+        # Startup indexes everything as clean: historical pairs must not
+        # re-flag on every restart, only arrivals after startup are checked.
+        _refresh_download_dedup_index(flag_duplicates=False)
     # Comics are an independent image-only namespace.  Resolve every file
     # before indexing so external symlinks cannot enter the comparison set.
     comics_root = _COMICS_DIR.resolve()
@@ -1545,7 +1594,7 @@ def _process_uploaded_file(file, target: str = "downloads") -> tuple[dict, int]:
             # and so files downloaded after startup join the comparison set.
             # Temp files are dot-prefixed and invisible to the walker.
             with _DEDUP_LOCK:
-                _refresh_download_dedup_index()
+                _refresh_download_dedup_index(flag_duplicates=True)
 
         if needs_convert:
             log.info("Converting %s → %s ...", tmp_path.name, new_name)
@@ -1587,31 +1636,26 @@ def _process_uploaded_file(file, target: str = "downloads") -> tuple[dict, int]:
                 new_thumb = _compute_thumbnail(img)
                 with _DEDUP_LOCK:
                     namespace = "comics:" if target == "comics" else ""
-                    for existing_key, (existing_dhash, existing_thumb) in _DEDUP_INDEX.items():
-                        if existing_key.startswith("comics:") != bool(namespace):
-                            continue
-                        if _hamming(new_dhash, existing_dhash) > _DHASH_THRESHOLD:
-                            continue
-                        mse_val = _mse(new_thumb, existing_thumb)
-                        if mse_val < _MSE_THRESHOLD:
-                            similarity = max(0, 100 - int(mse_val / _MSE_THRESHOLD * 100))
-                            dup_result = {
-                                "duplicate_of": existing_key.removeprefix(namespace),
-                                "dhash_dist": _hamming(new_dhash, existing_dhash),
-                                "mse": round(mse_val, 1),
-                                "similarity_pct": similarity,
-                            }
-                            _PENDING_DUPS.append({
-                                "root": target,
-                                "new_file": relpath,
-                                "match_file": existing_key.removeprefix(namespace),
-                                "dhash_dist": dup_result["dhash_dist"],
-                                "mse": dup_result["mse"],
-                                "similarity_pct": similarity,
-                            })
-                            log.info("Duplicate candidate: %s ≈ %s (dist=%d, mse=%.1f)",
-                                     relpath, existing_key, dup_result["dhash_dist"], dup_result["mse"])
-                            break
+                    match = _find_dedup_match(new_dhash, new_thumb, target == "comics")
+                    if match:
+                        existing_key, dist, mse_val = match
+                        similarity = max(0, 100 - int(mse_val / _MSE_THRESHOLD * 100))
+                        dup_result = {
+                            "duplicate_of": existing_key.removeprefix(namespace),
+                            "dhash_dist": dist,
+                            "mse": round(mse_val, 1),
+                            "similarity_pct": similarity,
+                        }
+                        _PENDING_DUPS.append({
+                            "root": target,
+                            "new_file": relpath,
+                            "match_file": existing_key.removeprefix(namespace),
+                            "dhash_dist": dist,
+                            "mse": dup_result["mse"],
+                            "similarity_pct": similarity,
+                        })
+                        log.info("Duplicate candidate: %s ≈ %s (dist=%d, mse=%.1f)",
+                                 relpath, existing_key, dist, mse_val)
                     if not dup_result:
                         _DEDUP_INDEX[_dedup_key(target, relpath)] = (new_dhash, new_thumb)
             except Exception as e:
@@ -2767,12 +2811,17 @@ uploadForm.addEventListener('submit', function(event) {
       var data = result.data;
       if (data.file_count) {
         if (data.success_count) {
-          var batchMessage = '✅ ' + data.message;
+          var dupCount = (data.files || []).filter(function(item) {
+            return item.duplicate;
+          }).length;
+          var batchMessage = dupCount
+            ? '⚠️ ' + data.message + '；' + dupCount + ' 个疑似重复，已加入待确认列表'
+            : '✅ ' + data.message;
           if (data.failed_count) batchMessage += '；失败：' + data.error;
           setUploadStatus(
             batchMessage,
-            data.failed_count ? '#fff3cd' : '#d4edda',
-            data.failed_count ? '#856404' : '#155724'
+            (data.failed_count || dupCount) ? '#fff3cd' : '#d4edda',
+            (data.failed_count || dupCount) ? '#856404' : '#155724'
           );
           setTimeout(reloadPreservingSections, 1800);
         } else {
@@ -2821,7 +2870,7 @@ function loadDups() {
       if (!dups.length) return;
 
       var header = document.createElement('div');
-      header.className = 'section-header collapsed';
+      header.className = 'section-header';
       header.dataset.section = 'duplicates';
       header.title = '点击折叠/展开';
       header.onclick = function() { toggleSection(header); };
@@ -2830,7 +2879,7 @@ function loadDups() {
       container.appendChild(header);
 
       var body = document.createElement('div');
-      body.className = 'collapsible-body dup-section collapsed';
+      body.className = 'collapsible-body dup-section';
 
       dups.forEach(function(d) {
         var card = document.createElement('div');
@@ -2923,6 +2972,8 @@ function resolveDup(path, action, label, root) {
   }).catch(function(e) { alert('请求失败: ' + e.message); });
 }
 loadDups();
+// Surface automatic-download duplicates without requiring a manual reload.
+setInterval(loadDups, 15000);
 </script>
 </body>
 </html>"""  # noqa: E501
@@ -3711,6 +3762,21 @@ ERROR_HTML = (
 
 # ── Entrypoint ─────────────────────────────────────────────────────────
 
+def _start_dedup_refresh_worker() -> None:
+    """Pick up downloaded files periodically and flag new duplicates."""
+
+    def _loop() -> None:
+        while True:
+            time.sleep(15)
+            try:
+                with _DEDUP_LOCK:
+                    _refresh_download_dedup_index(flag_duplicates=True)
+            except Exception:
+                log.exception("Periodic dedup refresh failed")
+
+    threading.Thread(target=_loop, name="dedup-refresh", daemon=True).start()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Douyin File Browser")
     parser.add_argument("--port", type=int, default=8081, help="Listen port (default: 8081)")
@@ -3728,6 +3794,7 @@ def main():
     log.info("Serving downloads from: %s", _DOWNLOAD_DIR)
 
     _build_dedup_index()
+    _start_dedup_refresh_worker()
 
     try:
         # Flask otherwise reloads .env at server startup.  That late reload can
