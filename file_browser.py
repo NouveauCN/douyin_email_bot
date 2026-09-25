@@ -864,6 +864,8 @@ def _load_dedup_state() -> None:
         pending = payload.get("pending", [])
         if not isinstance(pending, list):
             pending = []
+    except FileNotFoundError:
+        return
     except (OSError, ValueError, TypeError) as exc:
         log.warning("Ignoring corrupt dedup state: %s", exc)
         return
@@ -931,6 +933,8 @@ def _refresh_download_dedup_index(*, flag_duplicates: bool) -> None:
             continue
         _DEDUP_INDEX[rel] = (dhash, thumb)
     for stale in list(_DEDUP_MANIFEST.keys() - seen):
+        if stale.startswith("comics:"):
+            continue  # comics keys are reconciled by the startup comics walk
         _DEDUP_MANIFEST.pop(stale, None)
         _DEDUP_INDEX.pop(stale, None)
         changed = True
@@ -951,6 +955,7 @@ def _build_dedup_index():
         _refresh_download_dedup_index(flag_duplicates=False)
     # Comics are an independent image-only namespace.  Resolve every file
     # before indexing so external symlinks cannot enter the comparison set.
+    # Unchanged files skip fingerprinting via the shared manifest.
     comics_root = _COMICS_DIR.resolve()
     if _COMICS_DIR.is_dir():
         for directory, _, filenames in os.walk(_COMICS_DIR, followlinks=False):
@@ -964,12 +969,21 @@ def _build_dedup_index():
                     if not resolved.is_file():
                         continue
                     rel = resolved.relative_to(comics_root).as_posix()
-                    img = _media_to_image(resolved)
-                    _DEDUP_INDEX[_dedup_key("comics", rel)] = (
-                        _compute_dhash(img), _compute_thumbnail(img)
-                    )
+                    stat = resolved.stat()
                 except (OSError, ValueError) as e:
                     log.warning("Comics dedup index: skipping %s — %s", f, e)
+                    continue
+                manifest_key = _dedup_key("comics", rel)
+                if _DEDUP_MANIFEST.get(manifest_key) == (stat.st_mtime_ns, stat.st_size):
+                    continue
+                try:
+                    img = _media_to_image(resolved)
+                    _DEDUP_INDEX[manifest_key] = (
+                        _compute_dhash(img), _compute_thumbnail(img)
+                    )
+                except Exception as e:
+                    log.warning("Comics dedup index: skipping %s — %s", f, e)
+                _DEDUP_MANIFEST[manifest_key] = (stat.st_mtime_ns, stat.st_size)
     with _DEDUP_LOCK:
         _save_dedup_state()
     log.info("Dedup index built: %d files", len(_DEDUP_INDEX))

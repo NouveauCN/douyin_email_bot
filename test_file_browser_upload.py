@@ -532,6 +532,17 @@ class DedupRefreshTests(unittest.TestCase):
         self.assertIn("slides/a.png", file_browser._DEDUP_INDEX)
         self.assertIn("slides/b.png", file_browser._DEDUP_INDEX)
 
+    def test_startup_skips_unchanged_fingerprints(self):
+        self._write("comics/img.png", _TEST_PNG)
+        self._write("slides/a.png", _TEST_PNG)
+        file_browser._build_dedup_index()
+
+        original = file_browser._media_to_image
+        with patch.object(file_browser, "_media_to_image", wraps=original) as spy:
+            file_browser._build_dedup_index()
+
+        spy.assert_not_called()
+
     def test_dedup_state_persists_and_reloads(self):
         self._write("slides/keep.png", _TEST_PNG)
         file_browser._build_dedup_index()
