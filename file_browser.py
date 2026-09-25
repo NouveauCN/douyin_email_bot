@@ -1392,6 +1392,21 @@ def api_comics_delete():
         _MEDIA_SEMAPHORE.release()
 
 
+def _remove_paired_backup(target: Path) -> bool:
+    """Drop the crop backup that belongs to a deleted media file."""
+    if target.suffix.lower() not in (_VIDEO_EXTS | _IMAGE_EXTS):
+        return False
+    backup = target.with_name(f"{target.stem}_original.bak")
+    try:
+        if backup.is_file():
+            backup.unlink()
+            log.info("Removed paired backup: %s", backup)
+            return True
+    except OSError as exc:
+        log.warning("Could not remove paired backup %s: %s", backup, exc)
+    return False
+
+
 def _delete_locked(target: Path, download_root: Path):
     """Delete a validated target while its per-path lock is held."""
     try:
@@ -1404,6 +1419,9 @@ def _delete_locked(target: Path, download_root: Path):
             cleanup_start = target.parent
         else:
             target.unlink()
+            # Remove the crop backup first so empty-parent cleanup sees the
+            # final directory contents.
+            _remove_paired_backup(target)
         removed_dirs = _cleanup_empty_parents(cleanup_start)
         log.info("Deleted: %s", target)
         if removed_dirs:
@@ -1912,6 +1930,7 @@ def api_dup_delete():
     try:
         file_lock.acquire()
         target.unlink()
+        _remove_paired_backup(target)
         _cleanup_empty_parents(target.parent, lock_root)
 
         # If deleting the match (existing) file, index the new file
