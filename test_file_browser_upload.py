@@ -32,6 +32,7 @@ class UploadFormTests(unittest.TestCase):
         self.index_patch = patch.object(file_browser, "_DEDUP_INDEX", {})
         self.manifest_patch = patch.object(file_browser, "_DEDUP_MANIFEST", {})
         self.pending_patch = patch.object(file_browser, "_PENDING_DUPS", [])
+        self.resolved_patch = patch.object(file_browser, "_DEDUP_RESOLVED_PAIRS", set())
         self.state_patch = patch.object(
             file_browser,
             "_DEDUP_STATE_FILE",
@@ -40,12 +41,14 @@ class UploadFormTests(unittest.TestCase):
         self.index_patch.start()
         self.manifest_patch.start()
         self.pending_patch.start()
+        self.resolved_patch.start()
         self.state_patch.start()
         self.client = file_browser.app.test_client()
         self.client.environ_base["HTTP_ORIGIN"] = "http://localhost"
 
     def tearDown(self):
         self.state_patch.stop()
+        self.resolved_patch.stop()
         self.pending_patch.stop()
         self.manifest_patch.stop()
         self.index_patch.stop()
@@ -451,6 +454,7 @@ class DedupRefreshTests(unittest.TestCase):
             patch.object(file_browser, "_DEDUP_INDEX", {}),
             patch.object(file_browser, "_DEDUP_MANIFEST", {}),
             patch.object(file_browser, "_PENDING_DUPS", []),
+            patch.object(file_browser, "_DEDUP_RESOLVED_PAIRS", set()),
             patch.object(
                 file_browser,
                 "_DEDUP_STATE_FILE",
@@ -531,6 +535,43 @@ class DedupRefreshTests(unittest.TestCase):
         self.assertEqual(file_browser._PENDING_DUPS, [])
         self.assertIn("slides/a.png", file_browser._DEDUP_INDEX)
         self.assertIn("slides/b.png", file_browser._DEDUP_INDEX)
+
+    def test_scan_flags_existing_identical_trio(self):
+        self._write("slides/a.png", _TEST_PNG)
+        self._write("slides/b.png", _TEST_PNG)
+        self._write("slides/c.png", _TEST_PNG)
+        file_browser._build_dedup_index()
+        self.assertEqual(file_browser._PENDING_DUPS, [])
+
+        response = self.client.post("/api/dups/scan", json={})
+
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["added"], 3)
+        self.assertEqual(len(file_browser._PENDING_DUPS), 3)
+
+        # A second scan must not duplicate existing pendings.
+        again = self.client.post("/api/dups/scan", json={})
+        self.assertEqual(again.get_json()["added"], 0)
+
+    def test_keep_both_is_not_reflaged_by_scan(self):
+        self._write("slides/x.png", _TEST_PNG)
+        file_browser._build_dedup_index()
+        self._write("slides/y.png", _TEST_PNG)
+        with file_browser._DEDUP_LOCK:
+            file_browser._refresh_download_dedup_index(flag_duplicates=True)
+        self.assertEqual(len(file_browser._PENDING_DUPS), 1)
+
+        keep = self.client.post(
+            "/api/dup/keep", json={"path": "slides/y.png", "root": "downloads"}
+        )
+        self.assertEqual(keep.get_json()["success"], True)
+        self.assertEqual(file_browser._PENDING_DUPS, [])
+
+        scan = self.client.post("/api/dups/scan", json={})
+        self.assertEqual(scan.get_json()["added"], 0)
+        self.assertEqual(file_browser._PENDING_DUPS, [])
 
     def test_startup_skips_unchanged_fingerprints(self):
         self._write("comics/img.png", _TEST_PNG)
@@ -648,6 +689,8 @@ class DedupRefreshTests(unittest.TestCase):
         self.assertIn("function dupFileHtml(", page)
         self.assertIn("replace('/raw/', '/thumb/')", page)
         self.assertIn("'/video/' : '/image/'", page)
+        self.assertIn('id="dedupScanBtn"', page)
+        self.assertIn("'/api/dups/scan'", page)
         dup_source = page.split("function dupFileHtml(")[1].split("function loadDups")[0]
         self.assertNotIn("🎬", dup_source)
         self.assertIn("target=\"_blank\"", dup_source)
