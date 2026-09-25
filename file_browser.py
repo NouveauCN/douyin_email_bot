@@ -720,10 +720,11 @@ _VIDEO_CONVERT_EXTS = {".mov", ".mkv", ".avi"}
 # ── Dedup state ──────────────────────────────────────────────────────
 
 _IMAGE_EXTS = {".webp", ".jpg", ".jpeg", ".png", ".gif"}
-_DEDUP_INDEX: dict[str, tuple[int, bytes]] = {}  # relpath → (dhash, 32×32 thumb bytes)
+_DEDUP_INDEX: dict[str, list[tuple[int, bytes]]] = {}  # relpath → frame (dhash, thumb) pairs
 _DEDUP_MANIFEST: dict[str, tuple[int, int]] = {}  # relpath → (mtime_ns, size) at fingerprint time
 _PENDING_DUPS: list[dict] = []  # pending duplicate confirmations
 _DEDUP_RESOLVED_PAIRS: set[frozenset[str]] = set()  # pairs kept as distinct by the user
+FINGERPRINT_VERSION = 2  # v2: multi-frame videos, list-valued entries
 _DEDUP_STATE_FILE = Path(
     os.environ.get("FILE_BROWSER_CACHE_DIR", "/app/browser_cache")
 ) / "dedup_state.json"
@@ -798,6 +799,65 @@ def _compute_thumbnail(img: Image.Image) -> bytes:
     return img.convert("L").resize((32, 32), Image.LANCZOS).tobytes()
 
 
+def _media_kind(relpath: str) -> str:
+    """Classify an index key or path as 'video' or 'image' by extension."""
+    suffix = Path(relpath.removeprefix("comics:")).suffix.lower()
+    return "video" if suffix in _VIDEO_EXTS else "image"
+
+
+def _similarity_from_mse(mse: float) -> float:
+    """Percentage with one decimal; MSE 0 → 100.0."""
+    return round(max(0.0, 100.0 - (mse / _MSE_THRESHOLD) * 100.0), 1)
+
+
+def _video_duration(filepath: Path) -> float:
+    """Container duration in seconds; 0.0 when probe fails."""
+    try:
+        proc = subprocess.run([
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "csv=p=0", str(filepath),
+        ], check=True, timeout=15, capture_output=True, text=True)
+        return float(proc.stdout.strip())
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return 0.0
+
+
+def _sample_video_frames(filepath: Path, count: int = 5) -> list[Image.Image]:
+    """Extract ``count`` evenly spaced frames via per-frame seeks."""
+    duration = _video_duration(filepath)
+    if duration <= 0:
+        return []
+    frames: list[Image.Image] = []
+    for index in range(count):
+        timestamp = duration * index / count
+        try:
+            proc = subprocess.run([
+                "ffmpeg", "-y", "-ss", f"{timestamp:.3f}", "-i", str(filepath),
+                "-frames:v", "1", "-f", "image2pipe", "-c:v", "mjpeg",
+                "-q:v", "3", "-",
+            ], check=True, timeout=20, capture_output=True)
+            frames.append(Image.open(BytesIO(proc.stdout)).convert("RGB"))
+        except (OSError, subprocess.SubprocessError, ValueError):
+            continue
+    return frames
+
+
+def _compute_media_fingerprint(filepath: Path) -> list[tuple[int, bytes]]:
+    """Fingerprint a media file as one or more (dhash, thumb) frame pairs.
+
+    Videos sample evenly spaced frames (five by default); images yield a
+    single pair. Video sampling failures fall back to the first frame.
+    """
+    if filepath.suffix.lower() not in _VIDEO_EXTS:
+        img = _media_to_image(filepath)
+        return [(_compute_dhash(img), _compute_thumbnail(img))]
+    frames = _sample_video_frames(filepath)
+    if not frames:
+        img = _media_to_image(filepath)
+        return [(_compute_dhash(img), _compute_thumbnail(img))]
+    return [(_compute_dhash(frame), _compute_thumbnail(frame)) for frame in frames]
+
+
 def _hamming(a: int, b: int) -> int:
     return (a ^ b).bit_count()
 
@@ -807,21 +867,51 @@ def _mse(a: bytes, b: bytes) -> float:
     return sum((a[i] - b[i]) ** 2 for i in range(n)) / n
 
 
+def _match_fingerprints(
+    left: list[tuple[int, bytes]], right: list[tuple[int, bytes]],
+) -> tuple[int, float, float] | None:
+    """Compare aligned frame pairs; report only the worst similarity.
+
+    Returns (worst_dist, worst_mse, worst_pct) when every aligned pair is
+    within thresholds, otherwise None. Identical videos align frame i to
+    frame i because both sample the same relative positions.
+    """
+    if not left or not right:
+        return None
+    worst_dist = 0
+    worst_mse = 0.0
+    for (dhash_a, thumb_a), (dhash_b, thumb_b) in zip(left, right):
+        dist = _hamming(dhash_a, dhash_b)
+        if dist > _DHASH_THRESHOLD:
+            return None
+        mse_val = _mse(thumb_a, thumb_b)
+        if mse_val >= _MSE_THRESHOLD:
+            return None
+        worst_dist = max(worst_dist, dist)
+        worst_mse = max(worst_mse, mse_val)
+    return worst_dist, worst_mse, _similarity_from_mse(worst_mse)
+
+
 def _find_dedup_match(
-    dhash: int, thumb: bytes, is_comics: bool, exclude: str | None = None,
-) -> tuple[str, int, float] | None:
-    """Return (key, hamming, mse) for the first close entry in the namespace."""
-    for existing_key, (existing_dhash, existing_thumb) in _DEDUP_INDEX.items():
+    frames: list[tuple[int, bytes]], is_comics: bool,
+    exclude: str | None = None, kind: str | None = None,
+) -> tuple[str, int, float, float] | None:
+    """Return (key, worst_dist, worst_mse, worst_pct) of the first match.
+
+    Only pairs of the same media kind are considered — a video never
+    matches an image. Callers pass ``kind`` for the queried file; stored
+    keys derive their kind from the extension.
+    """
+    for existing_key, existing_frames in _DEDUP_INDEX.items():
         if existing_key.startswith("comics:") != is_comics:
             continue
         if existing_key == exclude:
             continue
-        dist = _hamming(dhash, existing_dhash)
-        if dist > _DHASH_THRESHOLD:
+        if kind is not None and _media_kind(existing_key) != kind:
             continue
-        mse_val = _mse(thumb, existing_thumb)
-        if mse_val < _MSE_THRESHOLD:
-            return existing_key, dist, mse_val
+        result = _match_fingerprints(frames, existing_frames)
+        if result is not None:
+            return existing_key, result[0], result[1], result[2]
     return None
 
 
@@ -831,9 +921,11 @@ def _save_dedup_state() -> None:
         _DEDUP_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "version": 1,
+            "fingerprint_version": FINGERPRINT_VERSION,
             "index": {
-                key: [dhash, base64.b64encode(thumb).decode("ascii")]
-                for key, (dhash, thumb) in _DEDUP_INDEX.items()
+                key: [[dhash, base64.b64encode(thumb).decode("ascii")]
+                      for dhash, thumb in frames]
+                for key, frames in _DEDUP_INDEX.items()
             },
             "manifest": {
                 key: [mtime_ns, size]
@@ -850,22 +942,46 @@ def _save_dedup_state() -> None:
 
 
 def _load_dedup_state() -> None:
-    """Restore persisted state; a missing or corrupt file starts fresh."""
+    """Restore persisted state; a missing or corrupt file starts fresh.
+
+    Version-1 entries were single-frame: images are wrapped into the list
+    format, legacy video fingerprints are dropped so the startup refresh
+    recomputes them with frame sampling, and cross-type pendings (video
+    vs image) are discarded.
+    """
     try:
         payload = json.loads(_DEDUP_STATE_FILE.read_text(encoding="utf-8"))
         if payload.get("version") != 1:
             return
-        index = {
-            key: (int(dhash), base64.b64decode(thumb_b64))
-            for key, (dhash, thumb_b64) in payload.get("index", {}).items()
-        }
+        fingerprint_version = int(payload.get("fingerprint_version", 1))
+        index: dict[str, list[tuple[int, bytes]]] = {}
+        for key, value in payload.get("index", {}).items():
+            if fingerprint_version >= FINGERPRINT_VERSION:
+                index[key] = [
+                    (int(dhash), base64.b64decode(thumb_b64))
+                    for dhash, thumb_b64 in value
+                ]
+            elif _media_kind(key) == "video":
+                continue  # legacy single-frame video → recompute
+            else:
+                index[key] = [(int(value[0]), base64.b64decode(value[1]))]
         manifest = {
             key: (int(mtime_ns), int(size))
             for key, (mtime_ns, size) in payload.get("manifest", {}).items()
         }
+        if fingerprint_version < FINGERPRINT_VERSION:
+            manifest = {
+                key: value for key, value in manifest.items()
+                if _media_kind(key) != "video"
+            }
         pending = payload.get("pending", [])
         if not isinstance(pending, list):
             pending = []
+        pending = [
+            d for d in pending if isinstance(d, dict)
+            and _media_kind(str(d.get("new_file", "")))
+            == _media_kind(str(d.get("match_file", "")))
+        ]
         resolved = payload.get("resolved_pairs", [])
         if not isinstance(resolved, list):
             resolved = []
@@ -878,7 +994,7 @@ def _load_dedup_state() -> None:
     _DEDUP_INDEX.update(index)
     _DEDUP_MANIFEST.clear()
     _DEDUP_MANIFEST.update(manifest)
-    _PENDING_DUPS[:] = [d for d in pending if isinstance(d, dict)]
+    _PENDING_DUPS[:] = pending
     _DEDUP_RESOLVED_PAIRS.clear()
     _DEDUP_RESOLVED_PAIRS.update(
         frozenset((pair[0], pair[1]))
@@ -892,15 +1008,16 @@ def _scan_existing_duplicates() -> int:
     """Pairwise-compare indexed files and flag matches; caller holds _DEDUP_LOCK.
 
     Covers files that predate detection or arrived while the process was
-    down. Pairs already pending or confirmed as distinct are skipped; the
-    newer file becomes new_file.
+    down. Pairs already pending or confirmed as distinct are skipped, and
+    videos are never paired with images. The newer file becomes new_file;
+    similarity is the worst aligned-frame percentage.
     """
     added = 0
     for is_comics in (False, True):
         root_name = "comics" if is_comics else "downloads"
         entries = [
-            (key, dhash, thumb)
-            for key, (dhash, thumb) in _DEDUP_INDEX.items()
+            (key, frames)
+            for key, frames in _DEDUP_INDEX.items()
             if key.startswith("comics:") == is_comics
         ]
         open_pairs = {
@@ -911,23 +1028,22 @@ def _scan_existing_duplicates() -> int:
             for d in _PENDING_DUPS
             if d.get("root", "downloads") == root_name
         }
-        for index, (key_a, dhash_a, thumb_a) in enumerate(entries):
-            for key_b, dhash_b, thumb_b in entries[index + 1:]:
+        for index, (key_a, frames_a) in enumerate(entries):
+            for key_b, frames_b in entries[index + 1:]:
+                if _media_kind(key_a) != _media_kind(key_b):
+                    continue
                 pair = frozenset((key_a, key_b))
                 if pair in open_pairs or pair in _DEDUP_RESOLVED_PAIRS:
                     continue
-                dist = _hamming(dhash_a, dhash_b)
-                if dist > _DHASH_THRESHOLD:
+                result = _match_fingerprints(frames_a, frames_b)
+                if result is None:
                     continue
-                mse_val = _mse(thumb_a, thumb_b)
-                if mse_val >= _MSE_THRESHOLD:
-                    continue
+                dist, mse_val, similarity = result
                 newer_a = _DEDUP_MANIFEST.get(key_a, (0, 0))[0]
                 newer_b = _DEDUP_MANIFEST.get(key_b, (0, 0))[0]
                 new_key, match_key = (
                     (key_a, key_b) if newer_a >= newer_b else (key_b, key_a)
                 )
-                similarity = max(0, 100 - int(mse_val / _MSE_THRESHOLD * 100))
                 _PENDING_DUPS.append({
                     "root": root_name,
                     "new_file": new_key.removeprefix("comics:"),
@@ -938,8 +1054,8 @@ def _scan_existing_duplicates() -> int:
                 })
                 open_pairs.add(pair)
                 added += 1
-                log.info("Duplicate candidate: %s ≈ %s (dist=%d, mse=%.1f)",
-                         new_key, match_key, dist, mse_val)
+                log.info("Duplicate candidate: %s ≈ %s (dist=%d, mse=%.1f, worst=%.1f%%)",
+                         new_key, match_key, dist, mse_val, similarity)
     return added
 
 
@@ -968,9 +1084,7 @@ def _refresh_download_dedup_index(*, flag_duplicates: bool) -> None:
             continue
         changed = True
         try:
-            image = _media_to_image(path)
-            dhash = _compute_dhash(image)
-            thumb = _compute_thumbnail(image)
+            frames = _compute_media_fingerprint(path)
         except Exception as exc:
             log.warning("Dedup index: skipping %s — %s", rel, exc)
             _DEDUP_MANIFEST[rel] = (stat.st_mtime_ns, stat.st_size)
@@ -978,15 +1092,16 @@ def _refresh_download_dedup_index(*, flag_duplicates: bool) -> None:
         _DEDUP_MANIFEST[rel] = (stat.st_mtime_ns, stat.st_size)
         match = None
         if flag_duplicates:
-            match = _find_dedup_match(dhash, thumb, is_comics=False, exclude=rel)
+            match = _find_dedup_match(
+                frames, is_comics=False, exclude=rel, kind=_media_kind(rel),
+            )
         if match:
-            existing_key, dist, mse_val = match
+            existing_key, dist, mse_val, similarity = match
             already_pending = any(
                 d.get("root", "downloads") == "downloads" and d["new_file"] == rel
                 for d in _PENDING_DUPS
             )
             if not already_pending:
-                similarity = max(0, 100 - int(mse_val / _MSE_THRESHOLD * 100))
                 _PENDING_DUPS.append({
                     "root": "downloads",
                     "new_file": rel,
@@ -995,10 +1110,10 @@ def _refresh_download_dedup_index(*, flag_duplicates: bool) -> None:
                     "mse": round(mse_val, 1),
                     "similarity_pct": similarity,
                 })
-                log.info("Duplicate candidate: %s ≈ %s (dist=%d, mse=%.1f)",
-                         rel, existing_key, dist, mse_val)
+                log.info("Duplicate candidate: %s ≈ %s (dist=%d, mse=%.1f, worst=%.1f%%)",
+                         rel, existing_key, dist, mse_val, similarity)
             continue
-        _DEDUP_INDEX[rel] = (dhash, thumb)
+        _DEDUP_INDEX[rel] = frames
     for stale in list(_DEDUP_MANIFEST.keys() - seen):
         if stale.startswith("comics:"):
             continue  # comics keys are reconciled by the startup comics walk
@@ -1045,9 +1160,7 @@ def _build_dedup_index():
                     continue
                 try:
                     img = _media_to_image(resolved)
-                    _DEDUP_INDEX[manifest_key] = (
-                        _compute_dhash(img), _compute_thumbnail(img)
-                    )
+                    _DEDUP_INDEX[manifest_key] = [(_compute_dhash(img), _compute_thumbnail(img))]
                 except Exception as e:
                     log.warning("Comics dedup index: skipping %s — %s", f, e)
                 _DEDUP_MANIFEST[manifest_key] = (stat.st_mtime_ns, stat.st_size)
@@ -1796,15 +1909,15 @@ def _process_uploaded_file(file, target: str = "downloads") -> tuple[dict, int]:
         dup_result = None
         if target in {"downloads", "comics"}:
             try:
-                img = _media_to_image(dest)
-                new_dhash = _compute_dhash(img)
-                new_thumb = _compute_thumbnail(img)
+                new_frames = _compute_media_fingerprint(dest)
                 with _DEDUP_LOCK:
                     namespace = "comics:" if target == "comics" else ""
-                    match = _find_dedup_match(new_dhash, new_thumb, target == "comics")
+                    match = _find_dedup_match(
+                        new_frames, target == "comics",
+                        kind=_media_kind(relpath),
+                    )
                     if match:
-                        existing_key, dist, mse_val = match
-                        similarity = max(0, 100 - int(mse_val / _MSE_THRESHOLD * 100))
+                        existing_key, dist, mse_val, similarity = match
                         dup_result = {
                             "duplicate_of": existing_key.removeprefix(namespace),
                             "dhash_dist": dist,
@@ -1819,10 +1932,10 @@ def _process_uploaded_file(file, target: str = "downloads") -> tuple[dict, int]:
                             "mse": dup_result["mse"],
                             "similarity_pct": similarity,
                         })
-                        log.info("Duplicate candidate: %s ≈ %s (dist=%d, mse=%.1f)",
-                                 relpath, existing_key, dist, mse_val)
+                        log.info("Duplicate candidate: %s ≈ %s (dist=%d, mse=%.1f, worst=%.1f%%)",
+                                 relpath, existing_key, dist, mse_val, similarity)
                     if not dup_result:
-                        _DEDUP_INDEX[_dedup_key(target, relpath)] = (new_dhash, new_thumb)
+                        _DEDUP_INDEX[_dedup_key(target, relpath)] = new_frames
                     _save_dedup_state()
             except Exception as e:
                 log.warning("Dedup check skipped for %s: %s", relpath, e)
@@ -2014,11 +2127,9 @@ def api_dup_delete():
             new_target = (_safe_comics_subpath(entry["new_file"])
                           if root_name == "comics" else _safe_subpath(entry["new_file"]))
             if new_target.exists():
-                img = _media_to_image(new_target)
                 with _DEDUP_LOCK:
                     _DEDUP_INDEX[_dedup_key(root_name, entry["new_file"])] = (
-                        _compute_dhash(img),
-                        _compute_thumbnail(img),
+                        _compute_media_fingerprint(new_target)
                     )
                 log.info("Dup resolved: deleted match %s, indexed new %s",
                          path, entry["new_file"])
@@ -2070,9 +2181,8 @@ def api_dup_keep():
     try:
         file_lock.acquire()
         # Add to dedup index
-        img = _media_to_image(target)
         with _DEDUP_LOCK:
-            _DEDUP_INDEX[_dedup_key(root_name, path)] = (_compute_dhash(img), _compute_thumbnail(img))
+            _DEDUP_INDEX[_dedup_key(root_name, path)] = _compute_media_fingerprint(target)
             # Remove from pending and remember the pair so a rescan will not
             # flag two files the user chose to keep.
             global _PENDING_DUPS
@@ -3115,8 +3225,8 @@ function loadDups() {
         // Info
         var info = document.createElement('div');
         info.className = 'dup-info';
-        info.innerHTML = '<div class="pct">' + d.similarity_pct + '%</div>' +
-          '<div class="label">相似度 (d=' + d.dhash_dist + ')</div>';
+        info.innerHTML = '<div class="pct">' + Number(d.similarity_pct).toFixed(1) + '%</div>' +
+          '<div class="label">相似度（最差帧）</div>';
         card.appendChild(info);
 
         // Actions — closure captures d, no escaping issues
