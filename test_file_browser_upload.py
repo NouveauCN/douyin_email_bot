@@ -2,8 +2,10 @@
 
 import base64
 import io
+import os
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -501,13 +503,28 @@ class DedupRefreshTests(unittest.TestCase):
         self.assertTrue(payload["success"])
         self.assertEqual(payload["duplicate"]["duplicate_of"], "slides/base.png")
 
-    def test_video_card_shows_date_marker_instead_of_author(self):
+    def test_video_card_shows_author(self):
         self._write("某作者/20260102_030405_abc.mp4", b"x")
 
         html = self.client.get("/").get_data(as_text=True)
 
-        self.assertIn('<span class="stat">2026-01-02</span>', html)
-        self.assertNotIn('<span class="stat">某作者</span>', html)
+        self.assertIn('<span class="stat">某作者</span>', html)
+
+    def test_format_date_only_accepts_real_dates(self):
+        self.assertEqual(file_browser._format_date("20260925"), "2026-09-25")
+        self.assertEqual(file_browser._format_date("bilibili"), "")
+        self.assertEqual(file_browser._format_date("20261301"), "")
+        self.assertEqual(file_browser._format_date("20260932"), "")
+
+    def test_poster_card_shows_mtime_date_not_prefix_fragment(self):
+        poster = self._write("slides/bilibili_probe-poster.jpg", _TEST_PNG)
+        moment = datetime(2026, 9, 25, 12, 0, 0).timestamp()
+        os.utime(poster, (moment, moment))
+
+        html = self.client.get("/").get_data(as_text=True)
+
+        self.assertIn('<span class="stat">2026-09-25</span>', html)
+        self.assertNotIn("bili-bi-li", html)
 
 
 if __name__ == "__main__":
