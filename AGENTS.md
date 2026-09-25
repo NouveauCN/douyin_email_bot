@@ -231,6 +231,11 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   the yutto start time (not the video's publication time) and the same author
   sanitization/50-character limit as Douyin. Multiple P parts use `_P01`,
   `_P02`, etc.; existing targets are never overwritten.
+- `bilibili.download_path` is the shared download root (the same directory as
+  `douyin.download_path`), so the published layout is identical to Douyin.
+  yutto stages raw output in `<root>/bilibili/`, cover sidecars move from
+  there to `<root>/slides/`, and file collection is scoped to that staging
+  directory so concurrent downloads elsewhere under the root are untouched.
 - Resolve supported `b23.tv` short links only over bounded HTTPS redirects to
   approved Bilibili hosts. Short-link resolution and public author metadata
   lookup are best-effort: timeout, malformed/untrusted redirects, unknown IDs,

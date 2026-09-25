@@ -46,9 +46,13 @@ class BilibiliDownloader:
         """
         download_dir = Path(self.config.download_path)
         download_dir.mkdir(parents=True, exist_ok=True)
-        shared_root = download_dir.parent
+        # yutto stages in a dedicated subdir so file collection stays scoped
+        # while published videos land in <root>/<author>/ like Douyin.
+        staging_dir = download_dir / "bilibili"
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        shared_root = download_dir
         transaction_lock = media_file_lock(
-            download_dir / ".yutto-transaction",
+            staging_dir / ".yutto-transaction",
             root=shared_root,
             timeout=max(5.0, float(self.config.timeout)),
         )
@@ -57,14 +61,16 @@ class BilibiliDownloader:
         except MediaFileLockBusy:
             return self._error("B站下载等待媒体目录锁超时，请稍后重试")
         try:
-            return self._download_locked(url, download_dir, shared_root)
+            return self._download_locked(url, download_dir, staging_dir, shared_root)
         finally:
             transaction_lock.release()
 
-    def _download_locked(self, url: str, download_dir: Path, shared_root: Path) -> dict:
+    def _download_locked(
+        self, url: str, download_dir: Path, staging_dir: Path, shared_root: Path,
+    ) -> dict:
         """Run yutto and publish results while browser media writes are paused."""
         started_at = time.time()
-        command = self._build_command(url, download_dir)
+        command = self._build_command(url, staging_dir)
         logger.info("Running yutto for Bilibili URL: %s", url)
         logger.debug("yutto command: %s", _redact_command(command))
 
@@ -72,7 +78,7 @@ class BilibiliDownloader:
             completed = subprocess.run(
                 command,
                 env=direct_environment(),
-                cwd=download_dir,
+                cwd=staging_dir,
                 capture_output=True,
                 text=True,
                 timeout=self.config.timeout,
@@ -98,13 +104,13 @@ class BilibiliDownloader:
 
         logger.debug("yutto output: %s", output[-3000:])
 
-        covers = _move_cover_files(download_dir, started_at)
-        files = _collect_downloaded_files(download_dir, started_at)
+        covers = _move_cover_files(staging_dir, started_at)
+        files = _collect_downloaded_files(staging_dir, started_at)
 
         if not files:
             logger.warning(
                 "yutto exited successfully but no video files found in %s",
-                download_dir,
+                staging_dir,
             )
             return self._error(
                 _summarize_empty_yutto(output)
