@@ -131,10 +131,12 @@ class UploadFormTests(unittest.TestCase):
         self.assertIn('id="mediaSearch"', page)
         self.assertIn('function updateSearch()', page)
         self.assertIn('data-search="sample.mp4 author/sample.mp4 author"', page)
-        self.assertIn("header.className = 'section-header collapsed';", page)
-        self.assertIn(
-            "body.className = 'collapsible-body dup-section collapsed';", page
-        )
+        # The pending-duplicates section must start expanded so an automatic
+        # download duplicate is visible without an extra click.
+        self.assertIn("header.className = 'section-header';", page)
+        self.assertNotIn("header.className = 'section-header collapsed';", page)
+        self.assertIn("body.className = 'collapsible-body dup-section';", page)
+        self.assertIn("setInterval(loadDups, 15000);", page)
 
     def test_delete_keeps_section_state_without_full_page_reload(self):
         (self.download_dir / "author").mkdir()
@@ -478,14 +480,45 @@ class DedupRefreshTests(unittest.TestCase):
 
         self._write("slides/added.png", _TEST_PNG)
         with file_browser._DEDUP_LOCK:
-            file_browser._refresh_download_dedup_index()
+            file_browser._refresh_download_dedup_index(flag_duplicates=False)
         self.assertIn("slides/added.png", file_browser._DEDUP_INDEX)
 
         flat.unlink()
         with file_browser._DEDUP_LOCK:
-            file_browser._refresh_download_dedup_index()
+            file_browser._refresh_download_dedup_index(flag_duplicates=False)
         self.assertNotIn("slides/flat.png", file_browser._DEDUP_INDEX)
         self.assertNotIn("slides/flat.png", file_browser._DEDUP_MANIFEST)
+
+    def test_new_download_matching_indexed_file_becomes_pending(self):
+        self._write("slides/base.png", _TEST_PNG)
+        file_browser._build_dedup_index()
+
+        # Simulates the bot dropping a duplicate after startup.
+        new_rel = "季风的学长/20260925_235959_BV1xpbj6YEqk.png"
+        self._write(new_rel, _TEST_PNG)
+        with file_browser._DEDUP_LOCK:
+            file_browser._refresh_download_dedup_index(flag_duplicates=True)
+
+        self.assertEqual(len(file_browser._PENDING_DUPS), 1)
+        pending = file_browser._PENDING_DUPS[0]
+        self.assertEqual(pending["new_file"], new_rel)
+        self.assertEqual(pending["match_file"], "slides/base.png")
+        self.assertNotIn(new_rel, file_browser._DEDUP_INDEX)
+
+        # The periodic worker must not append the same pending entry again.
+        with file_browser._DEDUP_LOCK:
+            file_browser._refresh_download_dedup_index(flag_duplicates=True)
+        self.assertEqual(len(file_browser._PENDING_DUPS), 1)
+
+    def test_startup_build_keeps_historical_duplicates_clean(self):
+        self._write("slides/a.png", _TEST_PNG)
+        self._write("slides/b.png", _TEST_PNG)
+
+        file_browser._build_dedup_index()
+
+        self.assertEqual(file_browser._PENDING_DUPS, [])
+        self.assertIn("slides/a.png", file_browser._DEDUP_INDEX)
+        self.assertIn("slides/b.png", file_browser._DEDUP_INDEX)
 
     def test_upload_flags_duplicate_created_after_index_build(self):
         # Built while empty — simulates a bot download landing after startup.
