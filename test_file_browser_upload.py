@@ -543,6 +543,37 @@ class DedupRefreshTests(unittest.TestCase):
 
         spy.assert_not_called()
 
+    def test_dup_delete_removes_paired_backup(self):
+        self._write("slides/old.png", _TEST_PNG)
+        file_browser._build_dedup_index()
+        self._write("slides/new.png", _TEST_PNG)
+        self._write("slides/new_original.bak", b"bak")
+        with file_browser._DEDUP_LOCK:
+            file_browser._refresh_download_dedup_index(flag_duplicates=True)
+        self.assertEqual(len(file_browser._PENDING_DUPS), 1)
+
+        response = self.client.post(
+            "/api/dup/delete", json={"path": "slides/new.png"}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["success"])
+        self.assertFalse((self.download_dir / "slides/new.png").exists())
+        self.assertFalse((self.download_dir / "slides/new_original.bak").exists())
+        self.assertTrue((self.download_dir / "slides/old.png").exists())
+        self.assertEqual(file_browser._PENDING_DUPS, [])
+
+    def test_file_delete_removes_paired_backup(self):
+        self._write("作者/x.mp4", b"video")
+        self._write("作者/x_original.bak", b"bak")
+
+        response = self.client.post("/api/delete", json={"path": "作者/x.mp4"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["success"])
+        self.assertFalse((self.download_dir / "作者/x.mp4").exists())
+        self.assertFalse((self.download_dir / "作者/x_original.bak").exists())
+
     def test_dedup_state_persists_and_reloads(self):
         self._write("slides/keep.png", _TEST_PNG)
         file_browser._build_dedup_index()
