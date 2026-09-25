@@ -744,6 +744,51 @@ class DedupRefreshTests(unittest.TestCase):
         self.assertFalse((self.download_dir / small_rel).exists())
         self.assertTrue((self.download_dir / big_rel).exists())
 
+    def test_destructive_endpoints_blocked_during_full_scan(self):
+        victim = self._write("slides/victim.png", _TEST_PNG)
+        file_browser._FULL_SCAN_JOB["status"] = "running"
+
+        cases = [
+            ("/api/delete", {"path": "slides/victim.png"}),
+            ("/api/dup/delete", {"path": "slides/victim.png"}),
+            ("/api/dup/keep", {"path": "slides/victim.png", "root": "downloads"}),
+            ("/api/comics/delete", {"path": "x.png"}),
+            ("/api/crop/apply", {"path": "slides/victim.png"}),
+        ]
+        for endpoint, payload in cases:
+            response = self.client.post(endpoint, json=payload)
+            self.assertEqual(response.status_code, 409, endpoint)
+            self.assertIn("全量扫描", response.get_json()["error"], endpoint)
+        self.assertTrue(victim.exists())
+
+        file_browser._FULL_SCAN_JOB["status"] = "idle"
+        allowed = self.client.post("/api/delete", json={"path": "slides/victim.png"})
+        self.assertEqual(allowed.status_code, 200)
+        self.assertTrue(allowed.get_json()["success"])
+        self.assertFalse(victim.exists())
+
+    def test_upload_auto_resolve_defers_during_full_scan(self):
+        self._write("slides/base.png", _TEST_PNG)
+        file_browser._build_dedup_index()
+        file_browser._FULL_SCAN_JOB["status"] = "running"
+
+        response = self.client.post(
+            "/api/upload",
+            data={"target": "downloads", "file": (io.BytesIO(_TEST_PNG), "copy.png")},
+            headers={"X-Requested-With": "XMLHttpRequest"},
+        )
+
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        duplicate = payload["duplicate"]
+        self.assertEqual(duplicate["duplicate_of"], "slides/base.png")
+        self.assertNotIn("auto_removed", duplicate)
+        self.assertEqual(len(file_browser._PENDING_DUPS), 1)
+        self.assertTrue(
+            (self.download_dir / payload["relpath"]).exists()
+        )
+        file_browser._FULL_SCAN_JOB["status"] = "idle"
+
     def test_full_scan_recomputes_fingerprints_and_reports_progress(self):
         self._write("slides/full_a.png", _TEST_PNG)
         self._write("slides/full_b.png", _TEST_PNG)
