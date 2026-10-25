@@ -2662,7 +2662,7 @@ INDEX_HTML = (
     .card-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-bottom: 24px; }
     .card { border-radius: 8px; padding: 8px; }
     .card-thumb { border-radius: 6px; margin-bottom: 6px; }
-    .card.landscape-card { grid-column: span 1; }
+    .card.landscape-card { grid-column: 1 / -1; }
     .card .vname { font-size: 14px; }
     .section-header { min-height: 44px; margin-bottom: 8px; font-size: 16px; }
   }
