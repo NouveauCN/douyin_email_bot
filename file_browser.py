@@ -2659,7 +2659,7 @@ INDEX_HTML = (
     .browse-search input { min-width: 0; width: 100%; min-height: 44px; padding: 9px 12px; font-size: 16px; }
     .browse-search select, .search-clear { width: 100%; font-size: 16px; }
     .search-status { min-height: 20px; font-size: 13px; }
-    .card-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-bottom: 24px; }
+    .card-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-auto-flow: row dense; gap: 8px; margin-bottom: 24px; }
     .card { border-radius: 8px; padding: 8px; }
     .card-thumb { border-radius: 6px; margin-bottom: 6px; }
     .card.landscape-card { grid-column: 1 / -1; }
