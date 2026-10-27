@@ -206,7 +206,7 @@ services:
         limits:
           # fp32 Qwen2.5-VL-3B peaks around 13-14 GB; keep headroom. Compose
           # v2 applies deploy limits outside Swarm (verify with docker inspect
-          # CpuQuota after deployment).
+          # NanoCpus after deployment; cpus maps to NanoCpus, not CpuQuota).
           cpus: "4.0"
           memory: 18g
 

@@ -516,7 +516,9 @@ sudo docker compose down
   `config.yaml`, `.env`, the `state` volume, or the Docker socket. Its
   `deploy.resources.limits` (4 CPUs, 18 GB) are honored by Compose v2 outside
   Swarm; after deployment confirm with
-  `docker inspect --format '{{.HostConfig.CpuQuota}} {{.HostConfig.Memory}}' douyin_tag_worker`.
+  `docker inspect --format '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}' douyin_tag_worker`
+  (`NanoCpus=4000000000` means 4 CPUs; Compose maps `cpus` to `NanoCpus`, so
+  `CpuQuota` stays 0 and is not the field to check).
 - All services bind `config.yaml` read-only. The bot has a writable legacy
   `.env` bind for compatibility, while `file_browser` receives it read-only for
   bootstrap fallback and Compose injects `WEB_LOGIN_PASSWORD` explicitly.
