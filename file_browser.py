@@ -66,6 +66,17 @@ _COMICS_THUMB_MAX_BYTES = 2 * 1024**3
 _COMICS_SCAN_TTL = 5.0
 _COMICS_SCAN_LOCK = threading.RLock()
 _COMICS_SCAN_CACHE: tuple[str, float, list[dict]] | None = None
+# Tag sidecars are read-only inputs owned by tag_worker.  Per-file results are
+# keyed by sidecar mtime (unchanged files cost one stat), and the aggregated
+# gallery summary is reused for a short TTL so neither endpoint rescans the
+# whole gallery on every request.
+_COMICS_SIDECAR_CACHE_LOCK = threading.RLock()
+_COMICS_SIDECAR_CACHE: dict[str, tuple[int, tuple[list[str], bool, str]]] = {}
+_COMICS_TAGS_SUMMARY_TTL = 30.0
+_COMICS_TAGS_SUMMARY_LOCK = threading.RLock()
+_COMICS_TAGS_SUMMARY_CACHE: tuple[float, dict] | None = None
+# Pseudo tag filter that selects images without a usable sidecar tag list.
+_COMICS_UNTAGGED_TAG = "__untagged__"
 
 # ── App setup ─────────────────────────────────────────────────────────
 
@@ -655,9 +666,114 @@ def _collect_comics_images() -> list[dict]:
 
 
 def _invalidate_comics_scan() -> None:
-    global _COMICS_SCAN_CACHE
+    global _COMICS_SCAN_CACHE, _COMICS_TAGS_SUMMARY_CACHE
     with _COMICS_SCAN_LOCK:
         _COMICS_SCAN_CACHE = None
+    with _COMICS_TAGS_SUMMARY_LOCK:
+        _COMICS_TAGS_SUMMARY_CACHE = None
+
+
+def _parse_comics_sidecar(raw: bytes) -> tuple[list[str], bool, str]:
+    """Best-effort sidecar parse: (tags, nsfw, description), never raises."""
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return [], False, ""
+    if not isinstance(data, dict):
+        return [], False, ""
+    nsfw = data.get("nsfw")
+    is_nsfw = isinstance(nsfw, dict) and nsfw.get("label") == "nsfw"
+    description = data.get("description")
+    if not isinstance(description, str):
+        description = ""
+    # Only an ok sidecar with a real list counts as tagged; failed, missing,
+    # or malformed sidecars degrade to "no tags" without failing the request.
+    tags_value = data.get("tags") if data.get("status") == "ok" else None
+    tags = (
+        [tag for tag in tags_value if isinstance(tag, str)]
+        if isinstance(tags_value, list) else []
+    )
+    return tags, is_nsfw, description
+
+
+def _read_comics_sidecar(relpath: str) -> tuple[list[str], bool, str]:
+    """Return (tags, nsfw, description) for one gallery image, never raising.
+
+    ``relpath`` comes from ``_collect_comics_images()`` (already resolved
+    inside the comics root) and is only re-validated defensively here; the
+    sidecar is always built from that trusted relative path, never from user
+    input.  Results are cached per sidecar mtime under a lock.
+    """
+    if not isinstance(relpath, str) or not relpath:
+        return [], False, ""
+    parts = relpath.replace("\\", "/").split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        return [], False, ""
+    root = _COMICS_DIR.resolve()
+    key = f"{root}\0{relpath}"
+    sidecar = root / f"{relpath}.tags.json"
+    try:
+        resolved = sidecar.resolve()
+        resolved.relative_to(root)
+        mtime = resolved.stat().st_mtime_ns
+    except (OSError, ValueError):
+        # Missing, vanished, or external sidecar: treat as untagged.
+        with _COMICS_SIDECAR_CACHE_LOCK:
+            _COMICS_SIDECAR_CACHE.pop(key, None)
+        return [], False, ""
+    with _COMICS_SIDECAR_CACHE_LOCK:
+        cached = _COMICS_SIDECAR_CACHE.get(key)
+        if cached is not None and cached[0] == mtime:
+            tags, is_nsfw, description = cached[1]
+            return list(tags), is_nsfw, description
+    try:
+        raw = resolved.read_bytes()
+    except OSError:
+        return [], False, ""
+    parsed = _parse_comics_sidecar(raw)
+    with _COMICS_SIDECAR_CACHE_LOCK:
+        _COMICS_SIDECAR_CACHE[key] = (mtime, parsed)
+    return list(parsed[0]), parsed[1], parsed[2]
+
+
+def _copy_tag_summary(summary: dict) -> dict:
+    return {
+        "tags": [dict(item) for item in summary["tags"]],
+        "untagged": summary["untagged"],
+        "nsfw": summary["nsfw"],
+        "total": summary["total"],
+    }
+
+
+def _comics_tag_summary() -> dict:
+    """Aggregate gallery tag counts, cached for a short TTL under a lock."""
+    global _COMICS_TAGS_SUMMARY_CACHE
+    now = time.monotonic()
+    with _COMICS_TAGS_SUMMARY_LOCK:
+        cached = _COMICS_TAGS_SUMMARY_CACHE
+        if cached is not None and now - cached[0] < _COMICS_TAGS_SUMMARY_TTL:
+            return _copy_tag_summary(cached[1])
+    counts: dict[str, int] = {}
+    untagged = nsfw_total = 0
+    images = _collect_comics_images()
+    for image in images:
+        tags, is_nsfw, _ = _read_comics_sidecar(image["relpath"])
+        if not tags:
+            untagged += 1
+        if is_nsfw:
+            nsfw_total += 1
+        for tag in dict.fromkeys(tags):
+            counts[tag] = counts.get(tag, 0) + 1
+    ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    summary = {
+        "tags": [{"tag": tag, "count": count} for tag, count in ordered],
+        "untagged": untagged,
+        "nsfw": nsfw_total,
+        "total": len(images),
+    }
+    with _COMICS_TAGS_SUMMARY_LOCK:
+        _COMICS_TAGS_SUMMARY_CACHE = (now, summary)
+    return _copy_tag_summary(summary)
 
 
 def _comics_thumbnail_path(relpath: str, source: Path) -> Path:
@@ -1349,7 +1465,14 @@ def index():
     """Top-level index: author folders + slideshow groups."""
     data = _scan_downloads()
     all_comics = _collect_comics_images()
-    data["comics_images"] = all_comics[:120]
+    # Only the rendered first page reads sidecars (bounded work per request).
+    comics_page = all_comics[:120]
+    for image in comics_page:
+        tags, nsfw, description = _read_comics_sidecar(image["relpath"])
+        image["tags"] = tags
+        image["nsfw"] = nsfw
+        image["description"] = description
+    data["comics_images"] = comics_page
     data["comics_total"] = len(all_comics)
     data["empty"] = data["empty"] and not data["comics_images"]
     data["upload_success"] = request.args.get("upload_success", "")
@@ -1573,7 +1696,7 @@ def comics_thumbnail(filepath):
 
 @app.route("/api/comics")
 def api_comics():
-    """Return a stable, paginated comics catalog."""
+    """Return a stable, paginated comics catalog, optionally tag-filtered."""
     try:
         offset = max(0, int(request.args.get("offset", 0)))
     except (TypeError, ValueError):
@@ -1583,14 +1706,41 @@ def api_comics():
         limit = max(1, min(120 if offset == 0 else 60, int(request.args.get("limit", default_limit))))
     except (TypeError, ValueError):
         limit = default_limit
+    # The tag parameter only matches already-collected relpaths; it is never
+    # used to build a filesystem path, so unknown or hostile values simply
+    # match nothing (an empty page, not an error).
+    tag = request.args.get("tag", "")
     images = _collect_comics_images()
+    if tag:
+        if tag == _COMICS_UNTAGGED_TAG:
+            images = [
+                image for image in images
+                if not _read_comics_sidecar(image["relpath"])[0]
+            ]
+        else:
+            images = [
+                image for image in images
+                if tag in _read_comics_sidecar(image["relpath"])[0]
+            ]
+    # Sidecars are read only for the current page slice (the filter path above
+    # already had to touch the whole list to compute membership).
     page = images[offset:offset + limit]
     for image in page:
+        tags, nsfw, description = _read_comics_sidecar(image["relpath"])
+        image["tags"] = tags
+        image["nsfw"] = nsfw
+        image["description"] = description
         image["view_url"] = url_for("view_comics_image", filepath=image["relpath"])
         image["raw_url"] = url_for("raw_comics_file", filepath=image["relpath"])
         image["thumb_url"] = url_for("comics_thumbnail", filepath=image["relpath"])
     return {"images": page, "offset": offset, "limit": limit,
             "total": len(images), "has_more": offset + len(page) < len(images)}
+
+
+@app.route("/api/comics/tags")
+def api_comics_tags():
+    """Aggregate tag counts for the whole comics gallery (read-only)."""
+    return _comics_tag_summary()
 
 
 @app.route("/thumb/<path:filepath>")
@@ -2666,6 +2816,9 @@ INDEX_HTML = (
     .card.landscape-card { grid-column: 1 / -1; }
     .card .vname { font-size: 14px; }
     .section-header { min-height: 44px; margin-bottom: 8px; font-size: 16px; }
+    .comics-tag-filter { display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; }
+    .comics-tag-filter select { width: 100%; min-height: 44px; font-size: 16px; }
+    .tag-chip { font-size: 12px; }
   }
   @media (max-width:340px) {
     .card-grid { grid-template-columns: 1fr; }
@@ -2723,6 +2876,19 @@ INDEX_HTML = (
   .search-status { color:#888; font-size:12px; }
   .search-status.error { color:#c0392b; }
   .comics-empty-state { color: #999; padding: 24px 20px; text-align: center; }
+  /* ── Comics tag filter and card chips ── */
+  .comics-tag-filter { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:0 0 12px; grid-column:1 / -1; }
+  .comics-tag-filter label { color:#777; font-size:13px; }
+  .comics-tag-filter select { min-height:36px; max-width:100%; border:1px solid #ddd; border-radius:8px; padding:6px 10px; background:#fff; font:inherit; font-size:13px; }
+  .comics-tag-status { color:#888; font-size:12px; }
+  .tag-chips { display:flex; flex-wrap:wrap; gap:4px; margin-top:6px; }
+  .tag-chip {
+    font-size:11px; line-height:1.5; padding:1px 8px; border-radius:999px;
+    background:#f1f3f5; color:#555; border:1px solid #e3e6ea; cursor:pointer;
+    max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .tag-chip:hover { background:#e6e9ec; color:#333; }
+  .tag-chip.nsfw { background:#fdecec; border-color:#f3b6b6; color:#c0392b; font-weight:600; }
   .top-tabs { display:flex; gap:8px; margin:0 0 22px; }
   .top-tab { border:1px solid #ddd; border-radius:8px; padding:8px 18px; background:#fff; color:#777; cursor:pointer; font-size:13px; }
   .top-tab.active { background:#fe2c55; border-color:#fe2c55; color:#fff; }
@@ -2907,12 +3073,22 @@ INDEX_HTML = (
     <span class="section-count">{{ comics_total }} 张</span>
   </div>
   <div class="collapsible-body card-grid collapsed" id="comicsGrid" data-total="{{ comics_total }}">
+  <div class="comics-tag-filter" id="comicsTagBar">
+    <label for="comicsTagFilter">🏷️ 标签筛选</label>
+    <select id="comicsTagFilter" aria-label="按标签筛选二次元图片">
+      <option value="">全部标签（{{ comics_total }}）</option>
+    </select>
+    <span id="comicsTagStatus" class="comics-tag-status" aria-live="polite"></span>
+  </div>
   {% if comics_images %}
   {% for c in comics_images %}
-    <div class="card media-card comics-card{% if c.is_landscape %} landscape-card{% endif %}" data-search="{{ (c.name ~ ' ' ~ c.relpath)|e }}">
+    <div class="card media-card comics-card{% if c.is_landscape %} landscape-card{% endif %}" data-search="{{ (c.name ~ ' ' ~ c.relpath ~ ((' ' ~ ((c.tags|default([]))|join(' '))) if c.tags else '') ~ ((' ' ~ c.description) if c.description else ''))|e }}">
       <a class="card-inner" href="{{ url_for('view_comics_image', filepath=c.relpath) }}">
         <img class="card-thumb" src="{{ url_for('comics_thumbnail', filepath=c.relpath) }}" loading="lazy" alt="" width="180" height="320">
-        <div class="vname">{{ c.name }}</div>
+        <div class="vname"{% if c.description %} title="{{ c.description|e }}"{% endif %}>{{ c.name }}</div>
+        {% if c.tags %}
+        <div class="tag-chips">{% for t in c.tags %}<span class="tag-chip{% if t == 'nsfw' %} nsfw{% endif %}" data-tag="{{ t|e }}" role="button" tabindex="0">{{ t }}</span>{% endfor %}</div>
+        {% endif %}
         <div class="meta" style="margin-top:4px">
           <span class="stat">{{ c.relpath }}</span>
           <span class="stat">{{ c.size_fmt }}</span>
@@ -3219,22 +3395,48 @@ if (searchClear) searchClear.addEventListener('click', function() {
   mediaSearch.focus();
 });
 // Comics are fetched ahead of the viewport in bounded pages.  Keep only
-// thumbnail URLs in cards; the viewer requests originals on demand.
+// thumbnail URLs in cards; the viewer requests originals on demand.  Tag
+// filtering reuses the same endpoint with ?tag=, so pagination offsets are
+// always computed against the filtered result set.
 (function() {
   var grid = document.getElementById('comicsGrid');
-  var sentinel = document.getElementById('comicsLoadSentinel');
-  if (!grid || !sentinel) return;
+  var tagSelect = document.getElementById('comicsTagFilter');
+  var tagStatus = document.getElementById('comicsTagStatus');
+  if (!grid) return;
   var offset = grid.querySelectorAll('.comics-card').length;
   var loading = false;
+  var currentTag = '';
+  var requestSeq = 0;
+  var observer = new IntersectionObserver(function(entries) {
+    if (entries.some(function(entry) { return entry.isIntersecting; })) loadMore();
+  }, {rootMargin: '300% 0px'});
   function card(image) {
     var card = document.createElement('div');
+    var tags = Array.isArray(image.tags) ? image.tags : [];
     card.className = 'card media-card comics-card' + (image.is_landscape ? ' landscape-card' : '');
-    card.dataset.search = image.name + ' ' + image.relpath;
+    var search = image.name + ' ' + image.relpath;
+    if (tags.length) search += ' ' + tags.join(' ');
+    if (image.description) search += ' ' + image.description;
+    card.dataset.search = search;
     card.innerHTML = '<a class="card-inner" href="' + image.view_url + '">' +
       '<img class="card-thumb" src="' + image.thumb_url + '" loading="lazy" alt="" width="180" height="320">' +
-      '<div class="vname"></div><div class="meta" style="margin-top:4px"><span class="stat"></span><span class="stat"></span></div></a>' +
+      '<div class="vname"></div><div class="tag-chips"></div>' +
+      '<div class="meta" style="margin-top:4px"><span class="stat"></span><span class="stat"></span></div></a>' +
       '<button class="del-btn" title="删除">✕</button>';
-    card.querySelector('.vname').textContent = image.name;
+    var vname = card.querySelector('.vname');
+    vname.textContent = image.name;
+    if (image.description) vname.title = image.description;
+    var chipsBox = card.querySelector('.tag-chips');
+    tags.forEach(function(tag) {
+      var chip = document.createElement('span');
+      chip.className = 'tag-chip' + (tag === 'nsfw' ? ' nsfw' : '');
+      chip.dataset.tag = tag;
+      chip.setAttribute('role', 'button');
+      chip.setAttribute('tabindex', '0');
+      chip.textContent = tag;
+      chipsBox.appendChild(chip);
+    });
+    if (!tags.length) chipsBox.remove();
     card.querySelectorAll('.stat')[0].textContent = image.relpath;
     card.querySelectorAll('.stat')[1].textContent = image.size_fmt;
     card.querySelector('.del-btn').addEventListener('click', function(event) {
@@ -3242,26 +3444,182 @@ if (searchClear) searchClear.addEventListener('click', function() {
     });
     return card;
   }
+  function activeSentinel() {
+    return document.getElementById('comicsLoadSentinel');
+  }
+  function setSentinel(hasMore) {
+    var existing = activeSentinel();
+    if (!hasMore) {
+      if (existing) {
+        observer.unobserve(existing);
+        existing.remove();
+      }
+      return;
+    }
+    if (existing) return;
+    var node = document.createElement('div');
+    node.id = 'comicsLoadSentinel';
+    node.setAttribute('aria-live', 'polite');
+    node.style.gridColumn = '1 / -1';
+    node.style.height = '1px';
+    grid.appendChild(node);
+    observer.observe(node);
+  }
+  function clearGrid() {
+    Array.prototype.forEach.call(
+      grid.querySelectorAll('.comics-card, .comics-empty-state'),
+      function(node) { node.remove(); }
+    );
+    var existing = activeSentinel();
+    if (existing) {
+      observer.unobserve(existing);
+      existing.remove();
+    }
+  }
+  function apiUrl(offsetValue) {
+    return '/api/comics?offset=' + offsetValue + '&limit=60' +
+      (currentTag ? '&tag=' + encodeURIComponent(currentTag) : '');
+  }
   function loadMore() {
     if (loading || offset >= Number(grid.dataset.total || 0)) return;
     loading = true;
-    fetch('/api/comics?offset=' + offset + '&limit=60').then(function(response) {
+    var seq = requestSeq;
+    fetch(apiUrl(offset)).then(function(response) {
       if (!response.ok) throw new Error('HTTP ' + response.status);
       return response.json();
     }).then(function(data) {
+      if (seq !== requestSeq) return;
       data.images.forEach(function(image) { grid.appendChild(card(image)); });
       offset += data.images.length;
-      if (!data.has_more) sentinel.remove();
+      grid.dataset.total = String(data.total);
+      setSentinel(data.has_more);
       updateSearch();
     }).catch(function() {
+      if (seq !== requestSeq) return;
+      var sentinel = activeSentinel();
+      if (!sentinel) return;
       sentinel.textContent = '加载失败，点击重试';
       sentinel.style.cursor = 'pointer';
       sentinel.onclick = function() { sentinel.textContent = ''; loadMore(); };
-    }).finally(function() { loading = false; });
+    }).finally(function() {
+      if (seq === requestSeq) loading = false;
+    });
   }
-  new IntersectionObserver(function(entries) {
-    if (entries.some(function(entry) { return entry.isIntersecting; })) loadMore();
-  }, {rootMargin: '300% 0px'}).observe(sentinel);
+  // Keep the select, the rendered grid, and the pagination query on the same
+  // tag: insert a missing option so a chip-driven filter stays visible even
+  // when the tag summary failed to load or does not list the tag.
+  function syncTagSelect() {
+    if (!tagSelect) return;
+    var options = tagSelect.options;
+    var found = false;
+    for (var i = 0; i < options.length; i++) {
+      if (options[i].value === currentTag) { found = true; break; }
+    }
+    if (!found && currentTag) {
+      var option = document.createElement('option');
+      option.value = currentTag;
+      option.textContent = currentTag + '（当前筛选）';
+      tagSelect.appendChild(option);
+    }
+    tagSelect.value = currentTag;
+  }
+  function applyTagFilter(tag) {
+    var previousTag = currentTag;
+    currentTag = tag || '';
+    var seq = ++requestSeq;
+    loading = true;
+    fetch(apiUrl(0)).then(function(response) {
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      return response.json();
+    }).then(function(data) {
+      if (seq !== requestSeq) return;
+      clearGrid();
+      data.images.forEach(function(image) { grid.appendChild(card(image)); });
+      offset = data.images.length;
+      grid.dataset.total = String(data.total);
+      if (!data.images.length && data.total === 0) {
+        var empty = document.createElement('div');
+        empty.className = 'comics-empty-state';
+        empty.textContent = currentTag ? '没有匹配该标签的图片' : '暂无二次元图片';
+        grid.appendChild(empty);
+      }
+      setSentinel(data.has_more);
+      syncTagSelect();
+      updateSearch();
+    }).catch(function() {
+      if (seq !== requestSeq) return;
+      // Roll back to the tag the untouched grid still shows, so select,
+      // grid, and scroll pagination keep querying the same tag instead of
+      // mixing a new tag into the old result set.
+      currentTag = previousTag;
+      syncTagSelect();
+      if (tagStatus) tagStatus.textContent = '筛选失败，已恢复上一个筛选';
+    }).finally(function() {
+      if (seq === requestSeq) loading = false;
+    });
+  }
+  function selectTag(tag) {
+    applyTagFilter(tag || '');
+  }
+  function loadTagOptions() {
+    if (!tagSelect) return;
+    fetch('/api/comics/tags').then(function(response) {
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      return response.json();
+    }).then(function(summary) {
+      while (tagSelect.firstChild) tagSelect.removeChild(tagSelect.firstChild);
+      var allOption = document.createElement('option');
+      allOption.value = '';
+      allOption.textContent = '全部标签（' + summary.total + '）';
+      tagSelect.appendChild(allOption);
+      (summary.tags || []).forEach(function(item) {
+        var option = document.createElement('option');
+        option.value = item.tag;
+        option.textContent = item.tag + '（' + item.count + '）';
+        tagSelect.appendChild(option);
+      });
+      var untaggedOption = document.createElement('option');
+      untaggedOption.value = '__untagged__';
+      untaggedOption.textContent = '未打标（' + summary.untagged + '）';
+      tagSelect.appendChild(untaggedOption);
+      // Re-select the active filter, inserting it if the summary lacks it.
+      syncTagSelect();
+      if (tagStatus) {
+        tagStatus.textContent = summary.total + ' 张 · ' +
+          (summary.tags || []).length + ' 个标签 · 未打标 ' + summary.untagged;
+      }
+    }).catch(function() {
+      if (tagStatus) tagStatus.textContent = '标签列表加载失败';
+    });
+  }
+  // One delegation point covers server-rendered and JS-built chips alike.
+  function chipFromEvent(event) {
+    var target = event.target;
+    var chip = target && target.closest ? target.closest('.tag-chip') : null;
+    return chip && grid.contains(chip) ? chip : null;
+  }
+  grid.addEventListener('click', function(event) {
+    var chip = chipFromEvent(event);
+    if (!chip) return;
+    event.preventDefault();
+    event.stopPropagation();
+    selectTag(chip.dataset.tag || chip.textContent.trim());
+  });
+  grid.addEventListener('keydown', function(event) {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    var chip = chipFromEvent(event);
+    if (!chip) return;
+    event.preventDefault();
+    selectTag(chip.dataset.tag || chip.textContent.trim());
+  });
+  if (tagSelect) {
+    tagSelect.addEventListener('change', function() {
+      applyTagFilter(tagSelect.value);
+    });
+  }
+  var initialSentinel = activeSentinel();
+  if (initialSentinel) observer.observe(initialSentinel);
+  loadTagOptions();
 })();
 var savedSectionState = null;
 function restoreSectionState() {
