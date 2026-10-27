@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 *.pyo
 .venv/
+**/.venv/
 venv/
 
 # Git
@@ -47,3 +48,8 @@ docker-compose.yml
 
 # F2 config (auto-generated at container start)
 conf/
+
+# Agent/analysis scratch (multi-GB; never bake into images)
+.probe/
+.codegraph/
+.mimocode/

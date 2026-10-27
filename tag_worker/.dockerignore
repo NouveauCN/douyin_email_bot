@@ -1,0 +1,6 @@
+# Local env and caches never belong in the image
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
