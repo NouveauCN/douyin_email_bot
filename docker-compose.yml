@@ -169,6 +169,47 @@ services:
       - npm_config_proxy=
       - npm_config_https_proxy=
 
+  tag_worker:
+    build:
+      context: ./tag_worker
+      args: *direct-network-build-args
+    container_name: douyin_tag_worker
+    restart: unless-stopped
+    volumes:
+      # Read-write: the worker writes only its own *.tags.json sidecars here.
+      - /srv/nas_data/comics:/app/comics:rw
+      # Hugging Face model cache (Qwen2.5-VL-3B + NSFW classifier).
+      - tag_models:/app/models
+    environment:
+      - COMICS_PICS_PATH=/app/comics/pics
+      - HF_HOME=/app/models
+      - TAG_WORKER_THREADS=4
+      - TAG_WORKER_NICE=15
+      - TAG_WORKER_SCAN_INTERVAL=60
+      - TAG_WORKER_ITEM_DELAY=1.0
+      - TZ=Asia/Shanghai
+      # All services and subprocesses must connect directly.
+      - HTTP_PROXY=
+      - HTTPS_PROXY=
+      - ALL_PROXY=
+      - FTP_PROXY=
+      - SOCKS_PROXY=
+      - http_proxy=
+      - https_proxy=
+      - all_proxy=
+      - ftp_proxy=
+      - socks_proxy=
+      - NO_PROXY=*
+      - no_proxy=*
+    deploy:
+      resources:
+        limits:
+          # fp32 Qwen2.5-VL-3B peaks around 13-14 GB; keep headroom. Compose
+          # v2 applies deploy limits outside Swarm (verify with docker inspect
+          # CpuQuota after deployment).
+          cpus: "4.0"
+          memory: 18g
+
 volumes:
   logs:
     driver: local
@@ -181,4 +222,6 @@ volumes:
   file_browser_cache:
     driver: local
   qq_gateway_state:
+    driver: local
+  tag_models:
     driver: local

@@ -97,7 +97,7 @@ class UploadFormTests(unittest.TestCase):
 
         self.assertIn("env(safe-area-inset-left)", page)
         self.assertIn("grid-template-columns: repeat(2, minmax(0, 1fr))", page)
-        self.assertIn(".card.landscape-card { grid-column: span 1; }", page)
+        self.assertIn(".card.landscape-card { grid-column: span 2; }", page)
         self.assertIn("@media (max-width:340px)", page)
         self.assertIn(".upload-form { display: grid;", page)
         self.assertIn(".browse-search { display: grid;", page)

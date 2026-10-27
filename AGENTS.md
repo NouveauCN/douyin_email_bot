@@ -8,7 +8,8 @@ This Python service polls IMAP for Douyin or Bilibili links, downloads media,
 and replies over SMTP. It also includes Firefox cookie acquisition, a QR login
 password-gated Web Login subtab in the trusted-LAN file browser on port 8081.
 An optional standalone Node.js QQ C2C gateway accepts links through an
-authenticated internal bridge.
+authenticated internal bridge. An optional CPU tag worker annotates comics
+gallery images with Chinese JSON sidecars.
 
 ```text
 main.py                 Bot entry point and order-sensitive F2 bootstrap
@@ -34,9 +35,10 @@ migrate_downloads.py    One-shot slideshow layout migration
 smoke_download.py       Live Douyin smoke download
 config.yaml             Non-secret runtime configuration
 Dockerfile              Python 3.12 image with FFmpeg, Playwright, and yutto
-docker-compose.yml      bot, file_browser, and optional QQ gateway services
+docker-compose.yml      bot, file_browser, optional QQ gateway, tag worker
 qq_gateway/              Node.js QQ C2C gateway (optional, single instance)
 qq_bridge.py             Authenticated internal bridge and QQ outbox HTTP API
+tag_worker/              Optional comics tag worker (CPU, *.tags.json sidecars)
 ```
 
 Main flow:
@@ -319,6 +321,63 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   then exit so Docker `restart: unless-stopped` starts the bot automatically.
   Interrupted long Bilibili work is recovered by SQLite lease expiry.
 
+### Tag worker (comics tagging)
+
+- `tag_worker/` is an optional single-instance CPU service that scans the
+  comics gallery (`COMICS_PICS_PATH`, default `/app/comics/pics`) and writes a
+  Chinese-tag sidecar next to each image as `<full filename>.tags.json` (for
+  example `a.jpg.tags.json`). The sidecar carries `version`, `source`,
+  `generated_at`, `status`, `model`, `nsfw` label/confidence, `description`,
+  and `tags`; writes are a dot-prefixed temp file plus `os.replace`, UTF-8,
+  `ensure_ascii=false`, indent 2.
+- Sidecars are invisible to the gallery, deduplication, thumbnail cache, and
+  viewer because every comics walk filters on `_IMAGE_EXTS`; `file_browser.py`
+  requires no change for this. The worker never modifies image bytes and never
+  creates a file it does not own, so it does not take `media_file_lock`: it
+  reads whole images through an opened file descriptor (an already-open fd
+  stays consistent on POSIX even if a concurrent delete removes the entry) and
+  only creates/deletes its own `*.tags.json`, which no media path observes.
+- CPU policy (load balance over speed): `os.nice` once at startup
+  (`TAG_WORKER_NICE`, default 15), `torch.set_num_threads` on both the NSFW and
+  VLM paths (`TAG_WORKER_THREADS`, default 4), strictly one image at a time in
+  one process, a per-image delay (`TAG_WORKER_ITEM_DELAY`, default 1.0 s), and
+  an idle scan interval (`TAG_WORKER_SCAN_INTERVAL`, default 60 s). Compose
+  additionally caps the container at 4 CPUs / 18 GB. Logs go to stdout: one
+  line per processed image plus a per-round summary; rounds are never
+  interrupted by an exception.
+- Models: `Falconsai/nsfw_image_detection`, then the resident fp32 CPU
+  `Qwen/Qwen2.5-VL-3B-Instruct` (loaded on first use, never reloaded). The
+  prompt asks for exactly `描述：<一句中文>` and `标签：<5-10个中文标签，用、分隔>`;
+  parsing tolerates swapped lines, inline markers, comma/顿号 separators, and
+  dirty output. When the NSFW label is `nsfw`, `nsfw` is inserted as the first
+  tag; an unusable classifier result is recorded conservatively as `nsfw` so
+  the sidecar still carries the tag. Unparseable VLM output yields `tags: []`
+  with a `status: ok` sidecar.
+- Retry policy: `status: ok` is skipped until the sidecar is deleted;
+  `status: failed` retries after a 30-minute cooldown up to `attempts: 3`, then
+  is skipped permanently. Unreadable images are logged and retried next round
+  without writing a sidecar. If the failure sidecar itself cannot be written,
+  an in-memory per-path counter enforces the same 3-attempt cap for the
+  process lifetime; it clears on restart or once a sidecar at that path
+  becomes readable again.
+- Orphan cleanup runs every round and deletes only worker-owned `*.tags.json`
+  files under the comics source whose source image is gone and whose own mtime
+  is over an hour old, after the same lexical+resolve validation used
+  elsewhere. Ownership is checked first: the JSON must match this worker's
+  schema (`version` plus `source`), so foreign `*.tags.json` files are never
+  deleted. Crash temporaries (`.<name>.tags.json.<uuid>.tmp`) older than an
+  hour are recycled under the same rules. Images, directories, `.media_locks`,
+  dot files, and anything outside the source are never touched.
+- Run exactly one instance (the same rule as `qq_gateway`): sidecars are
+  written atomically and an existing sidecar means "skip", so a second
+  instance would only duplicate work, not corrupt data.
+- Models persist in the `tag_models` volume (`HF_HOME=/app/models`); the first
+  start downloads both models into it (about 8 GB) over direct HTTPS.
+- Environment: `COMICS_PICS_PATH`, `HF_HOME`, `TAG_WORKER_NICE`,
+  `TAG_WORKER_THREADS`, `TAG_WORKER_SCAN_INTERVAL`, `TAG_WORKER_ITEM_DELAY`.
+  Start it explicitly with:
+  `sudo docker compose up -d --build tag_worker`
+
 ## Configuration And Paths
 
 For supported overrides, priority is:
@@ -448,7 +507,16 @@ sudo docker compose down
 - `file_browser` mounts `/srv/nas_data/comics` read-write at `/app/comics` so
   its upload control can write directly to the original comics source, and
   uses `COMICS_PICS_PATH=/app/comics/pics` for the in-site comics gallery.
-  The bot does not mount this source.
+  The bot does not mount this source. `tag_worker` mounts the same source
+  read-write at `/app/comics` but writes only its own `*.tags.json` sidecars.
+- `tag_worker` is an optional single-instance service built from `./tag_worker`
+  with no published host ports and no `depends_on`. Besides the comics bind it
+  owns the `tag_models` volume mounted at `/app/models` (`HF_HOME`) so the
+  Qwen2.5-VL-3B and NSFW weights survive rebuilds; it never receives
+  `config.yaml`, `.env`, the `state` volume, or the Docker socket. Its
+  `deploy.resources.limits` (4 CPUs, 18 GB) are honored by Compose v2 outside
+  Swarm; after deployment confirm with
+  `docker inspect --format '{{.HostConfig.CpuQuota}} {{.HostConfig.Memory}}' douyin_tag_worker`.
 - All services bind `config.yaml` read-only. The bot has a writable legacy
   `.env` bind for compatibility, while `file_browser` receives it read-only for
   bootstrap fallback and Compose injects `WEB_LOGIN_PASSWORD` explicitly.
@@ -460,9 +528,10 @@ sudo docker compose down
   `BOT_OUTBOX_*` values: these remain managed/YAML settings unless explicitly
   injected outside Compose.
 - The entire stack is direct-only: bot, file_browser (including login metadata
-  validation), and qq_gateway must clear upper/lowercase proxy variables and set
-  `NO_PROXY`/`no_proxy` to `*`. Compose build arguments also disable inherited
-  build proxies. Never reintroduce automatic proxy discovery in these services.
+  validation), qq_gateway, and tag_worker must clear upper/lowercase proxy
+  variables and set `NO_PROXY`/`no_proxy` to `*`. Compose build arguments also
+  disable inherited build proxies. Never reintroduce automatic proxy discovery
+  in these services.
 - F2 bootstrap enforces the direct environment before importing F2 and clears
   cached TokenManager proxies. Firefox launches explicitly set
   `network.proxy.type=0` with a sanitized child environment; yutto uses

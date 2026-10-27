@@ -1,6 +1,6 @@
 # Architecture Contract
 
-Last reviewed: 2026-09-15
+Last reviewed: 2026-10-27
 
 The service is a lightweight modular monolith for one private deployment.
 Platform downloaders and the QQ transport are isolated, while task state and
@@ -51,6 +51,9 @@ File Browser + embedded Web Login (separate Flask process)
     |                         |
     +--> runtime settings     +--> shared media tree
          (separate SQLite)
+
+Tag Worker (optional, CPU-only, single instance)
+    +--> comics source (rw): reads images, writes only <name>.tags.json
 ```
 
 The bot process owns `EmailBot`, service composition, startup/shutdown,
@@ -58,7 +61,11 @@ settings revision handling, the internal QQ bridge, and the durable SQLite
 connection.  `file_browser.py` owns browser routes and the embedded login
 controller; it may use the runtime-settings database but never the bot's mail
 state volume.  The optional Node gateway owns QQ SDK/session delivery state
-and communicates only through the authenticated bridge.  IMAP, SMTP, F2,
+and communicates only through the authenticated bridge.  The optional tag
+worker is a separate CPU-bound process that shares no state with the bot: it
+scans the comics source, runs its own models, and writes only its own
+`*.tags.json` sidecars, which every gallery/dedup/thumbnail/viewer walk
+ignores because those filter on the image-extension set.  IMAP, SMTP, F2,
 HTTPX, yutto, Playwright, and FFmpeg are provider/process edges, not domain
 dependencies of the task contracts.
 
@@ -216,6 +223,28 @@ not participate.  It also does not make a crop semantically mergeable with a
 concurrent delete; callers must surface a conflict and re-scan.  Until both
 processes use one shared lock implementation, the residual risk is a
 cross-process lost update even though individual writes are atomic.
+
+The optional `tag_worker` deliberately does not take this lock.  It never
+modifies media bytes: it reads each image once through an already-open file
+descriptor (POSIX keeps that read consistent even if a concurrent delete
+removes the directory entry) and creates or deletes only its own
+`*.tags.json` sidecars, which no gallery, dedup, thumbnail, or viewer path
+observes.  Acquiring the lock would therefore serialize against operations
+that cannot conflict with it.  The residual exposure is bounded: a sidecar may
+be written next to an image deleted in the same instant, and the worker's
+orphan cleanup removes such sidecars only after they are over an hour old.
+Sidecar writes remain atomic (temp file plus `os.replace`), so readers always
+observe a complete JSON document.
+
+The validation itself retains the same TOCTOU residual as the file-browser
+comics delete route: `safe_source_path()` resolves the candidate and the
+later `unlink`/`os.replace` runs without `dirfd`/`O_NOFOLLOW`, so a hostile
+process on the same host that swaps a parent directory for a symlink between
+check and use could redirect one sidecar deletion or write outside the
+source.  The worker narrows the window (single process, validated lexical
+paths, dot-temp names it alone creates) but does not close it; like the
+existing cross-process lock limitation, this residual is accepted for the
+personal single-user deployment threat model.
 
 ## Resolved and residual coupling
 
