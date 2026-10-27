@@ -29,7 +29,7 @@ config_loader.py        YAML/env configuration dataclasses
 cookie_extractor.py     Persistent Playwright Firefox cookie handling
 get_cookie.py           Interactive/headless cookie CLI
 web_login.py            Password-gated Flask QR login controller and local fallback
-file_browser.py         Flask browser, playlist, upload, dedup, and delete UI
+file_browser.py         Flask browser, playlist, upload, dedup, delete, comics tag gallery UI
 play.py                 Local shuffled MP4 player
 migrate_downloads.py    One-shot slideshow layout migration
 smoke_download.py       Live Douyin smoke download
@@ -332,11 +332,23 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   `ensure_ascii=false`, indent 2.
 - Sidecars are invisible to the gallery, deduplication, thumbnail cache, and
   viewer because every comics walk filters on `_IMAGE_EXTS`; `file_browser.py`
-  requires no change for this. The worker never modifies image bytes and never
+  never sees them through those walks and only reads them as explicit metadata
+  (see the next bullet). The worker never modifies image bytes and never
   creates a file it does not own, so it does not take `media_file_lock`: it
   reads whole images through an opened file descriptor (an already-open fd
   stays consistent on POSIX even if a concurrent delete removes the entry) and
   only creates/deletes its own `*.tags.json`, which no media path observes.
+- The gallery UI displays those sidecars read-only and lets users filter by
+  tag: `GET /api/comics` adds `tags`, `nsfw`, and `description` per image and
+  accepts an exact-match `?tag=` query (plus the `__untagged__` pseudo tag)
+  applied to the full list before pagination, while `GET /api/comics/tags`
+  returns counted tags with `untagged`/`nsfw`/`total` and a 30-second cache.
+  The inline UI renders clickable tag chips, a tag `<select>`, description
+  tooltips, and appends tags/descriptions to card search text. Sidecar paths
+  are always derived from already-collected gallery relpaths and never from
+  query input; missing, corrupt, or `status: failed` sidecars degrade to "no
+  tags" without failing a request, and `tag_worker` remains the only sidecar
+  writer.
 - CPU policy (load balance over speed): `os.nice` once at startup
   (`TAG_WORKER_NICE`, default 15), `torch.set_num_threads` on both the NSFW and
   VLM paths (`TAG_WORKER_THREADS`, default 4), strictly one image at a time in

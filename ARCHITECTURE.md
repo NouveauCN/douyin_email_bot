@@ -65,7 +65,12 @@ and communicates only through the authenticated bridge.  The optional tag
 worker is a separate CPU-bound process that shares no state with the bot: it
 scans the comics source, runs its own models, and writes only its own
 `*.tags.json` sidecars, which every gallery/dedup/thumbnail/viewer walk
-ignores because those filter on the image-extension set.  IMAP, SMTP, F2,
+ignores because those filter on the image-extension set.  The file browser
+additionally reads those sidecars read-only as tag metadata for gallery
+display, description tooltips, and exact-match `?tag=` filtering
+(`GET /api/comics`, `GET /api/comics/tags`, with a short summary cache); the
+sidecars stay invisible to every media walk, and the tag worker remains the
+only writer.  IMAP, SMTP, F2,
 HTTPX, yutto, Playwright, and FFmpeg are provider/process edges, not domain
 dependencies of the task contracts.
 
@@ -228,8 +233,10 @@ The optional `tag_worker` deliberately does not take this lock.  It never
 modifies media bytes: it reads each image once through an already-open file
 descriptor (POSIX keeps that read consistent even if a concurrent delete
 removes the directory entry) and creates or deletes only its own
-`*.tags.json` sidecars, which no gallery, dedup, thumbnail, or viewer path
-observes.  Acquiring the lock would therefore serialize against operations
+`*.tags.json` sidecars, which no gallery, dedup, thumbnail, or viewer walk
+observes; the gallery UI reads them only as inert tag metadata through its own
+read-only helper, never through a media path.  Acquiring the lock would
+therefore serialize against operations
 that cannot conflict with it.  The residual exposure is bounded: a sidecar may
 be written next to an image deleted in the same instant, and the worker's
 orphan cleanup removes such sidecars only after they are over an hour old.
