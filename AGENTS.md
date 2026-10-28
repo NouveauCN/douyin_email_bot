@@ -375,7 +375,10 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   sidecar came from the manual edit routes) per image and accepts an
   exact-match `?tag=` query (plus the `__untagged__` pseudo tag) applied to
   the full list before pagination, while `GET /api/comics/tags` returns
-  counted tags with `untagged`/`nsfw`/`total` and a 30-second cache. The
+  counted tags with `untagged`/`nsfw`/`total` and a 30-second cache; the two
+  verdict words are pinned to the top of that list (`sfw` first, `nsfw`
+  second, only when actually present) while all other tags keep the
+  count-descending, lexicographic-tiebreak order. The
   inline UI renders clickable tag chips with a tooltip of description plus
   `平均置信 NN%` when a confidence exists, paints an `nsfw` chip amber
   (`.tag-chip.nsfw-low`) with an `NSFW 判定不一致` tooltip note when the two
