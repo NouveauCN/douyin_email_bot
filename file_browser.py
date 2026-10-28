@@ -15,6 +15,7 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -71,7 +72,7 @@ _COMICS_SCAN_CACHE: tuple[str, float, list[dict]] | None = None
 # gallery summary is reused for a short TTL so neither endpoint rescans the
 # whole gallery on every request.
 _COMICS_SIDECAR_CACHE_LOCK = threading.RLock()
-_COMICS_SIDECAR_CACHE: dict[str, tuple[int, tuple[list[str], bool, str]]] = {}
+_COMICS_SIDECAR_CACHE: dict[str, tuple[int, tuple[list[str], bool, str, float | None, str | None]]] = {}
 _COMICS_TAGS_SUMMARY_TTL = 30.0
 _COMICS_TAGS_SUMMARY_LOCK = threading.RLock()
 _COMICS_TAGS_SUMMARY_CACHE: tuple[float, dict] | None = None
@@ -673,16 +674,40 @@ def _invalidate_comics_scan() -> None:
         _COMICS_TAGS_SUMMARY_CACHE = None
 
 
-def _parse_comics_sidecar(raw: bytes) -> tuple[list[str], bool, str]:
-    """Best-effort sidecar parse: (tags, nsfw, description), never raises."""
+def _parse_comics_sidecar(
+    raw: bytes,
+) -> tuple[list[str], bool, str, float | None, str | None]:
+    """Best-effort sidecar parse: (tags, nsfw, description, confidence, agreement).
+
+    Never raises and tolerates every schema version: v1 sidecars carry no
+    ``verification``/``nsfw.agreement`` blocks, so they report ``None`` for
+    the two confirmation fields while displaying exactly as before.
+    """
+    empty: tuple[list[str], bool, str, float | None, str | None] = (
+        [], False, "", None, None,
+    )
     try:
         data = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
-        return [], False, ""
+        return empty
     if not isinstance(data, dict):
-        return [], False, ""
+        return empty
     nsfw = data.get("nsfw")
-    is_nsfw = isinstance(nsfw, dict) and nsfw.get("label") == "nsfw"
+    nsfw_record = nsfw if isinstance(nsfw, dict) else {}
+    is_nsfw = nsfw_record.get("label") == "nsfw"
+    agreement = nsfw_record.get("agreement")
+    if agreement not in ("high", "low", "single"):
+        agreement = None
+    verification = data.get("verification")
+    confidence: float | None = None
+    if isinstance(verification, dict):
+        mean_score = verification.get("mean_score")
+        if (
+            not isinstance(mean_score, bool)
+            and isinstance(mean_score, (int, float))
+            and math.isfinite(float(mean_score))
+        ):
+            confidence = round(float(mean_score), 4)
     description = data.get("description")
     if not isinstance(description, str):
         description = ""
@@ -693,11 +718,35 @@ def _parse_comics_sidecar(raw: bytes) -> tuple[list[str], bool, str]:
         [tag for tag in tags_value if isinstance(tag, str)]
         if isinstance(tags_value, list) else []
     )
-    return tags, is_nsfw, description
+    return tags, is_nsfw, description, confidence, agreement
 
 
-def _read_comics_sidecar(relpath: str) -> tuple[list[str], bool, str]:
-    """Return (tags, nsfw, description) for one gallery image, never raising.
+def _comics_chip_title(
+    description: str,
+    confidence: float | None,
+    *,
+    nsfw_disputed: bool = False,
+) -> str:
+    """Tooltip body for a tag chip: description, confidence, dispute note.
+
+    Lines are appended only when they exist, so a v1 sidecar (no confidence)
+    keeps the plain description tooltip it always had. ``nsfw_disputed``
+    adds the \"two classifiers disagreed\" note used for the amber nsfw chip.
+    """
+    lines: list[str] = []
+    if description:
+        lines.append(description)
+    if confidence is not None:
+        lines.append(f"平均置信 {round(confidence * 100)}%")
+    if nsfw_disputed:
+        lines.append("NSFW 判定不一致")
+    return "\n".join(lines)
+
+
+def _read_comics_sidecar(
+    relpath: str,
+) -> tuple[list[str], bool, str, float | None, str | None]:
+    """Return (tags, nsfw, description, confidence, agreement), never raising.
 
     ``relpath`` comes from ``_collect_comics_images()`` (already resolved
     inside the comics root) and is only re-validated defensively here; the
@@ -705,10 +754,10 @@ def _read_comics_sidecar(relpath: str) -> tuple[list[str], bool, str]:
     input.  Results are cached per sidecar mtime under a lock.
     """
     if not isinstance(relpath, str) or not relpath:
-        return [], False, ""
+        return [], False, "", None, None
     parts = relpath.replace("\\", "/").split("/")
     if any(part in ("", ".", "..") for part in parts):
-        return [], False, ""
+        return [], False, "", None, None
     root = _COMICS_DIR.resolve()
     key = f"{root}\0{relpath}"
     sidecar = root / f"{relpath}.tags.json"
@@ -720,20 +769,20 @@ def _read_comics_sidecar(relpath: str) -> tuple[list[str], bool, str]:
         # Missing, vanished, or external sidecar: treat as untagged.
         with _COMICS_SIDECAR_CACHE_LOCK:
             _COMICS_SIDECAR_CACHE.pop(key, None)
-        return [], False, ""
+        return [], False, "", None, None
     with _COMICS_SIDECAR_CACHE_LOCK:
         cached = _COMICS_SIDECAR_CACHE.get(key)
         if cached is not None and cached[0] == mtime:
-            tags, is_nsfw, description = cached[1]
-            return list(tags), is_nsfw, description
+            tags, is_nsfw, description, confidence, agreement = cached[1]
+            return list(tags), is_nsfw, description, confidence, agreement
     try:
         raw = resolved.read_bytes()
     except OSError:
-        return [], False, ""
+        return [], False, "", None, None
     parsed = _parse_comics_sidecar(raw)
     with _COMICS_SIDECAR_CACHE_LOCK:
         _COMICS_SIDECAR_CACHE[key] = (mtime, parsed)
-    return list(parsed[0]), parsed[1], parsed[2]
+    return list(parsed[0]), parsed[1], parsed[2], parsed[3], parsed[4]
 
 
 def _copy_tag_summary(summary: dict) -> dict:
@@ -757,7 +806,7 @@ def _comics_tag_summary() -> dict:
     untagged = nsfw_total = 0
     images = _collect_comics_images()
     for image in images:
-        tags, is_nsfw, _ = _read_comics_sidecar(image["relpath"])
+        tags, is_nsfw, _, _, _ = _read_comics_sidecar(image["relpath"])
         if not tags:
             untagged += 1
         if is_nsfw:
@@ -1468,10 +1517,18 @@ def index():
     # Only the rendered first page reads sidecars (bounded work per request).
     comics_page = all_comics[:120]
     for image in comics_page:
-        tags, nsfw, description = _read_comics_sidecar(image["relpath"])
+        tags, nsfw, description, confidence, agreement = _read_comics_sidecar(
+            image["relpath"]
+        )
         image["tags"] = tags
         image["nsfw"] = nsfw
         image["description"] = description
+        image["confidence"] = confidence
+        image["agreement"] = agreement
+        image["chip_title"] = _comics_chip_title(description, confidence)
+        image["chip_title_nsfw"] = _comics_chip_title(
+            description, confidence, nsfw_disputed=agreement == "low"
+        )
     data["comics_images"] = comics_page
     data["comics_total"] = len(all_comics)
     data["empty"] = data["empty"] and not data["comics_images"]
@@ -1726,10 +1783,15 @@ def api_comics():
     # already had to touch the whole list to compute membership).
     page = images[offset:offset + limit]
     for image in page:
-        tags, nsfw, description = _read_comics_sidecar(image["relpath"])
+        tags, nsfw, description, confidence, agreement = _read_comics_sidecar(
+            image["relpath"]
+        )
         image["tags"] = tags
         image["nsfw"] = nsfw
         image["description"] = description
+        # v2 confirmation data: None on v1/missing sidecars.
+        image["confidence"] = confidence
+        image["agreement"] = agreement
         image["view_url"] = url_for("view_comics_image", filepath=image["relpath"])
         image["raw_url"] = url_for("raw_comics_file", filepath=image["relpath"])
         image["thumb_url"] = url_for("comics_thumbnail", filepath=image["relpath"])
@@ -2889,6 +2951,8 @@ INDEX_HTML = (
   }
   .tag-chip:hover { background:#e6e9ec; color:#333; }
   .tag-chip.nsfw { background:#fdecec; border-color:#f3b6b6; color:#c0392b; font-weight:600; }
+  /* Amber outline instead of plain red: the two NSFW classifiers disagreed. */
+  .tag-chip.nsfw-low { background:#fff6e3; border-color:#e0a53a; color:#9a6a05; box-shadow:0 0 0 1px #e0a53a inset; font-weight:600; }
   .top-tabs { display:flex; gap:8px; margin:0 0 22px; }
   .top-tab { border:1px solid #ddd; border-radius:8px; padding:8px 18px; background:#fff; color:#777; cursor:pointer; font-size:13px; }
   .top-tab.active { background:#fe2c55; border-color:#fe2c55; color:#fff; }
@@ -3087,7 +3151,7 @@ INDEX_HTML = (
         <img class="card-thumb" src="{{ url_for('comics_thumbnail', filepath=c.relpath) }}" loading="lazy" alt="" width="180" height="320">
         <div class="vname"{% if c.description %} title="{{ c.description|e }}"{% endif %}>{{ c.name }}</div>
         {% if c.tags %}
-        <div class="tag-chips">{% for t in c.tags %}<span class="tag-chip{% if t == 'nsfw' %} nsfw{% endif %}" data-tag="{{ t|e }}" role="button" tabindex="0">{{ t }}</span>{% endfor %}</div>
+        <div class="tag-chips">{% for t in c.tags %}{% set chip_title = c.chip_title_nsfw if t == 'nsfw' else c.chip_title %}<span class="tag-chip{% if t == 'nsfw' %} nsfw{% if c.agreement == 'low' %} nsfw-low{% endif %}{% endif %}" data-tag="{{ t|e }}" role="button" tabindex="0"{% if chip_title %} title="{{ chip_title|e }}"{% endif %}>{{ t }}</span>{% endfor %}</div>
         {% endif %}
         <div class="meta" style="margin-top:4px">
           <span class="stat">{{ c.relpath }}</span>
@@ -3429,11 +3493,24 @@ if (searchClear) searchClear.addEventListener('click', function() {
     var chipsBox = card.querySelector('.tag-chips');
     tags.forEach(function(tag) {
       var chip = document.createElement('span');
-      chip.className = 'tag-chip' + (tag === 'nsfw' ? ' nsfw' : '');
+      var disputedNsfw = tag === 'nsfw' && image.agreement === 'low';
+      chip.className = 'tag-chip' + (tag === 'nsfw' ? ' nsfw' : '') +
+        (disputedNsfw ? ' nsfw-low' : '');
       chip.dataset.tag = tag;
       chip.setAttribute('role', 'button');
       chip.setAttribute('tabindex', '0');
       chip.textContent = tag;
+      // Tooltip: description, then the CLIP confirmation line when the
+      // sidecar carries one, then the dispute note for an nsfw disagreement.
+      var lines = [];
+      if (image.description) lines.push(image.description);
+      if (image.confidence !== null && image.confidence !== undefined) {
+        lines.push('平均置信 ' + Math.round(image.confidence * 100) + '%');
+      }
+      if (disputedNsfw) lines.push('NSFW 判定不一致');
+      // The Python string layer eats a bare backslash, so the JS newline
+      // escape is written doubled: lines.join('\\n').
+      if (lines.length) chip.title = lines.join('\\n');
       chipsBox.appendChild(chip);
     });
     if (!tags.length) chipsBox.remove();

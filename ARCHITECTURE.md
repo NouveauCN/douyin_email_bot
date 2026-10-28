@@ -63,11 +63,24 @@ controller; it may use the runtime-settings database but never the bot's mail
 state volume.  The optional Node gateway owns QQ SDK/session delivery state
 and communicates only through the authenticated bridge.  The optional tag
 worker is a separate CPU-bound process that shares no state with the bot: it
-scans the comics source, runs its own models, and writes only its own
-`*.tags.json` sidecars, which every gallery/dedup/thumbnail/viewer walk
-ignores because those filter on the image-extension set.  The file browser
+scans the comics source and writes only its own `*.tags.json` sidecars, which
+every gallery/dedup/thumbnail/viewer walk ignores because those filter on the
+image-extension set.  Its per-image pipeline is **tag -> CLIP confidence
+confirmation -> threshold partition**: two NSFW classifiers (Falconsai plus a
+second ViT) are cross-checked into one `nsfw` record with an `agreement`
+level, Qwen2.5-VL produces the Chinese description and candidate tags, a
+Chinese-CLIP scorer gives each candidate tag an image/text similarity, and
+only tags at or above `TAG_WORKER_CLIP_THRESHOLD` stay in `tags` while the
+rest are archived in `dropped_tags` with every score in `tag_scores`
+(sidecar `version 2`).  The worker runs in sessions: a cheap round only
+stats sidecars, one session lazily loads the models, drains the pending set,
+and unloads them again, so no model stays resident between rounds or during
+the MAA maintenance windows (`TAG_WORKER_MAINT_WINDOWS`); existing `version
+1` sidecars are upgraded in place by the verification-only path (no Qwen
+call) and are never overwritten when that path fails.  The file browser
 additionally reads those sidecars read-only as tag metadata for gallery
-display, description tooltips, and exact-match `?tag=` filtering
+display, description tooltips with the mean confidence, the disputed-NSFW
+chip styling, and exact-match `?tag=` filtering
 (`GET /api/comics`, `GET /api/comics/tags`, with a short summary cache); the
 sidecars stay invisible to every media walk, and the tag worker remains the
 only writer.  IMAP, SMTP, F2,
