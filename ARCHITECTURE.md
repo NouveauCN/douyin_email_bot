@@ -50,7 +50,8 @@ QQ Gateway (Node) --authenticated HTTP--> QQ bridge (bot process)
 File Browser + embedded Web Login (separate Flask process)
     |                         |
     +--> runtime settings     +--> shared media tree
-         (separate SQLite)
+         (separate SQLite)    +--> comics source (rw): reads images and tags,
+                                  manual tag-edit routes write <name>.tags.json
 
 Tag Worker (optional, CPU-only, single instance)
     +--> comics source (rw): reads images, writes only <name>.tags.json
@@ -78,12 +79,21 @@ and unloads them again, so no model stays resident between rounds or during
 the MAA maintenance windows (`TAG_WORKER_MAINT_WINDOWS`); existing `version
 1` sidecars are upgraded in place by the verification-only path (no Qwen
 call) and are never overwritten when that path fails.  The file browser
-additionally reads those sidecars read-only as tag metadata for gallery
-display, description tooltips with the mean confidence, the disputed-NSFW
-chip styling, and exact-match `?tag=` filtering
-(`GET /api/comics`, `GET /api/comics/tags`, with a short summary cache); the
-sidecars stay invisible to every media walk, and the tag worker remains the
-only writer.  IMAP, SMTP, F2,
+reads those sidecars as tag metadata for gallery display, description
+tooltips with the mean confidence, the disputed-NSFW chip styling, and
+exact-match `?tag=` filtering (`GET /api/comics`, `GET /api/comics/tags`,
+with a short summary cache), and it may rewrite one through the manual
+tag-edit routes `POST /api/comics/tags/update` (read-modify-write of
+`tags` plus `manual`/`manual_edited_at` markers, atomically, same
+dot-temp + `os.replace` convention) and `POST /api/comics/tags/reset`
+(sidecar deletion so the worker regenerates).  Sidecar writing is
+therefore a **dual-write protocol**: the worker writes everything it
+generates, the browser writes only through those two routes with
+`manual: true`, and the worker treats any `manual` document as read-only
+(no v1 upgrade, no threshold re-cut, no failed retry; the flag is re-read
+from disk on every decision) while its orphan cleanup still owns such
+files because ownership stays "known version + source".  The sidecars
+stay invisible to every media walk.  IMAP, SMTP, F2,
 HTTPX, yutto, Playwright, and FFmpeg are provider/process edges, not domain
 dependencies of the task contracts.
 
@@ -248,13 +258,43 @@ descriptor (POSIX keeps that read consistent even if a concurrent delete
 removes the directory entry) and creates or deletes only its own
 `*.tags.json` sidecars, which no gallery, dedup, thumbnail, or viewer walk
 observes; the gallery UI reads them only as inert tag metadata through its own
-read-only helper, never through a media path.  Acquiring the lock would
+helper, never through a media path, and rewrites one only through the manual
+tag-edit routes.  Acquiring the lock would
 therefore serialize against operations
 that cannot conflict with it.  The residual exposure is bounded: a sidecar may
 be written next to an image deleted in the same instant, and the worker's
 orphan cleanup removes such sidecars only after they are over an hour old.
 Sidecar writes remain atomic (temp file plus `os.replace`), so readers always
 observe a complete JSON document.
+
+Sidecar *content* is governed by the dual-write protocol rather than a lock.
+The worker re-reads the sidecar from disk on every decision and skips any
+document flagged `manual: true` (no v1 upgrade, no threshold re-cut, no
+failed retry); the browser's `POST /api/comics/tags/update` performs a
+read-modify-write against the bytes on disk at request time — never a
+client-supplied snapshot — changing only `tags` plus `manual`/
+`manual_edited_at`.  Both writers are atomic but mutually unaware, so a
+concurrent worker write and manual save on the same image are
+last-writer-wins on the whole file: normally the browser carries the
+worker's other fields over unchanged, but in the rare window where the
+worker replaces the file between the browser's read and its `os.replace`,
+one side's document is lost outright.  There are two such windows.  The
+browser's is the read-to-replace span of one request (milliseconds).  The
+worker's is far wider: it spans the `process_action` disk read, the whole
+inference run for that image (Qwen plus both NSFW classifiers plus CLIP
+scoring — seconds to minutes), and the final write, so a manual save made
+in the middle of that run is silently overwritten when the worker
+finishes.  The UI reports that save as successful, and after a refresh the
+「已手动」 badge and the edited tags are gone with it, because the surviving
+document is the worker's.  This is a known, accepted window rather than a
+bug: if the worker wins, the manual flag disappears with it and the image
+returns to automatic processing; if the browser wins, the worker keeps
+skipping it.  It is not locked (a lock would serialize the entire tagging
+pipeline against a single-user gallery edit), the outcome is stable and
+visible in the gallery, and the user can simply re-apply the edit —
+consistent with the cross-process lock limitation above.  Neither writer
+takes `media_file_lock` because both only ever replace `*.tags.json`,
+which no media path observes.
 
 The validation itself retains the same TOCTOU residual as the file-browser
 comics delete route: `safe_source_path()` resolves the candidate and the

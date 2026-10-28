@@ -1666,5 +1666,193 @@ class AliasLabelTests(unittest.TestCase):
         self.assertEqual(record["label"], "normal")
 
 
+class ManualSidecarTests(unittest.TestCase):
+    """Dual-write protocol: ``manual: true`` sidecars are read-only here.
+
+    The flag is re-read from disk on every decision, so it must block the
+    v1 verification upgrade, the threshold re-cut, and failed-sidecar
+    retries alike -- while orphan cleanup (ownership = known version +
+    source) keeps treating these files as worker-owned.
+    """
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.addCleanup(worker._upgrade_failures.clear)
+        self.addCleanup(worker._write_failures.clear)
+        self.root = Path(self.tempdir.name)
+        self.image = self.root / "img.jpg"
+        self.image.write_bytes(_FAKE_IMAGE)
+        self.sidecar_path = sidecar.sidecar_path_for(self.image)
+
+    @staticmethod
+    def _v2(threshold=0.25):
+        return sidecar.build_success_payload(
+            "img.jpg",
+            {
+                "nsfw": {"label": "normal", "confidence": 0.9,
+                         "agreement": "high",
+                         "models": {"primary": {"label": "normal",
+                                                "confidence": 0.9},
+                                    "secondary": {"label": "normal",
+                                                  "confidence": 0.8}}},
+                "description": "描述",
+                "tags": ["动漫"],
+                "tag_scores": {"动漫": 0.41, "浴袍": 0.2},
+                "dropped_tags": ["浴袍"],
+                "verification": {"model": inference.CLIP_MODEL,
+                                 "threshold": threshold,
+                                 "mean_score": 0.305, "min_score": 0.2},
+            },
+            inference.VLM_MODEL,
+        )
+
+    @staticmethod
+    def _v1():
+        return {
+            "version": 1,
+            "source": "img.jpg",
+            "generated_at": "2026-10-27T10:00:00+08:00",
+            "status": "ok",
+            "model": "Qwen/Qwen2.5-VL-3B-Instruct",
+            "nsfw": {"label": "normal", "confidence": 0.9},
+            "description": "一位少女",
+            "tags": ["动漫", "浴袍"],
+        }
+
+    def _write(self, payload):
+        sidecar.atomic_write_json(self.sidecar_path, payload)
+
+    def _bytes(self):
+        return self.sidecar_path.read_bytes()
+
+    def test_manual_v2_blocks_the_threshold_recut(self):
+        # Core regression: complete tag_scores at a stale threshold would
+        # normally re-cut tags from disk scores -- manual must win first.
+        payload = self._v2(threshold=0.25)
+        payload["manual"] = True
+        self._write(payload)
+        original = self._bytes()
+        self.assertTrue(sidecar.repartition_needed(payload, 0.4))
+
+        self.assertEqual(
+            sidecar.process_action(self.sidecar_path, threshold=0.4),
+            sidecar.ACTION_SKIP,
+        )
+        self.assertFalse(
+            sidecar.should_process(self.sidecar_path, threshold=0.4)
+        )
+        with patch.object(inference, "tag_image") as qwen, \
+                patch.object(inference, "verify_image") as verify, \
+                patch.object(inference, "unload_models") as unload:
+            status = worker.process_one(self.image, threads=1, threshold=0.4)
+            stats = worker.run_once(
+                self.root, threads=1, item_delay=0, threshold=0.4
+            )
+
+        self.assertEqual(status, "skipped")
+        qwen.assert_not_called()
+        verify.assert_not_called()
+        unload.assert_not_called()  # no session is started for it
+        self.assertEqual(stats["repartitioned"], 0)
+        self.assertEqual(stats["skipped"], 1)
+        self.assertEqual(self._bytes(), original)
+
+    def test_manual_v1_is_never_upgraded(self):
+        payload = self._v1()
+        payload["manual"] = True
+        self._write(payload)
+        original = self._bytes()
+
+        self.assertEqual(
+            sidecar.process_action(self.sidecar_path, threshold=0.25),
+            sidecar.ACTION_SKIP,
+        )
+        with patch.object(inference, "tag_image") as qwen, \
+                patch.object(inference, "verify_image") as verify:
+            status = worker.process_one(self.image, threads=1, threshold=0.25)
+
+        self.assertEqual(status, "skipped")
+        verify.assert_not_called()
+        qwen.assert_not_called()
+        self.assertEqual(self._bytes(), original)
+
+    def test_manual_failed_sidecar_is_not_retried(self):
+        self._write({
+            "version": 2,
+            "source": "img.jpg",
+            "generated_at": "2026-10-27T10:00:00+08:00",
+            "status": "failed",
+            "attempts": 1,
+            "error": "boom",
+            "manual": True,
+        })
+        # Age it far beyond the 30-minute cooldown: without the manual flag
+        # this would be retried (even with retry_policy=False).
+        stamp = time.time() - 31 * 60
+        os.utime(self.sidecar_path, (stamp, stamp))
+        original = self._bytes()
+
+        self.assertEqual(
+            sidecar.process_action(self.sidecar_path, retry_policy=True),
+            sidecar.ACTION_SKIP,
+        )
+        self.assertEqual(
+            sidecar.process_action(self.sidecar_path, retry_policy=False),
+            sidecar.ACTION_SKIP,
+        )
+        self.assertFalse(sidecar.should_process(self.sidecar_path))
+        with patch.object(inference, "tag_image") as qwen:
+            status = worker.process_one(self.image, threads=1)
+
+        self.assertEqual(status, "skipped")
+        qwen.assert_not_called()
+        self.assertEqual(self._bytes(), original)
+
+    def test_manual_flag_is_reread_from_disk_on_every_decision(self):
+        payload = self._v2(threshold=0.25)
+        self._write(payload)
+        self.assertEqual(
+            sidecar.process_action(self.sidecar_path, threshold=0.4),
+            sidecar.ACTION_REPARTITION,
+        )
+
+        payload["manual"] = True
+        self._write(payload)
+        self.assertEqual(
+            sidecar.process_action(self.sidecar_path, threshold=0.4),
+            sidecar.ACTION_SKIP,
+        )
+
+        # Explicit false behaves exactly like an absent flag.
+        payload["manual"] = False
+        self._write(payload)
+        self.assertEqual(
+            sidecar.process_action(self.sidecar_path, threshold=0.4),
+            sidecar.ACTION_REPARTITION,
+        )
+
+    def test_manual_orphan_is_cleaned_while_a_live_manual_image_is_kept(self):
+        payload = self._v2()
+        payload["manual"] = True
+        self._write(payload)  # image still exists: never cleaned
+
+        orphan = self.root / "gone.jpg.tags.json"
+        orphan.write_text(
+            json.dumps({"version": 2, "source": "gone.jpg", "status": "ok",
+                        "tags": ["动漫"], "manual": True},
+                       ensure_ascii=False),
+            encoding="utf-8",
+        )
+        stamp = time.time() - 2 * 60 * 60
+        os.utime(orphan, (stamp, stamp))
+
+        removed = worker.cleanup_orphans(self.root)
+
+        self.assertEqual(removed, 1)  # manual does not change ownership
+        self.assertFalse(orphan.exists())
+        self.assertTrue(self.sidecar_path.exists())
+
+
 if __name__ == "__main__":
     unittest.main()
