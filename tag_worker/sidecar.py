@@ -37,7 +37,10 @@ MAX_TAG_CHARS = 16
 # v1: Qwen description/tags plus one NSFW label.
 # v2: adds CLIP confidence confirmation (``tag_scores``/``dropped_tags``/
 # ``verification``) and dual-NSFW cross-validation (``nsfw.agreement`` and
-# ``nsfw.models``). Both versions are worker-owned; nothing else is.
+# ``nsfw.models``). Both versions are worker-owned by default; the one
+# exception is the file browser's manual tag-edit routes, which write the
+# same schema with ``manual: true`` and are then treated as read-only here
+# (except that orphan cleanup still owns them: known version + source).
 SIDECAR_VERSION = 2
 KNOWN_SIDECAR_VERSIONS = frozenset({1, SIDECAR_VERSION})
 
@@ -179,6 +182,8 @@ def is_worker_sidecar(state: Any) -> bool:
     Ownership is a known-version check, not "matches the current version":
     a v1 sidecar is still ours (it just needs the verification upgrade), so
     orphan cleanup may delete it, while any other ``version`` is foreign.
+    Manually edited sidecars (``manual: true``) keep the same version and
+    source fields, so cleanup still owns them after their image is gone.
     """
     if not isinstance(state, dict):
         return False
@@ -240,12 +245,20 @@ def process_action(
 ) -> str:
     """Classify what one image still needs: tag/verify/repartition/skip.
 
+    - ``manual: true`` sidecar -> ``skip`` (dual-write protocol: the file
+      browser's manual tag edit wins over every worker path)
     - missing or corrupt sidecar -> ``tag`` (full pipeline)
     - ``status: ok`` at version 1 -> ``verify`` (CLIP + dual-NSFW upgrade,
       the Qwen description/tags are kept as written)
     - ``status: ok`` at version 2 -> ``repartition`` when the recorded
       threshold differs from the current one, otherwise ``skip``
     - ``status: failed`` -> the unchanged cooldown/attempt policy
+
+    The ``manual`` flag is re-read from disk on every call (this function
+    never caches a sidecar), so an edit lands for the very next decision.
+    It blocks the v1 upgrade, the threshold re-cut, and failed-sidecar
+    retries alike; orphan cleanup is unaffected because ownership is still
+    a known ``version`` plus ``source``.
 
     ``retry_policy=False`` keeps the ok-sidecar decisions but always allows
     a failed image through: the round-level scan applies the cooldown, while
@@ -257,6 +270,12 @@ def process_action(
     state = read_sidecar(sidecar_path)
     if state is None:
         return ACTION_TAG  # corrupt or undecodable -> rewrite
+    if state.get("manual"):
+        # Dual-write protocol: a human edited this sidecar through the
+        # gallery's manual tag routes, so it is read-only for the worker --
+        # checked before status/version so it also overrides a failed
+        # retry and a complete-score re-cut at a changed threshold.
+        return ACTION_SKIP
     status = state.get("status")
     if status == "ok":
         version = state.get("version")

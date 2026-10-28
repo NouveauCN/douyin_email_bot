@@ -199,10 +199,13 @@ def cleanup_orphans(root: Path, now: float | None = None) -> int:
     Only ``*.tags.json`` files inside the comics source are considered, and
     only when the JSON matches this worker's schema (a known ``version`` plus
     ``source`` -- v1 and v2 are both ours, any other version is foreign), so
-    foreign ``*.tags.json`` files are never deleted. Images, directories,
-    ``.media_locks``, dot files, and anything outside the source are never
-    touched. The path goes through the same lexical+resolve validation as
-    every other worker path.
+    foreign ``*.tags.json`` files are never deleted. This ownership rule is
+    deliberately independent of the ``manual: true`` flag: a manually edited
+    sidecar is read-only for tagging/upgrades/retries, but once its image is
+    gone it is cleaned like any other worker-owned sidecar. Images,
+    directories, ``.media_locks``, dot files, and anything outside the source
+    are never touched. The path goes through the same lexical+resolve
+    validation as every other worker path.
     """
     root = Path(root)
     if not root.is_dir():

@@ -104,7 +104,12 @@ sufficient.
   directories, and paths outside the source must be rejected. Empty parent
   directories may be cleaned up afterward. Comics deduplication is allowed only
   for strictly validated paths within the comics source and must remain scoped
-  to the comics namespace; comics crop operations remain disallowed.
+  to the comics namespace; comics crop operations remain disallowed. Manual
+  comics tag edits (`POST /api/comics/tags/update`) and tag resets
+  (`POST /api/comics/tags/reset`) accept one validated image relpath only —
+  never absolute paths, `..` segments, directories, the source root,
+  `.media_locks`, symlink entries, or non-image suffixes — and they write or
+  delete only that image's sidecar, never the image itself.
 
 ## F2 Bootstrap Invariant
 
@@ -345,7 +350,11 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   - `verification` — `{model, threshold, mean_score, min_score}` recording
     the Chinese-CLIP model and the threshold used for this sidecar.
   `status: failed` sidecars keep the same `version`, `attempts`, and
-  `error` fields as before.
+  `error` fields as before. A manual edit adds `manual: true` and
+  `manual_edited_at` (ISO timestamp) to the document it rewrites; an image
+  with no sidecar yet gets a minimal `version 2` document (`model: "manual"`,
+  `description: ""`, no `nsfw`/`verification`/`tag_scores` blocks), which the
+  API reports as `confidence: null`/`agreement: null`.
 - Sidecars are invisible to the gallery, deduplication, thumbnail cache, and
   viewer because every comics walk filters on `_IMAGE_EXTS`; `file_browser.py`
   never sees them through those walks and only reads them as explicit metadata
@@ -354,10 +363,11 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   reads whole images through an opened file descriptor (an already-open fd
   stays consistent on POSIX even if a concurrent delete removes the entry) and
   only creates/deletes its own `*.tags.json`, which no media path observes.
-- The gallery UI displays those sidecars read-only and lets users filter by
-  tag: `GET /api/comics` adds `tags`, `nsfw`, `description`, `confidence`
-  (the v2 `verification.mean_score`, `null` on v1/missing sidecars), and
-  `agreement` (`high`/`low`/`single`/`null`) per image and accepts an
+- The gallery UI displays those sidecars and lets users filter by tag:
+  `GET /api/comics` adds `tags`, `nsfw`, `description`, `confidence`
+  (the v2 `verification.mean_score`, `null` on v1/missing sidecars),
+  `agreement` (`high`/`low`/`single`/`null`), and `manual` (whether the
+  sidecar came from the manual edit routes) per image and accepts an
   exact-match `?tag=` query (plus the `__untagged__` pseudo tag) applied to
   the full list before pagination, while `GET /api/comics/tags` returns
   counted tags with `untagged`/`nsfw`/`total` and a 30-second cache. The
@@ -368,8 +378,46 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   Dropped (below-threshold) tags are never shown or counted. Sidecar paths
   are always derived from already-collected gallery relpaths and never from
   query input; missing, corrupt, or `status: failed` sidecars degrade to "no
-  tags" without failing a request, and `tag_worker` remains the only sidecar
-  writer.
+  tags" without failing a request. Sidecar writing is a **dual-write
+  protocol**: `tag_worker` writes every sidecar it generates, while
+  `file_browser` writes only through the manual tag-edit routes below and
+  always flags its documents `manual: true`; the worker re-reads that flag
+  from disk on every decision and treats a manual sidecar as read-only (no
+  v1 upgrade, no threshold re-cut, no failed retry), while its orphan
+  cleanup still owns those files because ownership remains known version +
+  source.
+- Manual tag editing (the `file_browser` half of the dual-write protocol):
+  `POST /api/comics/tags/update` takes `{path, tags}` for exactly one
+  validated comics image — the same lexical+resolve checks as the comics
+  delete route, additionally rejecting absolute paths, `..` segments,
+  directories, the source root, `.media_locks`, symlink entries, and
+  non-`_IMAGE_EXTS` suffixes — and rewrites that image's sidecar atomically
+  (dot-prefixed temp + `os.replace`, UTF-8, `ensure_ascii=false`, `indent=2`)
+  as a read-modify-write against the bytes on disk at request time (never a
+  client-supplied snapshot): only `tags`, `manual`, and `manual_edited_at`
+  change, everything else (`description`/`nsfw`/`tag_scores`/`verification`/
+  …) is carried over, and a `status: failed` document is promoted to `ok` so
+  the edited tags actually render. Tags are stripped, de-duplicated in order,
+  capped at 12 entries of at most 32 characters, and any violation returns
+  `400` with a message without touching the disk; success returns
+  `{success, tags, manual}` and invalidates the gallery scan + tag-summary
+  caches. An image with no sidecar gets the minimal `version 2` document
+  described above. `POST /api/comics/tags/reset` takes `{path}`, deletes that
+  sidecar (idempotent when it is already absent), and returns `{success}` —
+  the gallery's 「恢复自动标签」 action, after which the worker regenerates
+  tags on a later round. Path-validation, tag-bound, and write failures from
+  both routes are JSON errors that never leak absolute paths (the pre-existing
+  global same-origin `before_request` check still answers with the app's HTML
+  error page, unchanged). The inline UI opens an editor modal from the card's ✎
+  button (chips with remove, add input, 保存/取消, reset behind a confirm
+  that says the tags will be regenerated in the background) and marks edited
+  images with a 「已手动」 badge driven by the `manual` field; all dynamic
+  text goes through `textContent`/DOM properties only. Concurrent worker
+  writes and manual edits are last-writer-wins on the whole file; both
+  lost-update windows — the browser's read-to-replace span and the worker's
+  read → full inference → write-back span, where a manual save made mid-
+  inference is silently overwritten after a success response — are
+  documented in `ARCHITECTURE.md`.
 - CPU policy (load balance over speed): `os.nice` once at startup
   (`TAG_WORKER_NICE`, default 15), `torch.set_num_threads` on both the NSFW and
   VLM paths (`TAG_WORKER_THREADS`, default 4), strictly one image at a time in
@@ -416,7 +464,9 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   optional: its load/inference failure only downgrades the record to
   `single` and never fails a first-round tagging run; an unusable primary
   result is still recorded conservatively as `nsfw`.
-- Retry policy: `status: ok` is skipped until the sidecar is deleted;
+- Retry policy: `status: ok` is skipped until the sidecar is deleted (and
+  any `manual: true` sidecar is skipped regardless of status or version —
+  the flag is re-read from disk on every decision);
   `status: failed` retries after a 30-minute cooldown up to `attempts: 3`, then
   is skipped permanently. Unreadable images are logged and retried next round
   without writing a sidecar. If the failure sidecar itself cannot be written,
@@ -611,7 +661,8 @@ sudo docker compose down
   configuration, not the bot's state volume, and never holds credentials.
 - Bot and `file_browser` bind the host NAS root to `/app/downloads`.
 - `file_browser` mounts `/srv/nas_data/comics` read-write at `/app/comics` so
-  its upload control can write directly to the original comics source, and
+  its upload control can write directly to the original comics source and its
+  manual tag-edit routes can rewrite gallery sidecars, and
   uses `COMICS_PICS_PATH=/app/comics/pics` for the in-site comics gallery.
   The bot does not mount this source. `tag_worker` mounts the same source
   read-write at `/app/comics` but writes only its own `*.tags.json` sidecars.

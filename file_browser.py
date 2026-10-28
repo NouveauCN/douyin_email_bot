@@ -40,6 +40,7 @@ from flask import (
     send_from_directory,
     url_for,
 )
+from werkzeug.exceptions import HTTPException
 
 # ── Bootstrap ────────────────────────────────────────────────────────
 _PROJECT_DIR = Path(__file__).parent
@@ -67,12 +68,14 @@ _COMICS_THUMB_MAX_BYTES = 2 * 1024**3
 _COMICS_SCAN_TTL = 5.0
 _COMICS_SCAN_LOCK = threading.RLock()
 _COMICS_SCAN_CACHE: tuple[str, float, list[dict]] | None = None
-# Tag sidecars are read-only inputs owned by tag_worker.  Per-file results are
-# keyed by sidecar mtime (unchanged files cost one stat), and the aggregated
-# gallery summary is reused for a short TTL so neither endpoint rescans the
-# whole gallery on every request.
+# Tag sidecars are dual-written (tag_worker, plus this app's manual edit
+# routes).  Per-file results are keyed by sidecar mtime (unchanged files
+# cost one stat), and the aggregated gallery summary is reused for a short
+# TTL so neither endpoint rescans the whole gallery on every request.
 _COMICS_SIDECAR_CACHE_LOCK = threading.RLock()
-_COMICS_SIDECAR_CACHE: dict[str, tuple[int, tuple[list[str], bool, str, float | None, str | None]]] = {}
+_COMICS_SIDECAR_CACHE: dict[
+    str, tuple[int, tuple[list[str], bool, str, float | None, str | None, bool]]
+] = {}
 _COMICS_TAGS_SUMMARY_TTL = 30.0
 _COMICS_TAGS_SUMMARY_LOCK = threading.RLock()
 _COMICS_TAGS_SUMMARY_CACHE: tuple[float, dict] | None = None
@@ -672,19 +675,30 @@ def _invalidate_comics_scan() -> None:
         _COMICS_SCAN_CACHE = None
     with _COMICS_TAGS_SUMMARY_LOCK:
         _COMICS_TAGS_SUMMARY_CACHE = None
+    # The sidecar parse cache is mtime-keyed with no TTL, so a coarse mount
+    # clock can report the same mtime_ns for a same-second rewrite; dropping
+    # it here keeps card tags/manual flags consistent with the summary that
+    # this call just invalidated.  Every lock is taken strictly one at a
+    # time (never nested): no path holds one of these three locks while
+    # acquiring another, so this cannot deadlock.
+    with _COMICS_SIDECAR_CACHE_LOCK:
+        _COMICS_SIDECAR_CACHE.clear()
 
 
 def _parse_comics_sidecar(
     raw: bytes,
-) -> tuple[list[str], bool, str, float | None, str | None]:
-    """Best-effort sidecar parse: (tags, nsfw, description, confidence, agreement).
+) -> tuple[list[str], bool, str, float | None, str | None, bool]:
+    """Best-effort sidecar parse: (tags, nsfw, description, confidence,
+    agreement, manual).
 
     Never raises and tolerates every schema version: v1 sidecars carry no
     ``verification``/``nsfw.agreement`` blocks, so they report ``None`` for
-    the two confirmation fields while displaying exactly as before.
+    the two confirmation fields while displaying exactly as before. The
+    ``manual`` flag marks sidecars written by the gallery's manual tag-edit
+    routes (absent/false everywhere else).
     """
-    empty: tuple[list[str], bool, str, float | None, str | None] = (
-        [], False, "", None, None,
+    empty: tuple[list[str], bool, str, float | None, str | None, bool] = (
+        [], False, "", None, None, False,
     )
     try:
         data = json.loads(raw.decode("utf-8"))
@@ -718,7 +732,9 @@ def _parse_comics_sidecar(
         [tag for tag in tags_value if isinstance(tag, str)]
         if isinstance(tags_value, list) else []
     )
-    return tags, is_nsfw, description, confidence, agreement
+    return tags, is_nsfw, description, confidence, agreement, bool(
+        data.get("manual")
+    )
 
 
 def _comics_chip_title(
@@ -745,8 +761,9 @@ def _comics_chip_title(
 
 def _read_comics_sidecar(
     relpath: str,
-) -> tuple[list[str], bool, str, float | None, str | None]:
-    """Return (tags, nsfw, description, confidence, agreement), never raising.
+) -> tuple[list[str], bool, str, float | None, str | None, bool]:
+    """Return (tags, nsfw, description, confidence, agreement, manual),
+    never raising.
 
     ``relpath`` comes from ``_collect_comics_images()`` (already resolved
     inside the comics root) and is only re-validated defensively here; the
@@ -754,10 +771,10 @@ def _read_comics_sidecar(
     input.  Results are cached per sidecar mtime under a lock.
     """
     if not isinstance(relpath, str) or not relpath:
-        return [], False, "", None, None
+        return [], False, "", None, None, False
     parts = relpath.replace("\\", "/").split("/")
     if any(part in ("", ".", "..") for part in parts):
-        return [], False, "", None, None
+        return [], False, "", None, None, False
     root = _COMICS_DIR.resolve()
     key = f"{root}\0{relpath}"
     sidecar = root / f"{relpath}.tags.json"
@@ -769,20 +786,24 @@ def _read_comics_sidecar(
         # Missing, vanished, or external sidecar: treat as untagged.
         with _COMICS_SIDECAR_CACHE_LOCK:
             _COMICS_SIDECAR_CACHE.pop(key, None)
-        return [], False, "", None, None
+        return [], False, "", None, None, False
     with _COMICS_SIDECAR_CACHE_LOCK:
         cached = _COMICS_SIDECAR_CACHE.get(key)
         if cached is not None and cached[0] == mtime:
-            tags, is_nsfw, description, confidence, agreement = cached[1]
-            return list(tags), is_nsfw, description, confidence, agreement
+            tags, is_nsfw, description, confidence, agreement, manual = (
+                cached[1]
+            )
+            return list(tags), is_nsfw, description, confidence, agreement, manual
     try:
         raw = resolved.read_bytes()
     except OSError:
-        return [], False, "", None, None
+        return [], False, "", None, None, False
     parsed = _parse_comics_sidecar(raw)
     with _COMICS_SIDECAR_CACHE_LOCK:
         _COMICS_SIDECAR_CACHE[key] = (mtime, parsed)
-    return list(parsed[0]), parsed[1], parsed[2], parsed[3], parsed[4]
+    return (
+        list(parsed[0]), parsed[1], parsed[2], parsed[3], parsed[4], parsed[5]
+    )
 
 
 def _copy_tag_summary(summary: dict) -> dict:
@@ -806,7 +827,7 @@ def _comics_tag_summary() -> dict:
     untagged = nsfw_total = 0
     images = _collect_comics_images()
     for image in images:
-        tags, is_nsfw, _, _, _ = _read_comics_sidecar(image["relpath"])
+        tags, is_nsfw, _, _, _, _ = _read_comics_sidecar(image["relpath"])
         if not tags:
             untagged += 1
         if is_nsfw:
@@ -1517,14 +1538,15 @@ def index():
     # Only the rendered first page reads sidecars (bounded work per request).
     comics_page = all_comics[:120]
     for image in comics_page:
-        tags, nsfw, description, confidence, agreement = _read_comics_sidecar(
-            image["relpath"]
+        tags, nsfw, description, confidence, agreement, manual = (
+            _read_comics_sidecar(image["relpath"])
         )
         image["tags"] = tags
         image["nsfw"] = nsfw
         image["description"] = description
         image["confidence"] = confidence
         image["agreement"] = agreement
+        image["manual"] = manual
         image["chip_title"] = _comics_chip_title(description, confidence)
         image["chip_title_nsfw"] = _comics_chip_title(
             description, confidence, nsfw_disputed=agreement == "low"
@@ -1783,8 +1805,8 @@ def api_comics():
     # already had to touch the whole list to compute membership).
     page = images[offset:offset + limit]
     for image in page:
-        tags, nsfw, description, confidence, agreement = _read_comics_sidecar(
-            image["relpath"]
+        tags, nsfw, description, confidence, agreement, manual = (
+            _read_comics_sidecar(image["relpath"])
         )
         image["tags"] = tags
         image["nsfw"] = nsfw
@@ -1792,6 +1814,8 @@ def api_comics():
         # v2 confirmation data: None on v1/missing sidecars.
         image["confidence"] = confidence
         image["agreement"] = agreement
+        # True only for sidecars written by the manual tag-edit routes.
+        image["manual"] = manual
         image["view_url"] = url_for("view_comics_image", filepath=image["relpath"])
         image["raw_url"] = url_for("raw_comics_file", filepath=image["relpath"])
         image["thumb_url"] = url_for("comics_thumbnail", filepath=image["relpath"])
@@ -1803,6 +1827,227 @@ def api_comics():
 def api_comics_tags():
     """Aggregate tag counts for the whole comics gallery (read-only)."""
     return _comics_tag_summary()
+
+
+# ── Manual tag editing (dual-write protocol) ─────────────────────────
+# The gallery writes a sidecar only through the two routes below, always
+# flagged ``manual: true``; the tag worker then treats that file as
+# read-only (no upgrade, re-cut, or failed retry) while its orphan cleanup
+# still owns it. Both sides write dot-temp + ``os.replace`` atomically, so
+# concurrent updates are last-writer-wins on the whole file.
+
+_COMICS_TAG_MAX_COUNT = 12
+_COMICS_TAG_MAX_CHARS = 32
+
+
+def _comics_edit_error(message: str, status: int):
+    """JSON error body for the manual tag routes (never leaks a path)."""
+    return {"success": False, "error": message, "message": message}, status
+
+
+def _manual_sidecar_path(image: Path) -> Path:
+    """``<full filename>.tags.json`` beside a validated comics image."""
+    return Path(f"{image}.tags.json")
+
+
+def _validated_comics_image(subpath):
+    """Validate one comics image path for the manual tag write routes.
+
+    Same discipline as the comics delete route (lexical containment plus
+    resolve-based containment through ``_safe_comics_subpath``), then the
+    extra guards these writes need: never an absolute path or ``..``
+    segment, never the source root, never ``.media_locks``, never a symlink
+    entry, and only one existing image file with a supported suffix.
+    Returns ``(target, None)`` on success or ``(None, (payload, status))``;
+    the helper's ``abort(403)`` is converted to this JSON shape so the
+    frontend always receives ``{success, error, message}``.
+    """
+    if not isinstance(subpath, str) or not subpath.strip():
+        return None, _comics_edit_error("缺少 path 参数", 400)
+    subpath = subpath.strip()
+    if subpath.startswith("/") or ".." in subpath.split("/"):
+        return None, _comics_edit_error("Path traversal denied", 403)
+    # Resolve for traversal/external-symlink checks, but retain the lexical
+    # path so an internal symlink cannot be acted on through its target.
+    lexical = _COMICS_DIR / subpath
+    try:
+        target = _safe_comics_subpath(subpath)
+    except HTTPException as exc:
+        return None, _comics_edit_error(
+            exc.description or "Path traversal denied", exc.code or 403
+        )
+    except ValueError:
+        # Malformed paths (an embedded NUL makes resolve() raise) never
+        # reach the filesystem checks; answer with a fixed JSON message
+        # that cannot echo the offending input.
+        return None, _comics_edit_error("路径参数非法", 400)
+    comics_root = _COMICS_DIR.resolve()
+    if target == comics_root:
+        return None, _comics_edit_error("不允许修改二次元根目录", 403)
+    try:
+        lexical.relative_to(_COMICS_DIR)
+    except ValueError:
+        return None, _comics_edit_error("Path traversal denied", 403)
+    if lexical.is_symlink():
+        return None, _comics_edit_error("不允许操作符号链接", 403)
+    # Resolve the lock directory too: if ``.media_locks`` is itself a
+    # symlink, comparing the unresolved name would let the guard pass.
+    lock_dir = (comics_root / ".media_locks").resolve()
+    if target == lock_dir or lock_dir in target.parents:
+        return None, _comics_edit_error("保留锁目录不可访问", 403)
+    if not target.exists():
+        return None, _comics_edit_error("图片不存在", 404)
+    if not target.is_file() or target.suffix.lower() not in _IMAGE_EXTS:
+        return None, _comics_edit_error("仅允许操作图片文件", 403)
+    return target, None
+
+
+def _clean_manual_tags(raw_tags) -> tuple[list[str] | None, str | None]:
+    """Strip, drop empties, and de-duplicate (order kept); bound at 12/32.
+
+    Returns ``(tags, None)`` on success or ``(None, message)`` when a bound
+    is violated; the route then answers 400 without touching the disk.
+    """
+    if not isinstance(raw_tags, list):
+        return None, "tags 必须是字符串数组"
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in raw_tags:
+        if not isinstance(item, str):
+            return None, "tags 必须是字符串数组"
+        # C0 control characters and DEL cannot round-trip through JSON/HTML
+        # safely (a NUL would serialize as U+FFFD), so strip them before the
+        # bounds; a tag that becomes empty this way is simply dropped.
+        tag = re.sub(r"[\x00-\x1f\x7f]", "", item).strip()
+        if not tag:
+            continue
+        if len(tag) > _COMICS_TAG_MAX_CHARS:
+            return None, f"单个标签不能超过 {_COMICS_TAG_MAX_CHARS} 个字符"
+        if tag in seen:
+            continue
+        seen.add(tag)
+        cleaned.append(tag)
+    if len(cleaned) > _COMICS_TAG_MAX_COUNT:
+        return None, (
+            f"标签最多 {_COMICS_TAG_MAX_COUNT} 个（去重后 {len(cleaned)} 个）"
+        )
+    return cleaned, None
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    """Write JSON via a dot-prefixed temp file plus ``os.replace``.
+
+    The same convention the tag worker uses (UTF-8, ``ensure_ascii=False``,
+    ``indent=2``), so both writers of the dual-write protocol produce
+    interchangeable sidecars and readers always see a complete document.
+    """
+    tmp = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+@app.route("/api/comics/tags/update", methods=["POST"])
+def api_comics_tags_update():
+    """Replace one image's tags in its sidecar (manual read-modify-write).
+
+    Body: ``{path: <comics relpath>, tags: [str, ...]}``. The sidecar is
+    re-read from disk at request time (never a client snapshot) and every
+    field except ``tags``/the manual markers is carried over untouched;
+    an image without a sidecar gets a minimal ``version 2`` document with
+    no ``nsfw``/``verification``/``tag_scores`` blocks.
+    """
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        # A JSON array/string/number or a missing body is a client bug, not
+        # a server error: answer 400 in JSON instead of raising on .get().
+        return _comics_edit_error("请求体必须是 JSON 对象", 400)
+    target, error = _validated_comics_image(data.get("path"))
+    if error:
+        return error
+    cleaned, problem = _clean_manual_tags(data.get("tags"))
+    if problem:
+        return _comics_edit_error(problem, 400)
+
+    sidecar_path = _manual_sidecar_path(target)
+    baseline: dict | None = None
+    if sidecar_path.exists() or sidecar_path.is_symlink():
+        # A symlinked sidecar would read (and imply writes) outside the
+        # comics source: refuse instead of adopting foreign content.
+        if sidecar_path.is_symlink() or not sidecar_path.is_file():
+            return _comics_edit_error("标签文件不可写", 403)
+        try:
+            parsed = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            parsed = None  # corrupt: rebuild the minimal document
+        if isinstance(parsed, dict):
+            baseline = parsed
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    if baseline is None:
+        payload = {
+            "version": 2,
+            "source": target.name,
+            "generated_at": now,
+            "status": "ok",
+            "model": "manual",
+            "description": "",
+            "tags": cleaned,
+            "manual": True,
+            "manual_edited_at": now,
+        }
+    else:
+        payload = baseline
+        payload["tags"] = cleaned
+        payload["manual"] = True
+        payload["manual_edited_at"] = now
+        if payload.get("status") != "ok":
+            # The gallery renders tags only from ``status: ok`` documents,
+            # so a manual edit of a failed sidecar has to become visible.
+            payload["status"] = "ok"
+    try:
+        _atomic_write_json(sidecar_path, payload)
+    except OSError as exc:
+        log.error("Failed to write manual tags for %s: %s", target.name, exc)
+        return _comics_edit_error("标签保存失败", 500)
+    _invalidate_comics_scan()
+    return {"success": True, "tags": cleaned, "manual": True}
+
+
+@app.route("/api/comics/tags/reset", methods=["POST"])
+def api_comics_tags_reset():
+    """Delete one image's sidecar so the worker regenerates its tags.
+
+    Body: ``{path: <comics relpath>}``. Idempotent: a missing sidecar is
+    still a success. The image itself is never touched, and a symlinked
+    sidecar loses only its link (the external target stays intact).
+    """
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return _comics_edit_error("请求体必须是 JSON 对象", 400)
+    target, error = _validated_comics_image(data.get("path"))
+    if error:
+        return error
+    sidecar_path = _manual_sidecar_path(target)
+    if sidecar_path.is_symlink() or sidecar_path.exists():
+        if sidecar_path.is_dir() and not sidecar_path.is_symlink():
+            return _comics_edit_error("标签文件不可删除", 403)
+        try:
+            sidecar_path.unlink()
+        except OSError as exc:
+            log.error("Failed to delete sidecar for %s: %s", target.name, exc)
+            return _comics_edit_error("标签删除失败", 500)
+    _invalidate_comics_scan()
+    return {"success": True}
 
 
 @app.route("/thumb/<path:filepath>")
@@ -2953,6 +3198,73 @@ INDEX_HTML = (
   .tag-chip.nsfw { background:#fdecec; border-color:#f3b6b6; color:#c0392b; font-weight:600; }
   /* Amber outline instead of plain red: the two NSFW classifiers disagreed. */
   .tag-chip.nsfw-low { background:#fff6e3; border-color:#e0a53a; color:#9a6a05; box-shadow:0 0 0 1px #e0a53a inset; font-weight:600; }
+  /* ── Manual tag editing: card button, badge, modal ── */
+  .edit-btn {
+    position:absolute; top:8px; right:44px;
+    width:28px; height:28px; border-radius:50%; border:none;
+    background:rgba(0,0,0,0.08); color:#999; font-size:15px;
+    cursor:pointer; transition:all 0.15s; line-height:1;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .edit-btn:hover { background:#25a55a; color:#fff; }
+  .manual-badge {
+    position:absolute; top:8px; left:8px; z-index:1;
+    background:#25a55a; color:#fff; border-radius:999px;
+    font-size:10px; line-height:1.6; padding:1px 7px; font-weight:600;
+    pointer-events:none;
+  }
+  .tag-modal-overlay {
+    position:fixed; inset:0; background:rgba(0,0,0,0.45); z-index:1000;
+    display:flex; align-items:center; justify-content:center; padding:16px;
+  }
+  .tag-modal {
+    background:#fff; border-radius:12px; padding:18px;
+    width:min(460px,100%); max-height:86vh; overflow:auto;
+    box-shadow:0 8px 30px rgba(0,0,0,0.25);
+  }
+  .tag-modal h3 { font-size:16px; color:#111; margin:0 0 4px; word-break:break-all; }
+  .tag-modal-hint { color:#888; font-size:12px; margin:0 0 10px; line-height:1.6; }
+  .tag-modal-chips { display:flex; flex-wrap:wrap; gap:6px; margin:0 0 12px; }
+  .tag-modal-chips:empty::after { content:"暂无标签"; color:#aaa; font-size:12px; }
+  .modal-chip {
+    display:inline-flex; align-items:center; gap:4px; max-width:100%;
+    background:#f1f3f5; border:1px solid #e3e6ea; color:#333;
+    border-radius:999px; padding:2px 4px 2px 10px; font-size:13px;
+  }
+  .modal-chip > span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .modal-chip-remove {
+    border:none; background:rgba(0,0,0,0.08); color:#666;
+    width:20px; height:20px; border-radius:50%; cursor:pointer;
+    font-size:12px; line-height:1;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .modal-chip-remove:hover { background:#fe2c55; color:#fff; }
+  .tag-modal-add { display:flex; gap:8px; margin:0 0 14px; }
+  .tag-modal-add input {
+    flex:1; min-width:0; border:1px solid #ddd; border-radius:8px;
+    padding:8px 10px; font:inherit; font-size:14px;
+  }
+  .tag-modal-actions { display:flex; gap:8px; flex-wrap:wrap; }
+  .tag-modal-actions button {
+    border:none; border-radius:8px; padding:9px 16px; cursor:pointer;
+    font:inherit; font-size:14px;
+  }
+  .tag-modal-actions button:disabled { opacity:0.55; cursor:wait; }
+  .tag-save-btn { background:#25a55a; color:#fff; }
+  .tag-cancel-btn { background:#eee; color:#444; }
+  .tag-reset-btn {
+    background:#fff3cd; color:#856404; border:1px solid #ffc107;
+    margin-left:auto;
+  }
+  .tag-reset-btn:hover { background:#ffe9b3; }
+  @media (max-width:640px) {
+    .edit-btn { width:44px; height:44px; right:42px; top:6px; font-size:18px; }
+    .manual-badge { font-size:11px; padding:2px 8px; }
+    .tag-modal-actions button { min-height:44px; flex:1; font-size:16px; }
+    .tag-reset-btn { margin-left:0; }
+    .tag-modal-add input { min-height:44px; font-size:16px; }
+    .modal-chip-remove { width:28px; height:28px; font-size:15px; }
+  }
   .top-tabs { display:flex; gap:8px; margin:0 0 22px; }
   .top-tab { border:1px solid #ddd; border-radius:8px; padding:8px 18px; background:#fff; color:#777; cursor:pointer; font-size:13px; }
   .top-tab.active { background:#fe2c55; border-color:#fe2c55; color:#fff; }
@@ -3146,7 +3458,7 @@ INDEX_HTML = (
   </div>
   {% if comics_images %}
   {% for c in comics_images %}
-    <div class="card media-card comics-card{% if c.is_landscape %} landscape-card{% endif %}" data-search="{{ (c.name ~ ' ' ~ c.relpath ~ ((' ' ~ ((c.tags|default([]))|join(' '))) if c.tags else '') ~ ((' ' ~ c.description) if c.description else ''))|e }}">
+    <div class="card media-card comics-card{% if c.is_landscape %} landscape-card{% endif %}" data-search="{{ (c.name ~ ' ' ~ c.relpath ~ ((' ' ~ ((c.tags|default([]))|join(' '))) if c.tags else '') ~ ((' ' ~ c.description) if c.description else ''))|e }}" data-comics-path="{{ c.relpath|e }}">
       <a class="card-inner" href="{{ url_for('view_comics_image', filepath=c.relpath) }}">
         <img class="card-thumb" src="{{ url_for('comics_thumbnail', filepath=c.relpath) }}" loading="lazy" alt="" width="180" height="320">
         <div class="vname"{% if c.description %} title="{{ c.description|e }}"{% endif %}>{{ c.name }}</div>
@@ -3158,6 +3470,8 @@ INDEX_HTML = (
           <span class="stat">{{ c.size_fmt }}</span>
         </div>
       </a>
+      {% if c.manual %}<span class="manual-badge">已手动</span>{% endif %}
+      <button class="edit-btn" title="编辑标签" aria-label="编辑标签">✎</button>
       <button class="del-btn" onclick="confirmDelete(event, '{{ c.relpath|e }}', '二次元图片 {{ c.name|e }}', '/api/comics/delete')" title="删除">✕</button>
     </div>
   {% endfor %}
@@ -3482,10 +3796,12 @@ if (searchClear) searchClear.addEventListener('click', function() {
     if (tags.length) search += ' ' + tags.join(' ');
     if (image.description) search += ' ' + image.description;
     card.dataset.search = search;
+    card.dataset.comicsPath = image.relpath;
     card.innerHTML = '<a class="card-inner" href="' + image.view_url + '">' +
       '<img class="card-thumb" src="' + image.thumb_url + '" loading="lazy" alt="" width="180" height="320">' +
       '<div class="vname"></div><div class="tag-chips"></div>' +
       '<div class="meta" style="margin-top:4px"><span class="stat"></span><span class="stat"></span></div></a>' +
+      '<button class="edit-btn" title="编辑标签" aria-label="编辑标签">✎</button>' +
       '<button class="del-btn" title="删除">✕</button>';
     var vname = card.querySelector('.vname');
     vname.textContent = image.name;
@@ -3516,6 +3832,7 @@ if (searchClear) searchClear.addEventListener('click', function() {
     if (!tags.length) chipsBox.remove();
     card.querySelectorAll('.stat')[0].textContent = image.relpath;
     card.querySelectorAll('.stat')[1].textContent = image.size_fmt;
+    if (image.manual) setManualBadge(card, true);
     card.querySelector('.del-btn').addEventListener('click', function(event) {
       confirmDelete(event, image.relpath, '二次元图片 ' + image.name, '/api/comics/delete');
     });
@@ -3669,13 +3986,283 @@ if (searchClear) searchClear.addEventListener('click', function() {
       if (tagStatus) tagStatus.textContent = '标签列表加载失败';
     });
   }
+  // ── Manual tag editing ────────────────────────────────────────────
+  // One shared editor modal. Every dynamic node is created with
+  // createElement and every user/model string lands through textContent or
+  // a DOM property, so tags, filenames, and descriptions can never become
+  // markup (no innerHTML concatenation with data, ever).
+  var MAX_TAG_COUNT = 12;
+  var MAX_TAG_CHARS = 32;
+  var activeEditor = null;
+
+  function cardTags(cardEl) {
+    var box = cardEl.querySelector('.tag-chips');
+    if (!box) return [];
+    return Array.prototype.map.call(
+      box.querySelectorAll('.tag-chip'),
+      function(chip) { return chip.dataset.tag || chip.textContent.trim(); }
+    ).filter(Boolean);
+  }
+
+  function rebuildCardSearch(cardEl, tags) {
+    // Rebuild data-search from the card's own text nodes (name, relpath,
+    // description tooltip) so a saved edit stays searchable in place.
+    var nameEl = cardEl.querySelector('.vname');
+    var stats = cardEl.querySelectorAll('.meta .stat');
+    if (!nameEl || !stats.length) return;
+    var search = nameEl.textContent + ' ' + stats[0].textContent;
+    if (tags.length) search += ' ' + tags.join(' ');
+    if (nameEl.title) search += ' ' + nameEl.title;
+    cardEl.dataset.search = search;
+  }
+
+  function renderCardTags(cardEl, tags) {
+    var box = cardEl.querySelector('.tag-chips');
+    if (!box) {
+      box = document.createElement('div');
+      box.className = 'tag-chips';
+      var anchor = cardEl.querySelector('.meta');
+      var inner = cardEl.querySelector('.card-inner');
+      if (inner && anchor) inner.insertBefore(box, anchor);
+    }
+    while (box.firstChild) box.removeChild(box.firstChild);
+    tags.forEach(function(tag) {
+      var chip = document.createElement('span');
+      chip.className = 'tag-chip' + (tag === 'nsfw' ? ' nsfw' : '');
+      chip.dataset.tag = tag;
+      chip.setAttribute('role', 'button');
+      chip.setAttribute('tabindex', '0');
+      chip.textContent = tag;
+      var nameEl = cardEl.querySelector('.vname');
+      if (nameEl && nameEl.title) chip.title = nameEl.title;
+      box.appendChild(chip);
+    });
+    if (!tags.length) box.remove();
+    rebuildCardSearch(cardEl, tags);
+  }
+
+  function setManualBadge(cardEl, manual) {
+    var badge = cardEl.querySelector('.manual-badge');
+    if (manual && !badge) {
+      badge = document.createElement('span');
+      badge.className = 'manual-badge';
+      badge.textContent = '已手动';
+      cardEl.insertBefore(badge, cardEl.firstChild);
+    } else if (!manual && badge) {
+      badge.remove();
+    }
+    if (manual) cardEl.dataset.manual = '1';
+    else delete cardEl.dataset.manual;
+  }
+
+  function postTagApi(url, payload) {
+    return fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    }).then(function(response) {
+      // Non-JSON bodies (the HTML error pages) fall through to the status,
+      // so the alert always shows a message instead of a parse crash.
+      return response.json().catch(function() { return null; }).then(function(data) {
+        if (!response.ok || !data || !data.success) {
+          throw new Error(
+            (data && (data.message || data.error)) || ('HTTP ' + response.status)
+          );
+        }
+        return data;
+      });
+    });
+  }
+
+  function closeTagEditor() {
+    if (!activeEditor) return;
+    document.removeEventListener('keydown', activeEditor.onEscape);
+    if (activeEditor.overlay.parentNode) {
+      activeEditor.overlay.parentNode.removeChild(activeEditor.overlay);
+    }
+    activeEditor = null;
+  }
+
+  function openTagEditor(cardEl) {
+    var path = cardEl.dataset.comicsPath || '';
+    if (!path) return;
+    closeTagEditor();
+    var tags = cardTags(cardEl).slice();
+    var overlay = document.createElement('div');
+    overlay.className = 'tag-modal-overlay';
+    var modal = document.createElement('div');
+    modal.className = 'tag-modal';
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-modal', 'true');
+    overlay.appendChild(modal);
+
+    var title = document.createElement('h3');
+    var nameEl = cardEl.querySelector('.vname');
+    title.textContent = '编辑标签 · ' + (nameEl ? nameEl.textContent : path);
+    modal.appendChild(title);
+
+    var hint = document.createElement('p');
+    hint.className = 'tag-modal-hint';
+    hint.textContent = '最多 ' + MAX_TAG_COUNT + ' 个标签，单个不超过 ' +
+      MAX_TAG_CHARS + ' 个字符。保存后该图转为手动标签，worker 不再自动改写。';
+    modal.appendChild(hint);
+
+    var chipsBox = document.createElement('div');
+    chipsBox.className = 'tag-modal-chips';
+    modal.appendChild(chipsBox);
+
+    function renderModalChips() {
+      while (chipsBox.firstChild) chipsBox.removeChild(chipsBox.firstChild);
+      tags.forEach(function(tag, index) {
+        var chip = document.createElement('span');
+        chip.className = 'modal-chip';
+        var label = document.createElement('span');
+        label.textContent = tag;
+        var remove = document.createElement('button');
+        remove.type = 'button';
+        remove.className = 'modal-chip-remove';
+        remove.setAttribute('aria-label', '移除标签 ' + tag);
+        remove.textContent = '×';
+        remove.addEventListener('click', function() {
+          tags.splice(index, 1);
+          renderModalChips();
+        });
+        chip.appendChild(label);
+        chip.appendChild(remove);
+        chipsBox.appendChild(chip);
+      });
+    }
+    renderModalChips();
+
+    var addRow = document.createElement('div');
+    addRow.className = 'tag-modal-add';
+    var input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = '输入标签，回车添加';
+    input.setAttribute('aria-label', '新标签');
+    var addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.className = 'tag-cancel-btn';
+    addBtn.textContent = '添加';
+    addRow.appendChild(input);
+    addRow.appendChild(addBtn);
+    modal.appendChild(addRow);
+
+    function addTag() {
+      var tag = input.value.trim();
+      input.value = '';
+      if (!tag) return;
+      if (tag.length > MAX_TAG_CHARS) {
+        alert('单个标签不能超过 ' + MAX_TAG_CHARS + ' 个字符');
+        return;
+      }
+      if (tags.indexOf(tag) !== -1) {
+        alert('标签已存在：' + tag);
+        return;
+      }
+      if (tags.length >= MAX_TAG_COUNT) {
+        alert('标签最多 ' + MAX_TAG_COUNT + ' 个');
+        return;
+      }
+      tags.push(tag);
+      renderModalChips();
+      input.focus();
+    }
+    addBtn.addEventListener('click', addTag);
+    input.addEventListener('keydown', function(event) {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        addTag();
+      }
+    });
+
+    var actions = document.createElement('div');
+    actions.className = 'tag-modal-actions';
+    var saveBtn = document.createElement('button');
+    saveBtn.type = 'button';
+    saveBtn.className = 'tag-save-btn';
+    saveBtn.textContent = '保存';
+    var cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.className = 'tag-cancel-btn';
+    cancelBtn.textContent = '取消';
+    var resetBtn = document.createElement('button');
+    resetBtn.type = 'button';
+    resetBtn.className = 'tag-reset-btn';
+    resetBtn.textContent = '恢复自动标签';
+    actions.appendChild(saveBtn);
+    actions.appendChild(cancelBtn);
+    actions.appendChild(resetBtn);
+    modal.appendChild(actions);
+
+    saveBtn.addEventListener('click', function() {
+      saveBtn.disabled = true;
+      postTagApi('/api/comics/tags/update', {path: path, tags: tags})
+        .then(function(data) {
+          var saved = Array.isArray(data.tags) ? data.tags : tags;
+          renderCardTags(cardEl, saved);
+          setManualBadge(cardEl, true);
+          closeTagEditor();
+          loadTagOptions();  // refresh counts only; never re-filters the grid
+          updateSearch();
+        })
+        .catch(function(error) {
+          saveBtn.disabled = false;
+          alert('保存失败: ' + error.message);
+        });
+    });
+    cancelBtn.addEventListener('click', closeTagEditor);
+    resetBtn.addEventListener('click', function() {
+      if (!confirm('确定恢复自动标签？手动标签将被删除，标签将在后台重新生成。')) {
+        return;
+      }
+      resetBtn.disabled = true;
+      postTagApi('/api/comics/tags/reset', {path: path})
+        .then(function() {
+          renderCardTags(cardEl, []);
+          setManualBadge(cardEl, false);
+          closeTagEditor();
+          loadTagOptions();
+          updateSearch();
+        })
+        .catch(function(error) {
+          resetBtn.disabled = false;
+          alert('恢复自动标签失败: ' + error.message);
+        });
+    });
+
+    overlay.addEventListener('click', function(event) {
+      if (event.target === overlay) closeTagEditor();
+    });
+    var onEscape = function(event) {
+      if (event.key === 'Escape') closeTagEditor();
+    };
+    document.addEventListener('keydown', onEscape);
+    activeEditor = {overlay: overlay, onEscape: onEscape};
+    document.body.appendChild(overlay);
+    input.focus();
+  }
+
   // One delegation point covers server-rendered and JS-built chips alike.
   function chipFromEvent(event) {
     var target = event.target;
     var chip = target && target.closest ? target.closest('.tag-chip') : null;
     return chip && grid.contains(chip) ? chip : null;
   }
+  function editButtonFromEvent(event) {
+    var target = event.target;
+    var button = target && target.closest ? target.closest('.edit-btn') : null;
+    return button && grid.contains(button) ? button : null;
+  }
   grid.addEventListener('click', function(event) {
+    var edit = editButtonFromEvent(event);
+    if (edit) {
+      event.preventDefault();
+      event.stopPropagation();
+      var cardEl = edit.closest('.comics-card');
+      if (cardEl) openTagEditor(cardEl);
+      return;
+    }
     var chip = chipFromEvent(event);
     if (!chip) return;
     event.preventDefault();
