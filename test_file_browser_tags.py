@@ -279,6 +279,83 @@ class ComicsTagsSummaryTests(ComicsTagTestCase):
         self.assertEqual(payload["total"], 1)
         self.assertEqual(payload["tags"], [{"tag": "动漫", "count": 1}])
 
+    def test_summary_pins_both_verdict_words_in_the_fixed_order(self):
+        # sfw/nsfw lead the list even though their counts are lower, and
+        # the rest keeps count-descending, lexicographic-tiebreak order.
+        self.write_image("a.png", _sidecar(["sfw", "动漫", "少女"]))
+        self.write_image("b.png", _sidecar(["sfw", "动漫", "少女"]))
+        self.write_image("c.png", _sidecar(["动漫", "少女"]))
+        self.write_image("d.png", _sidecar(["nsfw"], nsfw_label="nsfw"))
+        self.write_image("e.png", _sidecar(["科幻"]))
+
+        payload = self.client.get("/api/comics/tags").get_json()
+
+        self.assertEqual(
+            [(item["tag"], item["count"]) for item in payload["tags"]],
+            [
+                ("sfw", 2),
+                ("nsfw", 1),
+                ("动漫", 3),
+                ("少女", 3),
+                ("科幻", 1),
+            ],
+        )
+
+    def test_summary_pins_only_the_verdict_word_that_exists(self):
+        for absent, present in (("sfw", "nsfw"), ("nsfw", "sfw")):
+            with self.subTest(absent=absent, present=present):
+                self.reset_caches()
+                for stale in list(self.comics_dir.iterdir()):
+                    stale.unlink()
+                self.write_image("hi.png", _sidecar([present],
+                                                    nsfw_label="nsfw"))
+                self.write_image("a.png", _sidecar(["动漫"]))
+                self.write_image("b.png", _sidecar(["动漫"]))
+
+                payload = self.client.get("/api/comics/tags").get_json()
+
+                self.assertEqual(
+                    [item["tag"] for item in payload["tags"]],
+                    [present, "动漫"],
+                )
+                self.assertNotIn(absent,
+                                 [item["tag"] for item in payload["tags"]])
+
+    def test_summary_without_verdict_words_keeps_the_legacy_order(self):
+        self.write_image("a.png", _sidecar(["动漫", "少女"], nsfw_label="nsfw"))
+        self.write_image("b.png", _sidecar(["动漫"]))
+        self.write_image("c.png", _sidecar(["少女"]))
+        self.write_image("d.png", _sidecar(["科幻"]))
+
+        payload = self.client.get("/api/comics/tags").get_json()
+
+        self.assertEqual(
+            [(item["tag"], item["count"]) for item in payload["tags"]],
+            [("动漫", 2), ("少女", 2), ("科幻", 1)],
+        )
+
+    def test_summary_keeps_the_lexicographic_rule_among_tied_counts(self):
+        # Equal counts still break lexicographically, and pinning the
+        # verdict words does not disturb that rule for the rest.
+        self.write_image("a.png", _sidecar(["少女", "机甲", "科幻", "动漫"]))
+        self.write_image("b.png", _sidecar(["少女", "机甲", "科幻", "动漫"]))
+        self.write_image("c.png", _sidecar(["sfw", "nsfw", "少女", "机甲",
+                                            "科幻", "动漫"]))
+
+        payload = self.client.get("/api/comics/tags").get_json()
+
+        self.assertEqual(
+            [(item["tag"], item["count"]) for item in payload["tags"]],
+            [
+                ("sfw", 1),
+                ("nsfw", 1),
+                ("动漫", 3),
+                ("少女", 3),
+                ("机甲", 3),
+                ("科幻", 3),
+            ],
+        )
+
 
 class SidecarToleranceTests(ComicsTagTestCase):
     def test_faulty_sidecars_degrade_to_untagged_without_500(self):
@@ -430,6 +507,19 @@ class ComicsTagUiTests(ComicsTagTestCase):
         ):
             with self.subTest(needle=needle):
                 self.assertIn(needle, page)
+
+    def test_load_tag_options_preserves_the_server_order(self):
+        # The dropdown must render exactly the summary order (sfw/nsfw
+        # pinned server-side), so loadTagOptions never re-sorts the tags.
+        self.write_image("a.png", _sidecar(["sfw", "动漫"]))
+        page = self.client.get("/").get_data(as_text=True)
+
+        start = page.index("function loadTagOptions()")
+        end = page.index("// ── Manual tag editing", start)
+        body = page[start:end]
+
+        self.assertIn("(summary.tags || []).forEach(function(item)", body)
+        self.assertNotIn(".sort(", body)
 
     def test_index_renders_chips_title_and_augmented_search_text(self):
         self.write_image(

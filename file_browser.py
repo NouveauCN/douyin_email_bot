@@ -844,6 +844,15 @@ def _comics_tag_summary() -> dict:
         for tag in dict.fromkeys(tags):
             counts[tag] = counts.get(tag, 0) + 1
     ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    # The two verdict words lead the gallery tag dropdown in the fixed
+    # order ``sfw`` then ``nsfw`` (only when actually present), so the
+    # filter never buries them among ordinary tags; everything else keeps
+    # the count-descending, lexicographic-tiebreak ordering above.
+    verdict_order = ("sfw", "nsfw")
+    pinned = [item for tag in verdict_order
+              for item in ordered if item[0] == tag]
+    ordered = pinned + [item for item in ordered
+                        if item[0] not in verdict_order]
     summary = {
         "tags": [{"tag": tag, "count": count} for tag, count in ordered],
         "untagged": untagged,
