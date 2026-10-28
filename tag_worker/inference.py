@@ -22,7 +22,7 @@ import re
 import time
 from typing import Any
 
-from . import sidecar
+from . import normalize, sidecar
 
 log = logging.getLogger("tag_worker.inference")
 
@@ -47,6 +47,30 @@ PROMPT = (
     "描述：<一句中文描述>\n"
     "标签：<5到10个中文标签，用、分隔>"
 )
+
+
+def vlm_prompt() -> str:
+    """The Qwen prompt plus the standard tag library (canonical spellings).
+
+    The appended line lists every vocabulary word once, comma separated,
+    except the classifier-owned ``nsfw``/``sfw`` verdict words: the model
+    must never be invited to assert its own classification.  The line is
+    guidance only -- parsing and the two-line format are unchanged, and
+    any out-of-vocabulary word the model still emits is preserved by
+    :func:`tag_worker.normalize.normalize_tags`.  A missing/broken
+    vocabulary file returns the bare :data:`PROMPT`.
+    """
+    words = [
+        word for word in normalize.vocabulary_words()
+        if word not in sidecar.CLASSIFICATION_TAGS
+    ]
+    if not words:
+        return PROMPT
+    return (
+        PROMPT
+        + "\n优先从标准标签库选择（可有表外词）："
+        + "，".join(words)
+    )
 
 _DESC_MARKER = re.compile(r"描述\s*[:：]")
 _TAGS_MARKER = re.compile(r"标签\s*[:：]")
@@ -378,15 +402,19 @@ def _verification(
     }
 
 
-def _score_candidates(tags: list[str], nsfw_label: Any) -> list[str]:
-    """Tags that go through CLIP: the injected ``nsfw`` marker is exempt.
+def _score_candidates(tags: list[str]) -> list[str]:
+    """Tags that go through CLIP: the verdict markers are exempt.
 
-    The marker comes from the classifier, not from Qwen, so CLIP must never
-    get a vote that could threshold it away.
+    ``nsfw`` and ``sfw`` come from the classifiers, not from Qwen (whose
+    raw output is stripped of both before scoring), so CLIP must never get
+    a vote that could threshold either verdict away.  The filter is
+    unconditional -- raw model output no longer carries these words, so
+    this is belt-and-braces for every caller.
     """
-    if str(nsfw_label or "").strip().lower() != "nsfw":
-        return list(tags)
-    return [tag for tag in tags if str(tag).lower() != "nsfw"]
+    return [
+        tag for tag in tags
+        if str(tag).lower() not in sidecar.CLASSIFICATION_TAGS
+    ]
 
 
 def generate_tags(image_bytes: bytes, *, threads: int) -> str:
@@ -400,7 +428,7 @@ def generate_tags(image_bytes: bytes, *, threads: int) -> str:
             "role": "user",
             "content": [
                 {"type": "image", "image": image},
-                {"type": "text", "text": PROMPT},
+                {"type": "text", "text": vlm_prompt()},
             ],
         }
     ]
@@ -486,7 +514,7 @@ def assemble_result(
     last so the classifier verdict can never be thresholded away.
     """
     description, candidates = parse_model_output(raw_text)
-    candidates = sidecar.clean_tags(candidates)
+    candidates = sidecar.normalize_candidate_tags(sidecar.clean_tags(candidates))
     nsfw_record = dict(nsfw) if isinstance(nsfw, dict) else {}
     nsfw_label = nsfw_record.get("label")
     if tag_scores is None or threshold is None:
@@ -495,7 +523,7 @@ def assemble_result(
             "description": description,
             "tags": sidecar.apply_nsfw_tag(candidates, nsfw_label),
         }
-    scored = _score_candidates(candidates, nsfw_label)
+    scored = _score_candidates(candidates)
     score_map: dict[str, float | None] = {}
     for tag in scored:
         value = tag_scores.get(tag) if isinstance(tag_scores, dict) else None
@@ -538,9 +566,11 @@ def tag_image(
     raw_text = generate_tags(image_bytes, threads=threads)
     # Parse once here so the CLIP batch covers exactly the candidate tags
     # assemble_result() will partition (both calls are pure and identical).
+    # Normalization happens *before* scoring, so CLIP scores the canonical
+    # forms and every tag_scores/dropped_tags key matches the written tags.
     _, candidates = parse_model_output(raw_text)
-    candidates = sidecar.clean_tags(candidates)
-    scored = _score_candidates(candidates, nsfw.get("label"))
+    candidates = sidecar.normalize_candidate_tags(sidecar.clean_tags(candidates))
+    scored = _score_candidates(candidates)
     score_map = dict(zip(scored, score_tags(image_bytes, scored, threads=threads)))
     return assemble_result(
         raw_text, nsfw, tag_scores=score_map, threshold=threshold
@@ -564,8 +594,8 @@ def verify_image(
         threshold = sidecar.DEFAULT_CLIP_THRESHOLD
     primary = classify_nsfw(image_bytes, threads=threads)
     nsfw = combine_nsfw(primary, _secondary_nsfw(image_bytes, threads))
-    candidates = sidecar.clean_tags(tags)
-    scored = _score_candidates(candidates, nsfw.get("label"))
+    candidates = sidecar.normalize_candidate_tags(sidecar.clean_tags(tags))
+    scored = _score_candidates(candidates)
     score_map = dict(zip(scored, score_tags(image_bytes, scored, threads=threads)))
     kept, dropped = sidecar.partition_tags(scored, score_map, threshold)
     return {

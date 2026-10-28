@@ -40,8 +40,10 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project --no-cache
 
-# Only this project's modules; the build context is ./tag_worker, so .probe
-# and the rest of the repository never enter this image.
-COPY *.py ./tag_worker/
+# Only this project's modules plus the closed tag vocabulary data file;
+# the build context is ./tag_worker, so .probe and the rest of the
+# repository never enter this image. vocabulary.json must ship with the
+# code because normalize.py resolves it beside itself.
+COPY *.py vocabulary.json ./tag_worker/
 
 ENTRYPOINT ["python", "-m", "tag_worker.worker"]

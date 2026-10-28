@@ -54,6 +54,7 @@ from media_processor import (  # noqa: E402
 )
 from media_file_lock import MediaFileLockBusy, media_file_lock  # noqa: E402
 from settings_store import SETTING_REGISTRY, SettingsStore  # noqa: E402
+from tag_worker import normalize as tag_normalize  # noqa: E402
 from web_login import WEB_LOGIN_PANEL_HTML, register_web_login  # noqa: E402
 
 _config = load_config(_PROJECT_DIR / "config.yaml")
@@ -62,6 +63,14 @@ _SETTINGS_STORE = SettingsStore(config_path=_CONFIG_PATH)
 _LAST_RESTART_REQUEST_ID: str | None = None
 _DOWNLOAD_DIR = Path(_config.douyin.download_path)
 _COMICS_DIR = Path(os.environ.get("COMICS_PICS_PATH", "/app/comics/pics"))
+# The closed tag vocabulary is a repository data file shared with the tag
+# worker.  Both layouts place it beside this file at
+# <root>/tag_worker/vocabulary.json: the checkout root (local runs) and the
+# /app image root (the file-browser image copies the whole repository with
+# ``COPY . .``), matching tag_worker's own sibling-file resolution.
+_COMICS_VOCABULARY = (
+    Path(__file__).resolve().parent / "tag_worker" / "vocabulary.json"
+)
 _THUMB_CACHE = Path("/app/.thumb_cache")
 _COMICS_THUMB_CACHE = _THUMB_CACHE / "comics-v1"
 _COMICS_THUMB_MAX_BYTES = 2 * 1024**3
@@ -1961,11 +1970,15 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
 def api_comics_tags_update():
     """Replace one image's tags in its sidecar (manual read-modify-write).
 
-    Body: ``{path: <comics relpath>, tags: [str, ...]}``. The sidecar is
+    Body: ``{path: <comics relpath>, tags: [str, ...]}``.  The sidecar is
     re-read from disk at request time (never a client snapshot) and every
-    field except ``tags``/the manual markers is carried over untouched;
-    an image without a sidecar gets a minimal ``version 2`` document with
-    no ``nsfw``/``verification``/``tag_scores`` blocks.
+    field except ``tags``/the manual markers/``vocabulary_version`` is
+    carried over untouched; an image without a sidecar gets a minimal
+    ``version 2`` document with no ``nsfw``/``verification``/
+    ``tag_scores`` blocks.  The submitted tags are normalized against the
+    shared closed vocabulary (alias expansion, order preserved, duplicates
+    collapsed) after the 12/32 input bounds, and the write records the
+    ``vocabulary_version`` it normalized against.
     """
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
@@ -1978,6 +1991,14 @@ def api_comics_tags_update():
     cleaned, problem = _clean_manual_tags(data.get("tags"))
     if problem:
         return _comics_edit_error(problem, 400)
+    # Vocabulary normalization runs after the existing cleaning and the
+    # 12/32 input bounds (the cap applies to the submitted tags): aliases
+    # expand to their canonical forms, order is preserved, duplicates
+    # collapse, and out-of-vocabulary words are kept verbatim.  nsfw/sfw
+    # pass through like any other canonical word -- a manual edit never
+    # gains or loses a classification tag here.
+    tags = tag_normalize.normalize_tags(cleaned, path=_COMICS_VOCABULARY)
+    vocabulary_version = tag_normalize.vocab_version(_COMICS_VOCABULARY)
 
     sidecar_path = _manual_sidecar_path(target)
     baseline: dict | None = None
@@ -2001,15 +2022,17 @@ def api_comics_tags_update():
             "status": "ok",
             "model": "manual",
             "description": "",
-            "tags": cleaned,
+            "tags": tags,
             "manual": True,
             "manual_edited_at": now,
+            "vocabulary_version": vocabulary_version,
         }
     else:
         payload = baseline
-        payload["tags"] = cleaned
+        payload["tags"] = tags
         payload["manual"] = True
         payload["manual_edited_at"] = now
+        payload["vocabulary_version"] = vocabulary_version
         if payload.get("status") != "ok":
             # The gallery renders tags only from ``status: ok`` documents,
             # so a manual edit of a failed sidecar has to become visible.
@@ -2020,7 +2043,7 @@ def api_comics_tags_update():
         log.error("Failed to write manual tags for %s: %s", target.name, exc)
         return _comics_edit_error("标签保存失败", 500)
     _invalidate_comics_scan()
-    return {"success": True, "tags": cleaned, "manual": True}
+    return {"success": True, "tags": tags, "manual": True}
 
 
 @app.route("/api/comics/tags/reset", methods=["POST"])
@@ -3196,6 +3219,8 @@ INDEX_HTML = (
   }
   .tag-chip:hover { background:#e6e9ec; color:#333; }
   .tag-chip.nsfw { background:#fdecec; border-color:#f3b6b6; color:#c0392b; font-weight:600; }
+  /* Symmetric safe verdict: the classifier's ``sfw`` marker, restrained green. */
+  .tag-chip.sfw { background:#eaf6ee; border-color:#a9d3b8; color:#1e7a3c; font-weight:600; }
   /* Amber outline instead of plain red: the two NSFW classifiers disagreed. */
   .tag-chip.nsfw-low { background:#fff6e3; border-color:#e0a53a; color:#9a6a05; box-shadow:0 0 0 1px #e0a53a inset; font-weight:600; }
   /* ── Manual tag editing: card button, badge, modal ── */
@@ -3463,7 +3488,7 @@ INDEX_HTML = (
         <img class="card-thumb" src="{{ url_for('comics_thumbnail', filepath=c.relpath) }}" loading="lazy" alt="" width="180" height="320">
         <div class="vname"{% if c.description %} title="{{ c.description|e }}"{% endif %}>{{ c.name }}</div>
         {% if c.tags %}
-        <div class="tag-chips">{% for t in c.tags %}{% set chip_title = c.chip_title_nsfw if t == 'nsfw' else c.chip_title %}<span class="tag-chip{% if t == 'nsfw' %} nsfw{% if c.agreement == 'low' %} nsfw-low{% endif %}{% endif %}" data-tag="{{ t|e }}" role="button" tabindex="0"{% if chip_title %} title="{{ chip_title|e }}"{% endif %}>{{ t }}</span>{% endfor %}</div>
+        <div class="tag-chips">{% for t in c.tags %}{% set chip_title = c.chip_title_nsfw if t == 'nsfw' else c.chip_title %}<span class="tag-chip{% if t == 'nsfw' %} nsfw{% if c.agreement == 'low' %} nsfw-low{% endif %}{% elif t == 'sfw' %} sfw{% endif %}" data-tag="{{ t|e }}" role="button" tabindex="0"{% if chip_title %} title="{{ chip_title|e }}"{% endif %}>{{ t }}</span>{% endfor %}</div>
         {% endif %}
         <div class="meta" style="margin-top:4px">
           <span class="stat">{{ c.relpath }}</span>
@@ -3811,6 +3836,7 @@ if (searchClear) searchClear.addEventListener('click', function() {
       var chip = document.createElement('span');
       var disputedNsfw = tag === 'nsfw' && image.agreement === 'low';
       chip.className = 'tag-chip' + (tag === 'nsfw' ? ' nsfw' : '') +
+        (tag === 'sfw' ? ' sfw' : '') +
         (disputedNsfw ? ' nsfw-low' : '');
       chip.dataset.tag = tag;
       chip.setAttribute('role', 'button');
@@ -4028,7 +4054,8 @@ if (searchClear) searchClear.addEventListener('click', function() {
     while (box.firstChild) box.removeChild(box.firstChild);
     tags.forEach(function(tag) {
       var chip = document.createElement('span');
-      chip.className = 'tag-chip' + (tag === 'nsfw' ? ' nsfw' : '');
+      chip.className = 'tag-chip' + (tag === 'nsfw' ? ' nsfw' : '') +
+        (tag === 'sfw' ? ' sfw' : '');
       chip.dataset.tag = tag;
       chip.setAttribute('role', 'button');
       chip.setAttribute('tabindex', '0');

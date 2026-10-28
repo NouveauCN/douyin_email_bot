@@ -15,7 +15,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import file_browser
-from tag_worker import inference, sidecar, worker
+from tag_worker import inference, normalize, sidecar, worker
 
 _FAKE_IMAGE = b"definitely-not-a-real-image"
 
@@ -213,10 +213,21 @@ class TagHygieneTests(unittest.TestCase):
         # not evict an already-confirmed candidate.
         self.assertEqual(len(tags), sidecar.MAX_TAGS + 1)
 
-    def test_normal_label_leaves_tags_untouched(self):
-        self.assertEqual(sidecar.apply_nsfw_tag(["动漫"], "normal"), ["动漫"])
-        self.assertEqual(sidecar.apply_nsfw_tag([], "normal"), [])
+    def test_normal_label_inserts_the_sfw_marker_first(self):
+        # Symmetric counterpart of test_nsfw_label_is_inserted_first.
+        self.assertEqual(
+            sidecar.apply_nsfw_tag(["动漫"], "normal"), ["sfw", "动漫"]
+        )
+        self.assertEqual(sidecar.apply_nsfw_tag([], "normal"), ["sfw"])
         self.assertEqual(sidecar.apply_nsfw_tag([], "nsfw"), ["nsfw"])
+        # An unknown/absent verdict injects nothing at all.
+        self.assertEqual(sidecar.apply_nsfw_tag(["动漫"], None), ["动漫"])
+        # Only the classifiers may assert a verdict: a leftover marker of
+        # the opposite kind never survives an injection.
+        self.assertEqual(
+            sidecar.apply_nsfw_tag(["nsfw", "动漫"], "normal"),
+            ["sfw", "动漫"],
+        )
 
 
 class PathValidationTests(unittest.TestCase):
@@ -783,8 +794,11 @@ class PartitionTests(unittest.TestCase):
             threshold=0.25,
         )
 
-        self.assertEqual(result["tags"], ["动漫", "少女"])  # original order
+        # Symmetric classification: a normal verdict injects ``sfw`` first,
+        # and the verdict word is never part of the scored keys.
+        self.assertEqual(result["tags"], ["sfw", "动漫", "少女"])
         self.assertEqual(result["dropped_tags"], ["浴袍"])
+        self.assertNotIn("sfw", result["tag_scores"])
         self.assertEqual(
             result["tag_scores"], {"动漫": 0.41, "浴袍": 0.2, "少女": 0.33}
         )
@@ -811,7 +825,9 @@ class PartitionTests(unittest.TestCase):
         result = inference.assemble_result(
             "描述：x\n标签：动漫、浴袍", {"label": "normal", "confidence": 0.9}
         )
-        self.assertEqual(result["tags"], ["动漫", "浴袍"])
+        # Candidates are kept verbatim; the verdict marker comes from the
+        # classifier record, so a normal image carries ``sfw``.
+        self.assertEqual(result["tags"], ["sfw", "动漫", "浴袍"])
         self.assertNotIn("tag_scores", result)
 
 
@@ -902,7 +918,7 @@ class NsfwAggregationTests(unittest.TestCase):
 
         self.assertEqual(result["nsfw"]["agreement"], "single")
         self.assertEqual(result["nsfw"]["label"], "normal")
-        self.assertEqual(result["tags"], ["动漫"])
+        self.assertEqual(result["tags"], ["sfw", "动漫"])  # verdict injected
 
     def test_verify_image_survives_a_secondary_failure(self):
         with patch.object(inference, "classify_nsfw",
@@ -954,9 +970,11 @@ class SchemaV2Tests(unittest.TestCase):
             set(payload),
             {"version", "source", "generated_at", "status", "model", "nsfw",
              "description", "tags", "tag_scores", "dropped_tags",
-             "verification"},
+             "verification", "vocabulary_version"},
         )
         self.assertEqual(payload["version"], sidecar.SIDECAR_VERSION)
+        self.assertEqual(payload["vocabulary_version"],
+                         normalize.vocab_version())
         self.assertEqual(payload["status"], "ok")
         self.assertEqual(payload["nsfw"]["agreement"], "low")
         self.assertEqual(payload["nsfw"]["models"]["primary"]["confidence"], 0.99)
@@ -1135,7 +1153,9 @@ class UpgradePathTests(unittest.TestCase):
         verify.assert_not_called()
         unload.assert_not_called()  # a re-cut needs no session at all
         state = self._state()
-        self.assertEqual(state["tags"], ["动漫"])  # 0.41 passes 0.4
+        # The re-cut re-injects the stored verdict (normal -> sfw) on top of
+        # the re-partitioned candidates: 0.41 passes 0.4, 浴袍 does not.
+        self.assertEqual(state["tags"], ["sfw", "动漫"])
         self.assertEqual(state["dropped_tags"], ["浴袍"])
         self.assertEqual(state["verification"]["threshold"], 0.4)
         self.assertEqual(state["verification"]["mean_score"], 0.305)
@@ -1621,7 +1641,7 @@ class MissingScoreTests(unittest.TestCase):
             threshold=0.0,
         )
 
-        self.assertEqual(result["tags"], ["甲"])
+        self.assertEqual(result["tags"], ["sfw", "甲"])  # verdict injected
         self.assertEqual(result["dropped_tags"], ["乙"])
         # None (not 0.0) marks "never scored", so no cutoff can keep it.
         self.assertIsNone(result["tag_scores"]["乙"])
@@ -1671,8 +1691,11 @@ class ManualSidecarTests(unittest.TestCase):
 
     The flag is re-read from disk on every decision, so it must block the
     v1 verification upgrade, the threshold re-cut, and failed-sidecar
-    retries alike -- while orphan cleanup (ownership = known version +
-    source) keeps treating these files as worker-owned.
+    retries alike -- the single exception is the model-free vocabulary
+    normalization (it rewrites only tag spellings plus
+    ``vocabulary_version`` and keeps ``manual`` and the version intact) --
+    while orphan cleanup (ownership = known version + source) keeps
+    treating these files as worker-owned.
     """
 
     def setUp(self):
@@ -1758,9 +1781,38 @@ class ManualSidecarTests(unittest.TestCase):
         self.assertEqual(stats["skipped"], 1)
         self.assertEqual(self._bytes(), original)
 
-    def test_manual_v1_is_never_upgraded(self):
+    def test_manual_v1_gets_only_the_model_free_vocabulary_upgrade(self):
         payload = self._v1()
         payload["manual"] = True
+        self._write(payload)
+
+        # A manual document predating the vocabulary is pending the
+        # model-free normalization, but that rewrite must never become the
+        # v1 -> v2 verification: no model runs and the version stays 1.
+        self.assertEqual(
+            sidecar.process_action(self.sidecar_path, threshold=0.25),
+            sidecar.ACTION_NORMALIZE,
+        )
+        with patch.object(inference, "tag_image") as qwen, \
+                patch.object(inference, "verify_image") as verify:
+            status = worker.process_one(self.image, threads=1, threshold=0.25)
+
+        self.assertEqual(status, "normalized")
+        verify.assert_not_called()
+        qwen.assert_not_called()
+        state = json.loads(self.sidecar_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["version"], 1)  # never upgraded to v2
+        self.assertIs(state["manual"], True)
+        # Manual documents get no forced classification tag either: the
+        # normal verdict does not append ``sfw`` here.
+        self.assertEqual(state["tags"], ["动漫", "浴袍"])
+        self.assertEqual(state["vocabulary_version"],
+                         normalize.vocab_version())
+
+    def test_manual_v1_at_the_current_vocabulary_stays_skipped(self):
+        payload = self._v1()
+        payload["manual"] = True
+        payload["vocabulary_version"] = normalize.vocab_version()
         self._write(payload)
         original = self._bytes()
 
@@ -1852,6 +1904,653 @@ class ManualSidecarTests(unittest.TestCase):
         self.assertEqual(removed, 1)  # manual does not change ownership
         self.assertFalse(orphan.exists())
         self.assertTrue(self.sidecar_path.exists())
+
+
+class VocabularyFileTests(unittest.TestCase):
+    """vocabulary.json must stay a valid, self-consistent closed list.
+
+    These checks auto-fail a hand edit that breaks the drafting rules:
+    every alias component has to be a canonical word (otherwise expansion
+    would invent a word), no word may appear twice, and the two verdict
+    words live only in the NSFW category.
+    """
+
+    @staticmethod
+    def _load():
+        path = (Path(__file__).resolve().parent
+                / "tag_worker" / "vocabulary.json")
+        return path, json.loads(path.read_text(encoding="utf-8"))
+
+    def test_vocabulary_file_loads_with_a_positive_version(self):
+        path, data = self._load()
+        self.assertTrue(path.is_file())
+        self.assertIsInstance(data["version"], int)
+        self.assertFalse(isinstance(data["version"], bool))
+        self.assertGreater(data["version"], 0)
+        self.assertEqual(data["version"], normalize.vocab_version())
+
+    def test_word_count_categories_and_alias_count_are_in_range(self):
+        _, data = self._load()
+        categories = data["categories"]
+        words = [w for items in categories.values() for w in items]
+        self.assertTrue(8 <= len(categories) <= 10, len(categories))
+        self.assertTrue(120 <= len(words) <= 160, len(words))
+        self.assertGreaterEqual(len(data["aliases"]), 40)
+
+    def test_no_word_appears_twice_across_categories(self):
+        _, data = self._load()
+        words = [w for items in data["categories"].values() for w in items]
+        self.assertEqual(len(words), len(set(words)))
+
+    def test_every_alias_component_is_a_canonical_word(self):
+        _, data = self._load()
+        words = {w for items in data["categories"].values() for w in items}
+        for key, components in data["aliases"].items():
+            with self.subTest(alias=key):
+                self.assertTrue(components)
+                for component in components:
+                    self.assertIn(component, words)
+
+    def test_verdict_words_live_only_in_the_nsfw_category(self):
+        _, data = self._load()
+        verdict_words = set(data["categories"].get("NSFW", []))
+        self.assertEqual(verdict_words, set(sidecar.CLASSIFICATION_TAGS))
+        for name, items in data["categories"].items():
+            if name == "NSFW":
+                continue
+            with self.subTest(category=name):
+                self.assertFalse(set(items) & sidecar.CLASSIFICATION_TAGS)
+
+
+class NormalizeTagsTests(unittest.TestCase):
+    """normalize_tags: alias expansion, order/dedup, out-of-words kept."""
+
+    def test_alias_expands_into_its_canonical_components(self):
+        self.assertEqual(normalize.normalize_tags(["动漫角色"]),
+                         ["动漫", "角色"])
+        self.assertEqual(normalize.normalize_tags(["肌肉男"]),
+                         ["肌肉", "男性"])
+        self.assertEqual(normalize.normalize_tags(["惊讶表情"]),
+                         ["惊讶", "表情"])
+        self.assertEqual(normalize.normalize_tags(["躺姿", "躺着"]),
+                         ["躺下"])
+
+    def test_order_is_preserved_and_duplicates_collapse(self):
+        self.assertEqual(
+            normalize.normalize_tags(["红发角色", "动漫", "动漫角色", "红发"]),
+            ["红发", "角色", "动漫"],
+        )
+
+    def test_out_of_vocabulary_words_pass_through_verbatim(self):
+        # 表外保留: a long-tail word is neither dropped nor rewritten.
+        self.assertEqual(normalize.normalize_tags(["机甲", "深海"]),
+                         ["机甲", "深海"])
+
+    def test_classification_words_survive_normalization(self):
+        self.assertEqual(normalize.normalize_tags(["nsfw", "动漫", "sfw"]),
+                         ["nsfw", "动漫", "sfw"])
+
+    def test_normalization_is_idempotent(self):
+        words = normalize.vocabulary_words() + ["机甲", "动漫角色", "sfw"]
+        once = normalize.normalize_tags(words)
+        self.assertEqual(normalize.normalize_tags(once), once)
+
+    def test_non_list_input_normalizes_to_empty(self):
+        self.assertEqual(normalize.normalize_tags("动漫角色"), [])
+        self.assertEqual(normalize.normalize_tags(None), [])
+
+    def test_missing_vocabulary_file_falls_back_to_identity(self):
+        missing = Path(tempfile.gettempdir()) / "absent-vocabulary-file.json"
+        missing.unlink(missing_ok=True)
+        with self.assertLogs("tag_worker.normalize", level="WARNING"):
+            self.assertEqual(normalize.vocab_version(missing), 0)
+        # Empty vocabulary == every word stays outside == kept verbatim.
+        self.assertEqual(
+            normalize.normalize_tags(["动漫角色", "机甲"], path=missing),
+            ["动漫角色", "机甲"],
+        )
+
+    def test_broken_vocabulary_file_falls_back_to_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = Path(tmp) / "vocabulary.json"
+            bad.write_text("{definitely not json", encoding="utf-8")
+            with self.assertLogs("tag_worker.normalize", level="WARNING"):
+                version = normalize.vocab_version(bad)
+            self.assertEqual(version, 0)
+            self.assertEqual(normalize.normalize_tags(["动漫角色"], path=bad),
+                             ["动漫角色"])
+
+    def test_vocabulary_cache_follows_the_file_mtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            vocab = Path(tmp) / "vocabulary.json"
+            vocab.write_text(json.dumps(
+                {"version": 3, "categories": {"类": ["甲"]},
+                 "aliases": {"乙": ["甲"]}},
+                ensure_ascii=False,
+            ), encoding="utf-8")
+            self.assertEqual(normalize.vocab_version(vocab), 3)
+            self.assertEqual(normalize.normalize_tags(["乙"], path=vocab),
+                             ["甲"])
+
+            vocab.write_text(json.dumps(
+                {"version": 4, "categories": {"类": ["甲", "乙"]},
+                 "aliases": {}},
+                ensure_ascii=False,
+            ), encoding="utf-8")
+            stamp = time.time() + 5  # guarantee a distinct mtime
+            os.utime(vocab, (stamp, stamp))
+            self.assertEqual(normalize.vocab_version(vocab), 4)
+            # The alias is gone in v4: the reload is picked up immediately.
+            self.assertEqual(normalize.normalize_tags(["乙"], path=vocab),
+                             ["乙"])
+
+    def test_concurrent_loaders_share_one_consistent_view(self):
+        import threading
+
+        results = []
+        barrier = threading.Barrier(8)
+
+        def load():
+            barrier.wait()
+            results.append((
+                normalize.vocab_version(),
+                tuple(normalize.normalize_tags(["动漫角色", "机甲"])),
+            ))
+
+        threads = [threading.Thread(target=load) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(len(results), 8)
+        self.assertEqual(len(set(results)), 1)
+
+
+class GenerationNormalizationTests(unittest.TestCase):
+    """Qwen candidates are normalized before CLIP scores them."""
+
+    def test_normalization_runs_before_scoring_and_keys_match(self):
+        events = []
+        real_normalize = sidecar.normalize_candidate_tags
+
+        def recording_normalize(tags):
+            result = real_normalize(tags)
+            events.append(("normalize", list(result)))
+            return result
+
+        def recording_score(image_bytes, tags, *, threads):
+            events.append(("score", list(tags)))
+            return [0.5] * len(tags)
+
+        with patch.object(inference, "classify_nsfw",
+                          return_value={"label": "normal",
+                                       "confidence": 0.9}), \
+                patch.object(inference, "_secondary_nsfw", return_value=None), \
+                patch.object(inference, "generate_tags",
+                             return_value="描述：x\n标签：动漫角色、肌肉男、机甲"), \
+                patch.object(sidecar, "normalize_candidate_tags",
+                             side_effect=recording_normalize), \
+                patch.object(inference, "score_tags",
+                             side_effect=recording_score):
+            result = inference.tag_image(_FAKE_IMAGE, threads=1, threshold=0.25)
+
+        kinds = [kind for kind, _ in events]
+        self.assertLess(kinds.index("normalize"), kinds.index("score"))
+        # CLIP scored exactly the canonical forms...
+        score_event = next(value for kind, value in events if kind == "score")
+        self.assertEqual(score_event, ["动漫", "角色", "肌肉", "男性", "机甲"])
+        # ...and the written keys are those same canonical forms.
+        self.assertEqual(set(result["tag_scores"]),
+                         {"动漫", "角色", "肌肉", "男性", "机甲"})
+        self.assertEqual(result["tags"],
+                         ["sfw", "动漫", "角色", "肌肉", "男性", "机甲"])
+        self.assertEqual(result["dropped_tags"], [])
+
+    def test_model_emitted_verdict_words_are_stripped(self):
+        with patch.object(inference, "classify_nsfw",
+                          return_value={"label": "normal",
+                                       "confidence": 0.9}), \
+                patch.object(inference, "_secondary_nsfw", return_value=None), \
+                patch.object(inference, "generate_tags",
+                             return_value="描述：x\n标签：nsfw、sfw、动漫"), \
+                patch.object(inference, "score_tags", return_value=[0.5]):
+            result = inference.tag_image(_FAKE_IMAGE, threads=1, threshold=0.25)
+
+        # The model may not self-grade: both words are removed first, then
+        # exactly the classifier's verdict (normal -> sfw) is injected once.
+        self.assertEqual(result["tags"], ["sfw", "动漫"])
+        self.assertNotIn("nsfw", result["tag_scores"])
+        self.assertNotIn("sfw", result["tag_scores"])
+
+    def test_verify_strips_stale_verdict_words_before_scoring(self):
+        with patch.object(inference, "classify_nsfw",
+                          return_value={"label": "normal",
+                                       "confidence": 0.9}), \
+                patch.object(inference, "_secondary_nsfw", return_value=None), \
+                patch.object(inference, "score_tags",
+                             return_value=[0.4]) as score:
+            result = inference.verify_image(
+                _FAKE_IMAGE, tags=["nsfw", "动漫"], threads=1, threshold=0.25
+            )
+
+        # The stale v1 verdict is gone; only the current verdict survives.
+        self.assertEqual(result["tags"], ["sfw", "动漫"])
+        self.assertEqual(result["dropped_tags"], [])
+        self.assertEqual(score.call_args.args[1], ["动漫"])
+
+    def test_prompt_library_lists_every_word_except_the_verdicts(self):
+        prompt = inference.vlm_prompt()
+        self.assertIn("描述：<一句中文描述>", prompt)
+        self.assertIn("标签：<5到10个中文标签，用、分隔>", prompt)
+        library = prompt.splitlines()[-1]
+        self.assertTrue(library.startswith("优先从标准标签库选择"))
+        listed = set(library.split("：", 1)[1].split("，"))
+        self.assertEqual(
+            listed,
+            set(normalize.vocabulary_words()) - sidecar.CLASSIFICATION_TAGS,
+        )
+        self.assertNotIn("nsfw", listed)
+        self.assertNotIn("sfw", listed)
+
+
+class RepartitionNormalizationTests(unittest.TestCase):
+    """The threshold re-cut normalizes legacy free-form score keys first."""
+
+    @staticmethod
+    def _legacy_state():
+        return {
+            "version": 2,
+            "source": "img.jpg",
+            "generated_at": "2026-10-27T10:00:00+08:00",
+            "status": "ok",
+            "model": "Qwen/Qwen2.5-VL-3B-Instruct",
+            "nsfw": {"label": "normal", "confidence": 0.9,
+                     "agreement": "high",
+                     "models": {"primary": {"label": "normal",
+                                            "confidence": 0.9},
+                                "secondary": {"label": "normal",
+                                              "confidence": 0.8}}},
+            "description": "描述",
+            "tags": ["动漫角色", "躺姿"],
+            "tag_scores": {"动漫角色": 0.41, "躺姿": 0.2, "肌肉男": 0.1},
+            "dropped_tags": ["肌肉男"],
+            "verification": {"model": "OFA-Sys/chinese-clip-vit-base-patch16",
+                             "threshold": 0.5, "mean_score": 0.24,
+                             "min_score": 0.1},
+        }
+
+    def test_recut_normalizes_keys_and_inherits_scores(self):
+        recut = sidecar.recut_tags(self._legacy_state(), 0.25)
+
+        # Alias expansion hands the same score to every new key; the re-cut
+        # re-partitions the canonical forms at the new threshold.
+        self.assertEqual(recut["tag_scores"],
+                         {"动漫": 0.41, "角色": 0.41, "躺下": 0.2,
+                          "肌肉": 0.1, "男性": 0.1})
+        self.assertEqual(recut["tags"], ["sfw", "动漫", "角色"])
+        self.assertEqual(recut["dropped_tags"], ["躺下", "肌肉", "男性"])
+        self.assertEqual(recut["vocabulary_version"], normalize.vocab_version())
+        self.assertEqual(recut["verification"]["threshold"], 0.25)
+        # The completeness invariant survives the rewrite.
+        self.assertEqual(
+            set(recut["tag_scores"]),
+            (set(recut["tags"]) - sidecar.CLASSIFICATION_TAGS)
+            | set(recut["dropped_tags"]),
+        )
+
+    def test_generated_normal_verdict_payload_still_recuts(self):
+        # A freshly generated sidecar carries ``sfw`` in tags but never in
+        # tag_scores; the completeness check ignores the marker, so a later
+        # threshold change can still re-cut it (and re-inject the verdict).
+        payload = sidecar.build_success_payload(
+            "img.jpg",
+            {"nsfw": {"label": "normal", "confidence": 0.9,
+                      "agreement": "high",
+                      "models": {"primary": {"label": "normal",
+                                             "confidence": 0.9},
+                                 "secondary": {"label": "normal",
+                                               "confidence": 0.8}}},
+             "description": "描述",
+             "tags": ["sfw", "动漫"],
+             "tag_scores": {"动漫": 0.41},
+             "dropped_tags": [],
+             "verification": {"model": inference.CLIP_MODEL,
+                              "threshold": 0.25, "mean_score": 0.41,
+                              "min_score": 0.41}},
+            inference.VLM_MODEL,
+        )
+
+        self.assertTrue(sidecar.repartition_needed(payload, 0.4))
+        recut = sidecar.recut_tags(payload, 0.4)
+
+        self.assertEqual(recut["tags"], ["sfw", "动漫"])  # 0.41 passes 0.4
+        self.assertEqual(recut["dropped_tags"], [])
+        self.assertEqual(recut["vocabulary_version"],
+                         normalize.vocab_version())
+
+    def test_legacy_sidecar_routes_to_recut_or_normalize(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.jpg.tags.json"
+            path.write_text(
+                json.dumps(self._legacy_state(), ensure_ascii=False),
+                encoding="utf-8",
+            )
+            # Stale threshold: the re-cut runs (and normalizes on the way).
+            self.assertEqual(
+                sidecar.process_action(path, threshold=0.25),
+                sidecar.ACTION_REPARTITION,
+            )
+            # Same threshold: only the vocabulary upgrade is pending.
+            self.assertEqual(
+                sidecar.process_action(path, threshold=0.5),
+                sidecar.ACTION_NORMALIZE,
+            )
+
+    def test_normalize_sidecar_stamps_and_keeps_the_invariant(self):
+        normalized = sidecar.normalize_sidecar(self._legacy_state())
+
+        # Vocabulary-only: buckets are not re-cut here, only respelled.
+        self.assertEqual(normalized["tags"],
+                         ["sfw", "动漫", "角色", "躺下"])
+        self.assertEqual(normalized["dropped_tags"], ["肌肉", "男性"])
+        self.assertEqual(normalized["tag_scores"],
+                         {"动漫": 0.41, "角色": 0.41, "躺下": 0.2,
+                          "肌肉": 0.1, "男性": 0.1})
+        self.assertEqual(normalized["vocabulary_version"],
+                         normalize.vocab_version())
+        self.assertEqual(
+            set(normalized["tag_scores"]),
+            (set(normalized["tags"]) - sidecar.CLASSIFICATION_TAGS)
+            | set(normalized["dropped_tags"]),
+        )
+
+
+class VocabularyUpgradeTests(unittest.TestCase):
+    """Stock sidecars upgrade to the current vocabulary without any model."""
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.addCleanup(worker._upgrade_failures.clear)
+        self.addCleanup(worker._write_failures.clear)
+        self.root = Path(self.tempdir.name)
+        self.image = self.root / "img.jpg"
+        self.image.write_bytes(_FAKE_IMAGE)
+        self.sidecar_path = sidecar.sidecar_path_for(self.image)
+
+    def _write(self, payload):
+        sidecar.atomic_write_json(self.sidecar_path, payload)
+
+    def _state(self):
+        return json.loads(self.sidecar_path.read_text(encoding="utf-8"))
+
+    @staticmethod
+    def _ok_state(**extra):
+        state = {
+            "version": 2,
+            "source": "img.jpg",
+            "generated_at": "2026-10-27T10:00:00+08:00",
+            "status": "ok",
+            "model": "Qwen/Qwen2.5-VL-3B-Instruct",
+            "nsfw": {"label": "normal", "confidence": 0.9,
+                     "agreement": "high",
+                     "models": {"primary": {"label": "normal",
+                                            "confidence": 0.9},
+                                "secondary": {"label": "normal",
+                                              "confidence": 0.8}}},
+            "description": "描述",
+            "tags": ["动漫角色", "机甲"],
+            "tag_scores": {"动漫角色": 0.41, "机甲": 0.2},
+            "dropped_tags": [],
+            "verification": {"model": "OFA-Sys/chinese-clip-vit-base-patch16",
+                             "threshold": sidecar.DEFAULT_CLIP_THRESHOLD,
+                             "mean_score": 0.305, "min_score": 0.2},
+        }
+        state.update(extra)
+        return state
+
+    def test_pure_vocabulary_round_loads_no_model_at_all(self):
+        self._write(self._ok_state())  # no vocabulary_version -> pending
+
+        with patch.object(inference, "_load_nsfw") as l1, \
+                patch.object(inference, "_load_nsfw2") as l2, \
+                patch.object(inference, "_load_clip") as l3, \
+                patch.object(inference, "_load_vlm") as l4, \
+                patch.object(inference, "tag_image") as tag, \
+                patch.object(inference, "verify_image") as verify, \
+                patch.object(worker, "_drain_session") as session:
+            stats = worker.run_once(self.root, threads=1, item_delay=0)
+
+        # Zero-model proof: no loader, no inference call, no session at all.
+        for loader in (l1, l2, l3, l4):
+            loader.assert_not_called()
+        tag.assert_not_called()
+        verify.assert_not_called()
+        session.assert_not_called()
+        self.assertEqual(stats["normalized"], 1)
+        self.assertEqual(stats["processed"], 0)
+        self.assertEqual(stats["skipped"], 0)
+
+        state = self._state()
+        self.assertEqual(state["vocabulary_version"],
+                         normalize.vocab_version())
+        self.assertEqual(state["tags"],
+                         ["sfw", "动漫", "角色", "机甲"])
+        self.assertEqual(state["tag_scores"],
+                         {"动漫": 0.41, "角色": 0.41, "机甲": 0.2})
+
+        # The next round sees a current sidecar and skips it.
+        again = worker.run_once(self.root, threads=1, item_delay=0)
+        self.assertEqual(again["normalized"], 0)
+        self.assertEqual(again["skipped"], 1)
+
+    def test_manual_sidecar_is_normalized_without_losing_manual(self):
+        self._write(self._ok_state(
+            manual=True, manual_edited_at="2026-10-28T09:00:00+08:00",
+        ))
+
+        with patch.object(inference, "tag_image") as tag, \
+                patch.object(inference, "verify_image") as verify:
+            stats = worker.run_once(self.root, threads=1, item_delay=0)
+
+        tag.assert_not_called()
+        verify.assert_not_called()
+        self.assertEqual(stats["normalized"], 1)
+        state = self._state()
+        self.assertIs(state["manual"], True)
+        self.assertEqual(state["manual_edited_at"], "2026-10-28T09:00:00+08:00")
+        self.assertEqual(state["vocabulary_version"],
+                         normalize.vocab_version())
+        # Vocabulary only: no classification tag is forced onto a manual doc.
+        self.assertEqual(state["tags"], ["动漫", "角色", "机甲"])
+
+    def test_migration_adds_the_stored_nsfw_verdict(self):
+        self._write(self._ok_state(
+            tags=["动漫"], tag_scores={"动漫": 0.5},
+            nsfw={"label": "nsfw", "confidence": 0.9, "agreement": "high",
+                  "models": {"primary": {"label": "nsfw", "confidence": 0.9},
+                             "secondary": {"label": "nsfw",
+                                           "confidence": 0.8}}},
+        ))
+
+        self.assertEqual(worker.process_one(self.image, threads=1),
+                         "normalized")
+        state = self._state()
+        self.assertEqual(state["tags"], ["nsfw", "动漫"])
+        self.assertNotIn("nsfw", state["tag_scores"])
+
+    def test_missing_nsfw_record_is_never_guessed_from(self):
+        state = self._ok_state()
+        del state["nsfw"]
+        self._write(state)
+
+        self.assertEqual(worker.process_one(self.image, threads=1),
+                         "normalized")
+        written = self._state()
+        # No verdict block -> no verdict word is invented.
+        self.assertEqual(written["tags"], ["动漫", "角色", "机甲"])
+        self.assertEqual(written["vocabulary_version"],
+                         normalize.vocab_version())
+
+    def test_automatic_document_strips_verdicts_even_without_a_record(self):
+        # A leftover verdict word in an automatic document can only be a
+        # stale model self-assessment; strip it whether or not the nsfw
+        # record is usable, so the completeness check can hold again.
+        state = self._ok_state(tags=["sfw", "动漫角色"],
+                               tag_scores={"sfw": 0.4, "动漫角色": 0.41})
+        del state["nsfw"]
+        self._write(state)
+
+        self.assertEqual(worker.process_one(self.image, threads=1),
+                         "normalized")
+        written = self._state()
+        self.assertEqual(written["tags"], ["动漫", "角色"])  # nothing guessed
+        self.assertEqual(written["tag_scores"],
+                         {"动漫": 0.41, "角色": 0.41})
+        self.assertEqual(
+            set(written["tag_scores"]),
+            set(written["tags"]) | set(written["dropped_tags"]),
+        )
+
+    def test_minimal_document_keeps_fields_it_never_had(self):
+        # "Rewrite only the spellings + stamp": a minimal document without
+        # dropped_tags/tag_scores/... must not gain empty ones.
+        self._write({
+            "version": 2,
+            "source": "img.jpg",
+            "generated_at": "2026-10-27T10:00:00+08:00",
+            "status": "ok",
+            "model": "manual",
+            "description": "",
+            "tags": ["动漫角色", "nsfw"],
+            "manual": True,
+            "manual_edited_at": "2026-10-28T09:00:00+08:00",
+        })
+
+        self.assertEqual(worker.process_one(self.image, threads=1),
+                         "normalized")
+        written = self._state()
+        self.assertEqual(written["tags"], ["动漫", "角色", "nsfw"])
+        for absent in ("dropped_tags", "tag_scores", "nsfw", "verification"):
+            with self.subTest(absent=absent):
+                self.assertNotIn(absent, written)
+        self.assertIs(written["manual"], True)
+        self.assertEqual(written["vocabulary_version"],
+                         normalize.vocab_version())
+
+    def test_maintenance_window_still_runs_the_vocabulary_pass(self):
+        # The pre-pass runs before the window check: a pure vocabulary
+        # upgrade drains inside a window without a session or a loader.
+        self._write(self._ok_state())
+
+        with patch.object(worker, "in_maint_window", return_value=True), \
+                patch.object(inference, "_load_nsfw") as l1, \
+                patch.object(inference, "_load_nsfw2") as l2, \
+                patch.object(inference, "_load_clip") as l3, \
+                patch.object(inference, "_load_vlm") as l4, \
+                patch.object(inference, "tag_image") as tag, \
+                patch.object(worker, "_drain_session") as session:
+            stats = worker.run_once(self.root, threads=1, item_delay=0,
+                                    maint_windows=[(0, 1440)])
+
+        self.assertEqual(stats["normalized"], 1)
+        self.assertEqual(stats["paused"], 0)  # no model work was deferred
+        for loader in (l1, l2, l3, l4):
+            loader.assert_not_called()
+        tag.assert_not_called()
+        session.assert_not_called()
+        self.assertEqual(self._state()["vocabulary_version"],
+                         normalize.vocab_version())
+
+    def test_current_vocabulary_sidecar_is_skipped_entirely(self):
+        self._write(self._ok_state(
+            vocabulary_version=normalize.vocab_version(),
+        ))
+
+        with patch.object(inference, "tag_image") as tag:
+            status = worker.process_one(self.image, threads=1)
+
+        self.assertEqual(status, "skipped")
+        tag.assert_not_called()
+
+    def test_only_ok_sidecars_of_known_versions_route_to_normalize(self):
+        cases = (
+            # v1 stays on the verification path (its models run later).
+            ({"version": 1, "source": "img.jpg", "status": "ok",
+              "tags": ["动漫"]}, sidecar.ACTION_VERIFY),
+            # Foreign versions are never touched.
+            ({"version": 7, "source": "img.jpg", "status": "ok",
+              "tags": ["动漫"]}, sidecar.ACTION_SKIP),
+            # Failed sidecars keep the unchanged cooldown/attempt policy.
+            ({"version": 2, "source": "img.jpg", "status": "failed",
+              "attempts": 3}, sidecar.ACTION_SKIP),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.jpg.tags.json"
+            for state, expected in cases:
+                with self.subTest(version=state["version"],
+                                  status=state["status"]):
+                    path.write_text(json.dumps(state, ensure_ascii=False),
+                                    encoding="utf-8")
+                    self.assertEqual(
+                        sidecar.process_action(path, threshold=0.30),
+                        expected,
+                    )
+
+    def test_normalization_failures_share_the_no_overwrite_backoff(self):
+        self._write(self._ok_state())
+
+        with patch.object(sidecar, "atomic_write_json",
+                          side_effect=OSError("disk full")):
+            statuses = [worker.process_one(self.image, threads=1)
+                        for _ in range(4)]
+
+        self.assertEqual(statuses, ["upgrade-failed", "upgrade-failed",
+                                    "upgrade-failed", "backoff"])
+        # The original sidecar was never overwritten.
+        self.assertNotIn("vocabulary_version", self._state())
+        self.assertEqual(self._state()["tags"], ["动漫角色", "机甲"])
+
+
+class ClassificationSymmetryTests(unittest.TestCase):
+    """nsfw/sfw are symmetric: verdict-injected and CLIP-exempt."""
+
+    def test_verdict_marker_is_exempt_from_scoring(self):
+        self.assertEqual(
+            inference._score_candidates(["nsfw", "sfw", "动漫"]),
+            ["动漫"],
+        )
+        self.assertEqual(
+            inference._score_candidates(["nsfw", "动漫"]),
+            ["动漫"],
+        )
+
+    def test_sfw_survives_any_threshold_without_a_score(self):
+        result = inference.assemble_result(
+            "描述：x\n标签：动漫",
+            {"label": "normal", "confidence": 0.9},
+            tag_scores={"动漫": 0.5},
+            threshold=0.0,
+        )
+
+        self.assertEqual(result["tags"], ["sfw", "动漫"])
+        # Never scored, never dropped: no threshold can remove the verdict.
+        self.assertNotIn("sfw", result["tag_scores"])
+        self.assertEqual(result["dropped_tags"], [])
+
+    def test_nsfw_verdict_still_injects_nsfw_first(self):
+        with patch.object(inference, "classify_nsfw",
+                          return_value={"label": "nsfw",
+                                       "confidence": 0.9}), \
+                patch.object(inference, "_secondary_nsfw", return_value=None), \
+                patch.object(inference, "generate_tags",
+                             return_value="描述：x\n标签：动漫"), \
+                patch.object(inference, "score_tags", return_value=[0.5]):
+            result = inference.tag_image(_FAKE_IMAGE, threads=1, threshold=0.25)
+
+        self.assertEqual(result["tags"], ["nsfw", "动漫"])
+        self.assertNotIn("nsfw", result["tag_scores"])
 
 
 if __name__ == "__main__":

@@ -16,6 +16,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from . import normalize
+
 # ``<full filename>.tags.json`` lives next to its source image, e.g.
 # ``a.jpg.tags.json``. Gallery/dedup/thumbnail/viewer walks filter on
 # IMAGE_EXTS, so these files are invisible to file_browser.py.
@@ -47,6 +49,23 @@ KNOWN_SIDECAR_VERSIONS = frozenset({1, SIDECAR_VERSION})
 # NSFW agreement levels written by the two-classifier cross-check.
 NSFW_AGREEMENTS = frozenset({"high", "low", "single"})
 
+# Classifier-owned verdict tags.  ``nsfw`` and its symmetric counterpart
+# ``sfw`` are canonical vocabulary words but never Qwen candidates: the
+# worker strips them from raw model output, injects exactly the stored
+# dual-classifier verdict, and exempts both from CLIP scoring so no
+# threshold can keep or drop a verdict.
+CLASSIFICATION_TAGS = frozenset({"nsfw", "sfw"})
+
+
+def classification_marker(label: Any) -> str | None:
+    """The verdict tag for a classifier label: ``nsfw`` / ``sfw`` / None."""
+    text = str(label or "").strip().lower()
+    if text == "nsfw":
+        return "nsfw"
+    if text == "normal":
+        return "sfw"
+    return None
+
 # CLIP cosine cutoff used to keep or drop a proposed tag. Calibrated on the
 # production gallery (183 sidecars / 1047 tags: min 0.264, median 0.361):
 # 0.30 trims 2.3% of tags (~1.1% once the exempt nsfw marker is excluded),
@@ -60,6 +79,13 @@ ACTION_SKIP = "skip"            # nothing to do this round
 ACTION_TAG = "tag"              # full pipeline (NSFW + Qwen + CLIP)
 ACTION_VERIFY = "verify"        # v1 -> v2 upgrade: NSFW + CLIP only, no Qwen
 ACTION_REPARTITION = "repartition"  # v2 re-cut at a new threshold, no models
+# Vocabulary upgrade: rewrite tags/dropped/tag_scores keys to the current
+# ``vocabulary.json`` canonical forms and stamp ``vocabulary_version``.
+# Model-free like the re-cut (JSON rewriter only), and it is the one worker
+# path allowed to touch a ``manual: true`` sidecar -- the manual *content*
+# stays human-owned, only the spelling is standardized (the flag itself is
+# preserved).
+ACTION_NORMALIZE = "normalize"
 
 _TAG_NOISE = " \t、,，;；:：\"'“”‘’"
 
@@ -221,19 +247,160 @@ def repartition_needed(state: Any, threshold: float) -> bool:
             or not math.isfinite(float(value))
         ):
             return False
-    nsfw = state.get("nsfw")
-    label = nsfw.get("label") if isinstance(nsfw, dict) else None
     kept = {
         tag for tag in state.get("tags") or []
         if isinstance(tag, str)
+        and str(tag).lower() not in CLASSIFICATION_TAGS
     }
+    # Classifier verdicts are injected, never scored, so they are excluded
+    # from the completeness check (a legacy document may still carry a
+    # Qwen-emitted verdict word as a scored candidate; the re-cut strips
+    # those keys, so the check stays symmetric on both sides).
     dropped = {
         tag for tag in state.get("dropped_tags") or []
         if isinstance(tag, str)
     }
-    if str(label or "").strip().lower() == "nsfw":
-        kept.discard("nsfw")  # classifier marker: exempt from scoring
     return set(scores) == kept | dropped
+
+
+def vocab_upgrade_needed(state: Any) -> bool:
+    """True when an ``ok`` sidecar predates the current tag vocabulary.
+
+    Sidecars without a ``vocabulary_version`` (everything written before
+    the field existed) or stamped with an older version are pending the
+    model-free normalization round.  With no usable vocabulary file the
+    current version is 0, so nothing is pending and no sidecar is
+    rewritten just to record a version that carries no information.
+    """
+    if not isinstance(state, dict) or state.get("status") != "ok":
+        return False
+    current = normalize.vocab_version()
+    if current <= 0:
+        return False
+    recorded = state.get("vocabulary_version")
+    if isinstance(recorded, bool) or not isinstance(recorded, int):
+        return True
+    return int(recorded) < current
+
+
+def _better_score(left: float | None, right: float | None) -> float | None:
+    """Merge duplicate targets: any finite score beats ``None`` (unconfirmed)."""
+    if left is None:
+        return right
+    if right is None:
+        return left
+    return left if float(left) >= float(right) else right
+
+
+def normalize_score_map(scores: dict[str, Any]) -> dict[str, float | None]:
+    """Normalize ``tag_scores`` keys to canonical forms.
+
+    One alias key expanding to several canonical words hands the *same*
+    score to each new key; several input keys collapsing onto one word
+    merge to their best finite score (``None`` = unconfirmed always
+    loses), so a concept confirmed through any of its aliases keeps the
+    strongest evidence.  Values are expected to be ``_score_map`` output
+    (finite float or ``None``).
+    """
+    merged: dict[str, float | None] = {}
+    for tag, value in scores.items():
+        if not isinstance(tag, str):
+            continue
+        for key in normalize.normalize_tags([tag]):
+            if key not in merged:
+                merged[key] = value
+            else:
+                merged[key] = _better_score(merged[key], value)
+    return merged
+
+
+def normalize_sidecar(state: dict[str, Any]) -> dict[str, Any]:
+    """Vocabulary-normalize a sidecar (returns a copy); never runs a model.
+
+    ``tags`` and the ``tag_scores`` keys become canonical forms (a score
+    is inherited by every component an alias expands to), an absent
+    ``dropped_tags`` stays absent, then ``vocabulary_version`` is stamped
+    with the current version.  For a non-``manual`` document leftover
+    verdict words are stripped from tags/dropped/scores unconditionally
+    (in an automatic document they can only be stale model
+    self-assessments, and stripping them is what lets the completeness
+    check hold again) and the stored dual-classifier verdict, when
+    present, is inserted first -- a missing ``nsfw`` record is never
+    guessed from, and ``manual`` documents get vocabulary normalization
+    only.
+
+    Every other field is carried over untouched, and no list is
+    re-bounded: normalization may grow a list, and trimming it here would
+    break ``set(tag_scores) == tags | dropped_tags``.  Because
+    ``normalize`` is a deterministic per-word function, that invariant
+    survives the rewrite for any sidecar that satisfied it before.
+    """
+    payload = dict(state)
+    payload["tags"] = normalize.normalize_tags(
+        [tag for tag in state.get("tags") or [] if isinstance(tag, str)]
+    )
+    if "dropped_tags" in state:
+        # Absent stays absent: a minimal document without the field must
+        # not gain an empty one from this rewrite.
+        payload["dropped_tags"] = normalize.normalize_tags(
+            [tag for tag in state.get("dropped_tags") or []
+             if isinstance(tag, str)]
+        )
+    raw_scores = state.get("tag_scores")
+    if isinstance(raw_scores, dict):
+        payload["tag_scores"] = normalize_score_map(_score_map(raw_scores))
+    if not state.get("manual"):
+        # Symmetric classification migration, riding the same model-free
+        # rewrite: strip every leftover verdict word from tags, dropped and
+        # scores regardless of whether the ``nsfw`` record is usable, then
+        # (re)insert the stored verdict first when there is one.  A missing
+        # record is never guessed from, and ``manual`` documents only get
+        # the vocabulary normalization -- the human owns their
+        # classification words.
+        nsfw = state.get("nsfw") if isinstance(state.get("nsfw"), dict) else {}
+        verdict = classification_marker(nsfw.get("label"))
+        kept = [
+            tag for tag in payload["tags"]
+            if str(tag).lower() not in CLASSIFICATION_TAGS
+        ]
+        payload["tags"] = (
+            [verdict] if verdict is not None else []
+        ) + kept
+        if "dropped_tags" in payload:
+            payload["dropped_tags"] = [
+                tag for tag in payload["dropped_tags"]
+                if str(tag).lower() not in CLASSIFICATION_TAGS
+            ]
+        if isinstance(payload.get("tag_scores"), dict):
+            payload["tag_scores"] = {
+                key: value
+                for key, value in payload["tag_scores"].items()
+                if str(key).lower() not in CLASSIFICATION_TAGS
+            }
+    payload["vocabulary_version"] = normalize.vocab_version()
+    return payload
+
+
+def normalize_candidate_tags(tags: Any) -> list[str]:
+    """Qwen candidates -> canonical forms minus verdict words, ``MAX_TAGS``-bounded.
+
+    Runs after :func:`clean_tags` and before CLIP scoring, so scores,
+    ``tags`` and ``dropped_tags`` keys all share the canonical spellings.
+    The classifier-owned ``nsfw``/``sfw`` words are stripped here: a model
+    may not assert its own verdict, only the dual NSFW classifiers may
+    (the verdict is injected afterward by :func:`apply_nsfw_tag`), and the
+    stripped words can therefore never reach CLIP either.
+
+    The candidate bound is re-applied because one alias may expand into
+    several words; keeping the pre-existing ``MAX_TAGS`` cap preserves the
+    ``MAX_TAGS + 1`` payload bound (with the injected verdict marker) and
+    with it the ``set(tag_scores) == tags | dropped_tags`` invariant.
+    """
+    normalized = normalize.normalize_tags(tags)
+    return [
+        tag for tag in normalized
+        if tag.lower() not in CLASSIFICATION_TAGS
+    ][:MAX_TAGS]
 
 
 def process_action(
@@ -246,12 +413,18 @@ def process_action(
     """Classify what one image still needs: tag/verify/repartition/skip.
 
     - ``manual: true`` sidecar -> ``skip`` (dual-write protocol: the file
-      browser's manual tag edit wins over every worker path)
+      browser's manual tag edit wins over every worker path), except that
+      a pending vocabulary normalization still applies (it rewrites only
+      the tag spellings plus ``vocabulary_version`` and keeps every other
+      field, ``manual`` included, untouched)
     - missing or corrupt sidecar -> ``tag`` (full pipeline)
     - ``status: ok`` at version 1 -> ``verify`` (CLIP + dual-NSFW upgrade,
-      the Qwen description/tags are kept as written)
+      the Qwen description/tags are kept as written; the payload is
+      normalized and stamped like any new write)
     - ``status: ok`` at version 2 -> ``repartition`` when the recorded
-      threshold differs from the current one, otherwise ``skip``
+      threshold differs from the current one (the re-cut normalizes the
+      keys first), ``normalize`` when the sidecar predates the current
+      vocabulary version, otherwise ``skip``
     - ``status: failed`` -> the unchanged cooldown/attempt policy
 
     The ``manual`` flag is re-read from disk on every call (this function
@@ -274,14 +447,27 @@ def process_action(
         # Dual-write protocol: a human edited this sidecar through the
         # gallery's manual tag routes, so it is read-only for the worker --
         # checked before status/version so it also overrides a failed
-        # retry and a complete-score re-cut at a changed threshold.
+        # retry and a complete-score re-cut at a changed threshold.  The
+        # one exception is the model-free vocabulary normalization: it is
+        # pending for any known-version ``ok`` document that predates the
+        # current vocabulary, and it preserves every field including the
+        # manual markers.
+        if (
+            state.get("version") in KNOWN_SIDECAR_VERSIONS
+            and vocab_upgrade_needed(state)
+        ):
+            return ACTION_NORMALIZE
         return ACTION_SKIP
     status = state.get("status")
     if status == "ok":
         version = state.get("version")
         if version == SIDECAR_VERSION:
             if threshold is not None and repartition_needed(state, threshold):
+                # The re-cut normalizes the keys as well, so it also clears
+                # a pending vocabulary upgrade in the same model-free pass.
                 return ACTION_REPARTITION
+            if vocab_upgrade_needed(state):
+                return ACTION_NORMALIZE
             return ACTION_SKIP
         if isinstance(version, int) and not isinstance(version, bool) and version == 1:
             return ACTION_VERIFY
@@ -380,6 +566,10 @@ def build_success_payload(
             str(tag) for tag in dropped if isinstance(tag, str)
         ][:MAX_TAGS],
         "verification": verification,
+        # Every writer records the vocabulary it normalized against, so a
+        # later vocabulary bump turns this sidecar into pending work for
+        # the model-free normalization round.
+        "vocabulary_version": normalize.vocab_version(),
     }
 
 
@@ -444,24 +634,32 @@ def recut_tags(state: dict[str, Any], threshold: float) -> dict[str, Any]:
     """Re-partition a v2 sidecar's stored scores at a new threshold.
 
     Pure bookkeeping: no model runs, and only ``tags``, ``dropped_tags``,
-    ``generated_at`` and the ``verification`` threshold/mean/min change.
+    ``generated_at``, the ``verification`` threshold/mean/min and the
+    ``vocabulary_version`` stamp change.  The score keys are normalized to
+    canonical vocabulary forms first -- alias components inherit the same
+    score -- and ``tags``/``dropped_tags`` are rebuilt from those keys, so
+    normalizing keys, tags and dropped together keeps
+    ``set(tag_scores) == tags | dropped_tags`` by construction.
     Raises ``ValueError`` when the stored state cannot be re-cut (the
     caller then leaves the file untouched).
     """
     if not repartition_needed(state, threshold):
         raise ValueError("sidecar scores are incomplete or already at threshold")
-    scores = _score_map(state.get("tag_scores"))
+    scores = normalize_score_map(_score_map(state.get("tag_scores")))
+    # Verdict words are injected, never scored: drop any legacy marker keys
+    # so the rewritten ``tag_scores`` matches the rebuilt buckets exactly.
+    scores = {
+        key: value for key, value in scores.items()
+        if str(key).lower() not in CLASSIFICATION_TAGS
+    }
     nsfw = state.get("nsfw") if isinstance(state.get("nsfw"), dict) else {}
     nsfw_label = nsfw.get("label")
-    marker = str(nsfw_label or "").strip().lower() == "nsfw"
+    verdict = classification_marker(nsfw_label)
     # ``tag_scores`` keeps the original candidate order, so the re-cut
     # preserves the Qwen tag order even for tags that move between buckets.
-    candidates = [
-        tag for tag in scores
-        if not (marker and str(tag).lower() == "nsfw")
-    ]
+    candidates = list(scores)
     kept, dropped = partition_tags(candidates, scores, threshold)
-    if marker:
+    if verdict is not None:
         kept = apply_nsfw_tag(kept, nsfw_label)
     values = [float(scores[tag]) for tag in candidates]
     payload = dict(state)
@@ -469,7 +667,11 @@ def recut_tags(state: dict[str, Any], threshold: float) -> dict[str, Any]:
     payload["status"] = "ok"
     payload["tags"] = kept
     payload["dropped_tags"] = dropped
+    # The normalized key map goes back with the buckets: legacy free-form
+    # keys are replaced by their canonical forms in the same rewrite.
+    payload["tag_scores"] = scores
     payload["generated_at"] = _now_iso()
+    payload["vocabulary_version"] = normalize.vocab_version()
     payload["verification"] = {
         **(dict(state.get("verification"))
            if isinstance(state.get("verification"), dict) else {}),
@@ -521,16 +723,24 @@ def clean_tags(tags: Any) -> list[str]:
 
 
 def apply_nsfw_tag(tags: list[str], nsfw_label: Any) -> list[str]:
-    """Insert ``nsfw`` as the first tag when the classifier flags the image.
+    """Insert the classifier verdict as the first tag (``nsfw`` or ``sfw``).
 
     The marker is prepended without truncating confirmed candidates: a full
     ``MAX_TAGS`` candidate list stays intact (result cap ``MAX_TAGS + 1``),
     so no passing tag can vanish from *both* ``tags`` and ``dropped_tags``
     and silently break the repartition completeness check. ``MAX_TAGS``
     still bounds the Qwen candidate cleaning in :func:`clean_tags`.
+
+    The injection is symmetric: an ``nsfw`` verdict yields ``nsfw`` first,
+    a ``normal`` verdict yields ``sfw`` first, and any leftover verdict
+    word of the opposite kind is removed (only the classifiers may assert
+    a verdict). An unknown/absent label leaves the list untouched.
     """
-    label = str(nsfw_label or "").strip().lower()
-    if label != "nsfw":
+    marker = classification_marker(nsfw_label)
+    if marker is None:
         return list(tags)
-    rest = [str(tag) for tag in tags if str(tag).lower() != "nsfw"]
-    return (["nsfw"] + rest)[: MAX_TAGS + 1]
+    rest = [
+        str(tag) for tag in tags
+        if str(tag).lower() not in CLASSIFICATION_TAGS
+    ]
+    return ([marker] + rest)[: MAX_TAGS + 1]
