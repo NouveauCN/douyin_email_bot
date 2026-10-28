@@ -378,7 +378,15 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   counted tags with `untagged`/`nsfw`/`total` and a 30-second cache; the two
   verdict words are pinned to the top of that list (`sfw` first, `nsfw`
   second, only when actually present) while all other tags keep the
-  count-descending, lexicographic-tiebreak order. The
+  count-descending, lexicographic-tiebreak order. Display verdicts are
+  derived from `tags` membership alone: the per-image `nsfw` boolean is
+  `'nsfw' in tags`, the top-level `nsfw` counter counts the same
+  membership, and `?tag=nsfw` filters on it, so the boolean, the count, and
+  the filter can never drift apart (they previously followed the sidecar's
+  `nsfw.label` and could disagree with the tags actually rendered). The
+  sidecar's `nsfw` block (`label`/`confidence`/`agreement`/`models`) is
+  classifier history, never rewritten for display or by a manual edit, and
+  `agreement` alone still drives the disputed-chip styling. The
   inline UI renders clickable tag chips with a tooltip of description plus
   `平均置信 NN%` when a confidence exists, paints an `nsfw` chip amber
   (`.tag-chip.nsfw-low`) with an `NSFW 判定不一致` tooltip note when the two
@@ -414,18 +422,34 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   …) is carried over, and a `status: failed` document is promoted to `ok` so
   the edited tags actually render. Tags are stripped, de-duplicated in order,
   normalized against the shared closed vocabulary (alias expansion to
-  canonical forms; `nsfw`/`sfw` pass through like any other word — this
-  route never adds or removes a classification tag), capped at 12 entries of
-  at most 32 characters — the bounds apply to the submitted input, so an
+  canonical forms), capped at 12 entries of at most
+  32 characters — the bounds apply to the submitted input, so an
   alias expansion may legitimately yield more entries — and any violation
   returns
-  `400` with a message without touching the disk; success returns
+  `400` with a message without touching the disk. After normalization and
+  before the write, the route enforces the **exactly-one-verdict-word
+  rule**: the stored `tags` must hold exactly one of `nsfw`/`sfw`, always
+  in first position. A submission containing `nsfw` keeps it and drops any
+  `sfw` (an explicit re-judgement wins); a submission without `nsfw` gets
+  `sfw` injected first. The semantics are deliberately asymmetric — the
+  default verdict must never degrade because a user deleted something:
+  deleting `nsfw` flips the image to `sfw`; deleting `sfw` only regresses
+  to `sfw` and **never** escalates to `nsfw`; only an explicit `nsfw`
+  submission re-judges an image. This is the one place in the manual route
+  that adds or removes a classification word (the sidecar's `nsfw`
+  classifier block is still carried over untouched — only `tags` and the
+  manual markers change), and because the 12-entry cap governs the
+  submitted input, an injected marker may leave 13 stored entries, exactly
+  like the worker's marker injection. Success returns
   `{success, tags, manual}` and invalidates the gallery scan + tag-summary
   caches. An image with no sidecar gets the minimal `version 2` document
   described above. `POST /api/comics/tags/reset` takes `{path}`, deletes that
   sidecar (idempotent when it is already absent), and returns `{success}` —
   the gallery's 「恢复自动标签」 action, after which the worker regenerates
-  tags on a later round. Path-validation, tag-bound, and write failures from
+  tags on a later round. While the edited list still holds `nsfw`, the
+  modal also shows the small note 「删除 nsfw 保存后将自动改为 sfw」
+  (`.tag-modal-verdict-hint`, shown/hidden with the `hidden` property as
+  chips change), warning about exactly this rule. Path-validation, tag-bound, and write failures from
   both routes are JSON errors that never leak absolute paths (the pre-existing
   global same-origin `before_request` check still answers with the app's HTML
   error page, unchanged). The inline UI opens an editor modal from the card's ✎

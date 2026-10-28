@@ -107,7 +107,7 @@ class ComicsTagTestCase(unittest.TestCase):
 class ApiComicsTagTests(ComicsTagTestCase):
     def test_api_comics_returns_tags_nsfw_and_description(self):
         self.write_image(
-            "a.png", _sidecar(["动漫", "少女"], nsfw_label="nsfw",
+            "a.png", _sidecar(["动漫", "少女", "nsfw"], nsfw_label="nsfw",
                               description="一位少女")
         )
         self.write_image("b.png")
@@ -116,7 +116,7 @@ class ApiComicsTagTests(ComicsTagTestCase):
 
         self.assertEqual(payload["total"], 2)
         tagged, plain = payload["images"]
-        self.assertEqual(tagged["tags"], ["动漫", "少女"])
+        self.assertEqual(tagged["tags"], ["动漫", "少女", "nsfw"])
         self.assertIs(tagged["nsfw"], True)
         self.assertEqual(tagged["description"], "一位少女")
         self.assertEqual(plain["tags"], [])
@@ -215,7 +215,10 @@ class ApiComicsTagTests(ComicsTagTestCase):
 
 class ComicsTagsSummaryTests(ComicsTagTestCase):
     def test_summary_counts_are_sorted_and_report_totals(self):
-        self.write_image("a.png", _sidecar(["动漫", "少女"], nsfw_label="nsfw"))
+        # The verdict counter follows ``tags`` membership (a.png holds the
+        # nsfw word), not the sidecar's classifier label history.
+        self.write_image("a.png", _sidecar(["动漫", "少女", "nsfw"],
+                                           nsfw_label="nsfw"))
         self.write_image("b.png", _sidecar(["动漫"]))
         self.write_image("c.png", _sidecar(["少女"]))
         self.write_image("d.png")
@@ -229,6 +232,7 @@ class ComicsTagsSummaryTests(ComicsTagTestCase):
         self.assertEqual(
             payload["tags"],
             [
+                {"tag": "nsfw", "count": 1},
                 {"tag": "动漫", "count": 3},
                 {"tag": "少女", "count": 3},
                 {"tag": "科幻", "count": 1},
@@ -710,6 +714,182 @@ class ConfirmationUiTests(ComicsTagTestCase):
         self.assertNotIn("背景", page)
         self.assertNotIn("浴袍", json.dumps(api, ensure_ascii=False))
         self.assertEqual(api["images"][0]["tags"], ["动漫"])
+
+
+class ManualVerdictRuleTests(ComicsTagTestCase):
+    """Manual edits keep exactly one verdict word, always in first place.
+
+    Deleting ``nsfw`` flips the image to ``sfw``; deleting ``sfw`` only
+    regresses to ``sfw`` and never escalates to ``nsfw``; an explicit
+    ``nsfw`` submission re-judges the image. The gallery's per-image
+    boolean, the ``/api/comics/tags`` top-level count, and the ``?tag=``
+    filter all follow ``tags`` membership, so they stay in lockstep even
+    when the sidecar's classifier history block disagrees.
+    """
+
+    def update(self, path, tags):
+        # Mutating routes require a same-origin source header (the base
+        # test case only ever issues GET requests).
+        self.client.environ_base["HTTP_ORIGIN"] = "http://localhost"
+        return self.client.post(
+            "/api/comics/tags/update", json={"path": path, "tags": tags}
+        )
+
+    def read_sidecar(self, relpath):
+        return json.loads(
+            (self.comics_dir / f"{relpath}.tags.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+    def verdict_state(self):
+        """(per-image flags, summary, nsfw/sfw filter totals) together."""
+        images = self.client.get("/api/comics").get_json()["images"]
+        flags = {image["relpath"]: image["nsfw"] for image in images}
+        summary = self.client.get("/api/comics/tags").get_json()
+        nsfw_filter = self.client.get(
+            "/api/comics", query_string={"tag": "nsfw"}
+        ).get_json()["total"]
+        sfw_filter = self.client.get(
+            "/api/comics", query_string={"tag": "sfw"}
+        ).get_json()["total"]
+        return flags, summary, nsfw_filter, sfw_filter
+
+    def test_deleting_nsfw_flips_the_image_to_sfw(self):
+        self.write_image(
+            "a.png",
+            _sidecar(["nsfw", "动漫", "红背景"], nsfw_label="nsfw",
+                     description="红发动漫角色坐着", version=2,
+                     agreement="high", mean_score=0.42,
+                     tag_scores={"动漫": 0.4, "红背景": 0.35},
+                     dropped_tags=[]),
+        )
+        before = self.read_sidecar("a.png")
+
+        response = self.update("a.png", ["动漫", "红背景"])
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["tags"], ["sfw", "动漫", "红背景"])
+        after = self.read_sidecar("a.png")
+        self.assertEqual(after["tags"][0], "sfw")
+        self.assertNotIn("nsfw", after["tags"])
+        self.assertIs(after["manual"], True)
+        self.assertIn("manual_edited_at", after)
+        # Read-modify-write: the classifier history block and every other
+        # carried field stay exactly as they were.
+        for field in ("nsfw", "description", "verification", "tag_scores",
+                      "dropped_tags", "source", "generated_at", "model"):
+            with self.subTest(field=field):
+                self.assertEqual(after[field], before[field])
+
+        flags, summary, nsfw_filter, sfw_filter = self.verdict_state()
+        self.assertIs(flags["a.png"], False)
+        self.assertEqual(summary["nsfw"], 0)
+        self.assertEqual(nsfw_filter, 0)
+        self.assertEqual(sfw_filter, 1)
+
+    def test_deleting_sfw_regresses_to_sfw_and_never_escalates(self):
+        self.write_image(
+            "a.png",
+            _sidecar(["sfw", "动漫"], nsfw_label="normal", version=2,
+                     agreement="high", mean_score=0.5),
+        )
+
+        response = self.update("a.png", ["动漫"])
+
+        self.assertEqual(response.status_code, 200)
+        after = self.read_sidecar("a.png")
+        self.assertEqual(after["tags"], ["sfw", "动漫"])
+        # Removing sfw never manufactures an nsfw verdict.
+        self.assertNotIn("nsfw", after["tags"])
+        flags, summary, nsfw_filter, _ = self.verdict_state()
+        self.assertIs(flags["a.png"], False)
+        self.assertEqual(summary["nsfw"], 0)
+        self.assertEqual(nsfw_filter, 0)
+
+    def test_submitting_both_verdict_words_keeps_only_nsfw_first(self):
+        self.write_image("a.png", _sidecar(["动漫", "红背景"]))
+
+        response = self.update("a.png", ["nsfw", "动漫", "sfw"])
+
+        self.assertEqual(response.status_code, 200)
+        # The submission replaces the list; only one verdict word survives.
+        self.assertEqual(response.get_json()["tags"], ["nsfw", "动漫"])
+        after = self.read_sidecar("a.png")
+        self.assertEqual(after["tags"][0], "nsfw")
+        self.assertEqual(after["tags"].count("nsfw"), 1)
+        self.assertNotIn("sfw", after["tags"])
+        flags, summary, nsfw_filter, _ = self.verdict_state()
+        self.assertIs(flags["a.png"], True)
+        self.assertEqual(summary["nsfw"], 1)
+        self.assertEqual(nsfw_filter, 1)
+
+    def test_explicitly_adding_nsfw_rejudges_an_sfw_image(self):
+        self.write_image(
+            "a.png",
+            _sidecar(["sfw", "动漫"], nsfw_label="normal", version=2,
+                     agreement="high", mean_score=0.5),
+        )
+        before = self.read_sidecar("a.png")
+
+        response = self.update("a.png", ["动漫", "nsfw"])
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["tags"], ["nsfw", "动漫"])
+        after = self.read_sidecar("a.png")
+        self.assertEqual(after["tags"], ["nsfw", "动漫"])
+        # Only tags change; the classifier record keeps its own verdict.
+        self.assertEqual(after["nsfw"], before["nsfw"])
+        flags, summary, nsfw_filter, sfw_filter = self.verdict_state()
+        self.assertIs(flags["a.png"], True)
+        self.assertEqual(summary["nsfw"], 1)
+        self.assertEqual(nsfw_filter, 1)
+        self.assertEqual(sfw_filter, 0)
+
+    def test_nsfw_flag_count_and_filter_all_follow_tags(self):
+        # Two opposite mismatches between the classifier history block and
+        # the stored tags: display follows tags in both directions, which
+        # is what keeps the boolean, the top-level count, and the filter
+        # totals from drifting apart (the old 89-vs-88 mismatch).
+        self.write_image(
+            "flipped.png",
+            _sidecar(["sfw", "动漫"], nsfw_label="nsfw", version=2,
+                     agreement="high", mean_score=0.9),
+        )
+        self.write_image(
+            "rejudged.png",
+            _sidecar(["nsfw", "动漫"], nsfw_label="normal", version=2,
+                     agreement="low", mean_score=0.4),
+        )
+
+        flags, summary, nsfw_filter, sfw_filter = self.verdict_state()
+
+        self.assertIs(flags["flipped.png"], False)
+        self.assertIs(flags["rejudged.png"], True)
+        self.assertEqual(summary["nsfw"], 1)
+        self.assertEqual(nsfw_filter, 1)
+        self.assertEqual(sfw_filter, 1)
+        self.assertEqual(
+            summary["nsfw"], sum(1 for flag in flags.values() if flag)
+        )
+
+    def test_editor_modal_notes_the_nsfw_to_sfw_flip(self):
+        self.write_image(
+            "a.png", _sidecar(["nsfw", "动漫"], nsfw_label="nsfw")
+        )
+
+        page = self.client.get("/").get_data(as_text=True)
+
+        self.assertIn(
+            "verdictHint.textContent = '删除 nsfw 保存后将自动改为 sfw'", page
+        )
+        self.assertIn(".tag-modal-verdict-hint", page)
+        # The note tracks the live tag list, so removing nsfw hides it.
+        self.assertIn(
+            "verdictHint.hidden = tags.indexOf('nsfw') === -1", page
+        )
 
 
 if __name__ == "__main__":
