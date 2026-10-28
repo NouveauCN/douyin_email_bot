@@ -66,14 +66,29 @@ and communicates only through the authenticated bridge.  The optional tag
 worker is a separate CPU-bound process that shares no state with the bot: it
 scans the comics source and writes only its own `*.tags.json` sidecars, which
 every gallery/dedup/thumbnail/viewer walk ignores because those filter on the
-image-extension set.  Its per-image pipeline is **tag -> CLIP confidence
-confirmation -> threshold partition**: two NSFW classifiers (Falconsai plus a
+image-extension set.  Its per-image pipeline is **tag -> vocabulary
+normalization -> CLIP confidence confirmation -> threshold partition**: two
+NSFW classifiers (Falconsai plus a
 second ViT) are cross-checked into one `nsfw` record with an `agreement`
-level, Qwen2.5-VL produces the Chinese description and candidate tags, a
+level, Qwen2.5-VL produces the Chinese description and candidate tags (its
+prompt also carries the standard tag library, minus the verdict words), the
+candidate spellings are normalized against the closed vocabulary
+(`tag_worker/vocabulary.json`: versioned `categories` word lists plus an
+`aliases` map shared with the file browser; alias entries expand to
+canonical components, out-of-vocabulary words pass through untouched, and
+the classifier-owned `nsfw`/`sfw` words are stripped from raw model output
+so only the dual-classifier verdict can assert one — injected as `nsfw`
+first for a flagged image and `sfw` first for a normal one, both exempt
+from scoring), a
 Chinese-CLIP scorer gives each candidate tag an image/text similarity, and
 only tags at or above `TAG_WORKER_CLIP_THRESHOLD` stay in `tags` while the
 rest are archived in `dropped_tags` with every score in `tag_scores`
-(sidecar `version 2`).  The worker runs in sessions: a cheap round only
+(sidecar `version 2`, every successful write stamped with
+`vocabulary_version`).  A sidecar whose stamp is missing or older becomes
+pending for a **model-free vocabulary upgrade** that rewrites only the tag
+keys plus the stamp (manual documents included — the human keeps
+`manual: true` and the version) in a dedicated pass after the cheap scan,
+so it never opens a session or loads a model.  The worker runs in sessions: a cheap round only
 stats sidecars, one session lazily loads the models, drains the pending set,
 and unloads them again, so no model stays resident between rounds or during
 the MAA maintenance windows (`TAG_WORKER_MAINT_WINDOWS`); existing `version
@@ -84,8 +99,11 @@ tooltips with the mean confidence, the disputed-NSFW chip styling, and
 exact-match `?tag=` filtering (`GET /api/comics`, `GET /api/comics/tags`,
 with a short summary cache), and it may rewrite one through the manual
 tag-edit routes `POST /api/comics/tags/update` (read-modify-write of
-`tags` plus `manual`/`manual_edited_at` markers, atomically, same
-dot-temp + `os.replace` convention) and `POST /api/comics/tags/reset`
+`tags` plus `manual`/`manual_edited_at`/`vocabulary_version` markers,
+atomically, same
+dot-temp + `os.replace` convention; the submitted tags are normalized
+against the same vocabulary after the 12/32 input bounds) and
+`POST /api/comics/tags/reset`
 (sidecar deletion so the worker regenerates).  Sidecar writing is
 therefore a **dual-write protocol**: the worker writes everything it
 generates, the browser writes only through those two routes with

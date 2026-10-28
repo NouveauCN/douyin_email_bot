@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import file_browser
+from tag_worker import normalize
 
 
 _TEST_PNG = base64.b64decode(
@@ -616,6 +617,81 @@ class ManualTagUiTests(ManualTagTestCase):
         # The modal fills labels through textContent, never innerHTML.
         self.assertIn("label.textContent = tag", page)
         self.assertNotIn("chipsBox.innerHTML", page)
+
+
+class ManualTagVocabularyTests(ManualTagTestCase):
+    """Manual edits normalize against the shared closed vocabulary."""
+
+    def test_update_normalizes_aliases_and_stamps_vocabulary_version(self):
+        self.write_image("a.png")
+
+        response = self.update("a.png", ["动漫角色", "红发角色", "机甲"])
+
+        self.assertEqual(response.status_code, 200)
+        expected = ["动漫", "角色", "红发", "机甲"]  # dedup across aliases
+        self.assertEqual(response.get_json()["tags"], expected)
+        state = self.read_sidecar("a.png")
+        self.assertEqual(state["tags"], expected)
+        self.assertEqual(state["vocabulary_version"],
+                         normalize.vocab_version())
+        self.assertIs(state["manual"], True)
+
+    def test_update_keeps_out_of_vocabulary_words_verbatim(self):
+        self.write_image("a.png")
+
+        response = self.update("a.png", ["机甲", "动漫角色", "深海"])
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["tags"],
+                         ["机甲", "动漫", "角色", "深海"])
+
+    def test_verdict_words_pass_through_without_forced_changes(self):
+        # nsfw/sfw are ordinary canonical words on this route: the manual
+        # authority decides, nothing is added or removed here.
+        self.write_image("a.png")
+
+        response = self.update("a.png", ["nsfw", "动漫", "sfw"])
+
+        self.assertEqual(response.status_code, 200)
+        state = self.read_sidecar("a.png")
+        self.assertEqual(state["tags"], ["nsfw", "动漫", "sfw"])
+        # And a manual edit without them gains none.
+        self.update("a.png", ["动漫"])
+        self.assertEqual(self.read_sidecar("a.png")["tags"], ["动漫"])
+
+    def test_twelve_tag_cap_applies_to_the_pre_normalization_input(self):
+        self.write_image("a.png")
+        # Exactly 12 submissions: within the bound even though alias
+        # expansion yields more canonical entries than were submitted.
+        aliases = ["动漫角色", "卡通人物", "男性角色", "红发角色", "肌肉男",
+                   "惊讶表情", "金发男孩", "年轻男子", "橙色背景",
+                   "红色服装", "黑色靴子", "自然环境"]
+        self.assertEqual(len(aliases), 12)
+
+        response = self.update("a.png", aliases)
+
+        self.assertEqual(response.status_code, 200)
+        state = self.read_sidecar("a.png")
+        self.assertGreater(len(state["tags"]), 12)
+        self.assertEqual(state["tags"][:5],
+                         ["动漫", "角色", "卡通", "男性", "红发"])
+        self.assertEqual(state["vocabulary_version"],
+                         normalize.vocab_version())
+
+    def test_vocabulary_file_is_locatable_in_both_layouts(self):
+        # The checkout root and the /app image root both place the data
+        # file at <root>/tag_worker/vocabulary.json beside file_browser.py;
+        # tag_worker resolves the same file from its own package directory.
+        expected = (Path(file_browser.__file__).resolve().parent
+                    / "tag_worker" / "vocabulary.json")
+        self.assertEqual(expected, file_browser._COMICS_VOCABULARY)
+        self.assertTrue(expected.is_file())
+        data = json.loads(expected.read_text(encoding="utf-8"))
+        self.assertGreater(data["version"], 0)
+        self.assertEqual(normalize.DEFAULT_VOCABULARY_PATH, expected)
+        self.assertEqual(normalize.vocab_version(),
+                         file_browser.tag_normalize.vocab_version(
+                             file_browser._COMICS_VOCABULARY))
 
 
 if __name__ == "__main__":

@@ -349,6 +349,11 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
     `{label, confidence}` (`null` when that model was unavailable).
   - `verification` — `{model, threshold, mean_score, min_score}` recording
     the Chinese-CLIP model and the threshold used for this sidecar.
+  - `vocabulary_version` — the `tag_worker/vocabulary.json` version the tag
+    spellings were normalized against. Every writer records it (generation,
+    threshold re-cut, manual edit), and a sidecar missing it or holding an
+    older value is pending the model-free vocabulary upgrade (see
+    [Tag vocabulary](#tag-vocabulary-closed-word-list)).
   `status: failed` sidecars keep the same `version`, `attempts`, and
   `error` fields as before. A manual edit adds `manual: true` and
   `manual_edited_at` (ISO timestamp) to the document it rewrites; an image
@@ -374,7 +379,10 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   inline UI renders clickable tag chips with a tooltip of description plus
   `平均置信 NN%` when a confidence exists, paints an `nsfw` chip amber
   (`.tag-chip.nsfw-low`) with an `NSFW 判定不一致` tooltip note when the two
-  classifiers disagreed, and appends tags/descriptions to card search text.
+  classifiers disagreed, paints the symmetric `sfw` chip with the restrained
+  green `.tag-chip.sfw` style, and appends tags/descriptions to card search
+  text. Filtering and counting (`?tag=`, `GET /api/comics/tags`) treat both
+  verdict words as ordinary tags, so they need no special casing.
   Dropped (below-threshold) tags are never shown or counted. Sidecar paths
   are always derived from already-collected gallery relpaths and never from
   query input; missing, corrupt, or `status: failed` sidecars degrade to "no
@@ -383,7 +391,10 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   `file_browser` writes only through the manual tag-edit routes below and
   always flags its documents `manual: true`; the worker re-reads that flag
   from disk on every decision and treats a manual sidecar as read-only (no
-  v1 upgrade, no threshold re-cut, no failed retry), while its orphan
+  v1 upgrade, no threshold re-cut, no failed retry — the one exception is
+  the model-free vocabulary normalization, which rewrites only the tag
+  spellings plus `vocabulary_version` and keeps `manual` and the version
+  intact), while its orphan
   cleanup still owns those files because ownership remains known version +
   source.
 - Manual tag editing (the `file_browser` half of the dual-write protocol):
@@ -394,11 +405,17 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   non-`_IMAGE_EXTS` suffixes — and rewrites that image's sidecar atomically
   (dot-prefixed temp + `os.replace`, UTF-8, `ensure_ascii=false`, `indent=2`)
   as a read-modify-write against the bytes on disk at request time (never a
-  client-supplied snapshot): only `tags`, `manual`, and `manual_edited_at`
+  client-supplied snapshot): only `tags`, `manual`, `manual_edited_at`, and
+  `vocabulary_version`
   change, everything else (`description`/`nsfw`/`tag_scores`/`verification`/
   …) is carried over, and a `status: failed` document is promoted to `ok` so
   the edited tags actually render. Tags are stripped, de-duplicated in order,
-  capped at 12 entries of at most 32 characters, and any violation returns
+  normalized against the shared closed vocabulary (alias expansion to
+  canonical forms; `nsfw`/`sfw` pass through like any other word — this
+  route never adds or removes a classification tag), capped at 12 entries of
+  at most 32 characters — the bounds apply to the submitted input, so an
+  alias expansion may legitimately yield more entries — and any violation
+  returns
   `400` with a message without touching the disk; success returns
   `{success, tags, manual}` and invalidates the gallery scan + tag-summary
   caches. An image with no sidecar gets the minimal `version 2` document
@@ -433,12 +450,19 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   the verified AdamCodd ViT is the default), the resident fp32 CPU
   `Qwen/Qwen2.5-VL-3B-Instruct`, and `OFA-Sys/chinese-clip-vit-base-patch16`
   for tag confidence. All four load lazily, never at import time. The Qwen
-  prompt asks for exactly `描述：<一句中文>` and `标签：<5-10个中文标签，用、分隔>`;
-  parsing tolerates swapped lines, inline markers, comma/顿号 separators, and
-  dirty output. Unparseable VLM output yields `tags: []` with a
-  `status: ok` sidecar.
-- Confidence confirmation: every candidate tag gets one Chinese-CLIP
-  image/text cosine score (`score_tags`, batched, one image forward); tags
+  prompt asks for exactly `描述：<一句中文>` and `标签：<5-10个中文标签，用、分隔>`,
+  then appends one guidance line `优先从标准标签库选择（可有表外词）：<every
+  vocabulary word, comma separated>` — the classifier-owned `nsfw`/`sfw`
+  words are excluded from that list so the model is never invited to grade
+  itself; parsing tolerates swapped lines, inline markers, comma/顿号
+  separators, and dirty output. Unparseable VLM output yields `tags: []`
+  with a `status: ok` sidecar.
+- Confidence confirmation: candidate tags are first normalized to the
+  closed-vocabulary canonical forms (alias expansion, dedup, and the
+  `nsfw`/`sfw` words stripped — the model may not self-grade), so every
+  candidate then gets one Chinese-CLIP
+  image/text cosine score (`score_tags`, batched, one image forward) and
+  the recorded keys match the written tags; tags
   with `score >= TAG_WORKER_CLIP_THRESHOLD` (default **0.30**) stay in
   `tags` in their original order, the rest move to `dropped_tags` with all
   scores recorded in `tag_scores`, and `verification` stores the model,
@@ -447,11 +471,13 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   2.3% of tags (~1.1% once the exempt `nsfw` marker is excluded), while
   0.35 would trim 36.6% and start cutting plausible tags — hence rejected.
   Changing the threshold only re-cuts existing sidecars from their stored
-  scores; no model runs for that. The boundary passes (`==` keeps a tag), a
+  scores (normalizing the legacy free-form keys in the same rewrite); no
+  model runs for that. The boundary passes (`==` keeps a tag), a
   tag without a usable score is treated as unconfirmed and dropped at any
-  threshold (its `tag_scores` entry is `null`), and the injected `nsfw`
-  marker is exempt from scoring so CLIP can never threshold the classifier
-  verdict away; that marker may bring `tags` to `MAX_TAGS + 1` entries
+  threshold (its `tag_scores` entry is `null`), and both injected verdict
+  markers (`nsfw`/`sfw`) are exempt from scoring so CLIP can never
+  threshold the classifier verdict away; a marker may bring `tags` to
+  `MAX_TAGS + 1` entries
   rather than evicting a passing candidate.
 - NSFW cross-validation: `label` is `nsfw` when **either** classifier flags
   the image (a flag is never lost); `agreement` is `high` when both usable
@@ -460,13 +486,19 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   exactly one model produced a usable verdict (zero usable verdicts are
   also recorded as `single` — the conservative `nsfw` fallback; in
   production only the secondary verdict can be missing, because the primary
-  always yields a verdict or fails the image). The second classifier is
+  always yields a verdict or fails the image). The verdict is injected into
+  `tags` symmetrically and only from this record: `nsfw` first for a
+  flagged image, `sfw` first for a `normal` one, with any leftover verdict
+  word removed (the Qwen output is stripped of both beforehand, so the
+  model can never assert a verdict). The second classifier is
   optional: its load/inference failure only downgrades the record to
   `single` and never fails a first-round tagging run; an unusable primary
   result is still recorded conservatively as `nsfw`.
 - Retry policy: `status: ok` is skipped until the sidecar is deleted (and
   any `manual: true` sidecar is skipped regardless of status or version —
-  the flag is re-read from disk on every decision);
+  the flag is re-read from disk on every decision; the model-free
+  vocabulary upgrade is the single exception, see
+  [Tag vocabulary](#tag-vocabulary-closed-word-list));
   `status: failed` retries after a 30-minute cooldown up to `attempts: 3`, then
   is skipped permanently. Unreadable images are logged and retried next round
   without writing a sidecar. If the failure sidecar itself cannot be written,
@@ -488,6 +520,8 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   are complete but its recorded `verification.threshold` differs from the
   current `TAG_WORKER_CLIP_THRESHOLD`, the worker re-cuts `tags`/
   `dropped_tags` from the stored scores only — no model runs for that.
+  Version 2 sidecars that predate `vocabulary_version` take the separate
+  model-free vocabulary upgrade described in the next section instead.
 - Orphan cleanup runs every round and deletes only worker-owned `*.tags.json`
   files under the comics source whose source image is gone and whose own mtime
   is over an hour old, after the same lexical+resolve validation used
@@ -533,6 +567,66 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   `TAG_WORKER_NSFW2_MODEL` (default `AdamCodd/vit-base-nsfw-detector`), and
   `TAG_WORKER_MAINT_WINDOWS`. Start it explicitly with:
   `sudo docker compose up -d --build tag_worker`
+
+### Tag vocabulary (closed word list)
+
+- `tag_worker/vocabulary.json` is the closed vocabulary: a plain repository
+  data file with a positive `version`, nine `categories` word lists (~120-160
+  canonical forms, no word repeated across categories) and an `aliases` map
+  (40+ concrete/specific forms -> canonical components, for example
+  `动漫角色 -> [动漫, 角色]` and `躺姿 -> [躺下]`). Every alias component must
+  itself be a canonical word; a hand edit violating that keeps the original
+  tag instead of inventing a word. The worker image ships it next to the
+  modules (`COPY *.py vocabulary.json`), and the file browser resolves it as
+  `Path(__file__).resolve().parent / "tag_worker" / "vocabulary.json"` —
+  the same path in the checkout root and in `/app`.
+- The file **is** the maintenance entry point: edit the lists, bump
+  `version`. The promotion flow for a recurring out-of-vocabulary word is
+  "add it to a category (plus an alias if it is a compound of existing
+  words), bump `version`" — every writer then stamps the new version and
+  stock sidecars upgrade on their next round. No code change is involved.
+- Out-of-vocabulary words are always preserved (表外保留): `normalize_tags()`
+  expands alias entries into their canonical components (order kept,
+  duplicates collapsed, recursion cycle-guarded) and keeps every other word
+  verbatim; long-tail hapax words simply stay outside the list. A missing or
+  broken vocabulary file degrades to an empty vocabulary — identity
+  normalization, `vocab_version() == 0`, nothing pending — with a warning,
+  never a crash.
+- Three writers normalize and all three record `vocabulary_version`:
+  (1) the worker's generation path normalizes Qwen candidates *before* CLIP
+  scores them, so `tags`, `dropped_tags` and `tag_scores` keys share the
+  canonical spellings (and the re-cut inherits one score across every
+  component an alias expands to); (2) the model-free threshold re-cut
+  normalizes the stored score keys first; (3) the file browser's manual
+  edit normalizes the submitted tags after the 12/32 input bounds.
+- Stock sidecars missing (or holding an older) `vocabulary_version` are
+  pending the model-free `normalize` upgrade: a dedicated pass right after
+  the round's cheap scan rewrites `tags`/`dropped_tags`/`tag_scores` keys
+  plus the stamp **without loading any model or opening a session** — it
+  runs even inside maintenance windows, because windows only defer model
+  work. The rewrite shares the in-process MAX_ATTEMPTS no-overwrite
+  backoff with the re-cut — after three failed attempts that sidecar
+  stays stale until a process restart re-arms it, exactly like the
+  verification path — and it includes `manual: true` sidecars (the
+  dual-write protocol's single exception): only the spellings and the
+  stamp change; `manual`, `manual_edited_at` and `version` stay intact,
+  and a field the document never had (such as `dropped_tags`) stays
+  absent. For automatic sidecars the same pass always strips leftover
+  verdict words — a stale model self-assessment, even when the `nsfw`
+  record is missing — and then back-fills the stored dual-classifier
+  verdict (`sfw` for `normal`, `nsfw` first for `nsfw`) without ever
+  guessing one from a missing record; manual sidecars get vocabulary
+  normalization only.
+- Classification labels are symmetric and classifier-owned: `nsfw` when
+  either classifier flags the image, `sfw` otherwise. Both are canonical
+  vocabulary words (the NSFW category holds exactly these two), both are
+  exempt from CLIP scoring/thresholding, and only the dual-classifier
+  record may inject them (first position). The Qwen raw output is stripped
+  of both words before normalization, and the prompt's standard-tag-library
+  line excludes them, so the model cannot grade itself. The gallery renders
+  `sfw` chips with the restrained green `.tag-chip.sfw`, symmetric to the
+  amber/red `nsfw` styling; filtering and counting treat both as ordinary
+  tags.
 
 ## Configuration And Paths
 

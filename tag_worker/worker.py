@@ -18,7 +18,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import inference, sidecar
+from . import inference, normalize, sidecar
 
 log = logging.getLogger("tag_worker")
 
@@ -298,13 +298,14 @@ def _write_backoff_active(sidecar_path: Path) -> bool:
 
 
 def _upgrade_backoff_active(sidecar_path: Path) -> bool:
-    """True after MAX_ATTEMPTS failed verifications/re-cuts in this process.
+    """True after MAX_ATTEMPTS failed no-overwrite upgrades in this process.
 
-    Shared by both no-overwrite paths (v1 -> v2 verification and the
-    threshold re-cut): neither may destroy the existing sidecar, so an
-    in-process cap is the only thing that stops a permanent disk/model
-    fault from retrying every round. Unlike the write-failure counter this
-    never self-clears, so only a restart re-arms the work.
+    Shared by all three paths that must never destroy the existing
+    sidecar (v1 -> v2 verification, threshold re-cut, and vocabulary
+    normalization): an in-process cap is the only thing that stops a
+    permanent disk/model fault from retrying every round. Unlike the
+    write-failure counter this never self-clears, so only a restart
+    re-arms the work.
     """
     return _upgrade_failures.get(str(sidecar_path), 0) >= sidecar.MAX_ATTEMPTS
 
@@ -351,6 +352,39 @@ def _recut_one(
         len(payload["dropped_tags"]), time.perf_counter() - started,
     )
     return "repartitioned"
+
+
+def _normalize_one(image_path: Path, sidecar_path: Path, state: dict) -> str:
+    """Refresh one sidecar's vocabulary normalization without any model.
+
+    Rewrites only the tag spellings (``tags``/``dropped_tags``/
+    ``tag_scores`` keys) plus the ``vocabulary_version`` stamp and keeps
+    every other field -- ``manual`` markers included.  Shares the
+    in-process MAX_ATTEMPTS no-overwrite cap with the verification and
+    re-cut paths: a failing rewrite (typically a full disk) leaves the
+    original sidecar intact and stops retrying after three tries.
+    """
+    started = time.perf_counter()
+    try:
+        payload = sidecar.normalize_sidecar(state)
+        sidecar.atomic_write_json(sidecar_path, payload)
+    except Exception as exc:  # noqa: BLE001 - never destroy the original
+        failures = _count_upgrade_failure(sidecar_path, image_path.name)
+        log.error(
+            "vocabulary normalization of %s failed (%d/%d); original sidecar "
+            "kept error=%s: %s",
+            image_path.name, failures, sidecar.MAX_ATTEMPTS,
+            type(exc).__name__, exc,
+        )
+        return "upgrade-failed"
+    _upgrade_failures.pop(str(sidecar_path), None)
+    log.info(
+        "normalized %s to vocabulary v%d kept=%d dropped=%d (no models) in %.3fs",
+        image_path.name, payload.get("vocabulary_version", 0),
+        len(payload["tags"]), len(payload.get("dropped_tags") or []),
+        time.perf_counter() - started,
+    )
+    return "normalized"
 
 
 def _verify_one(
@@ -409,16 +443,18 @@ def _verify_one(
 
 
 def process_one(image_path: Path, *, threads: int, threshold: float | None = None) -> str:
-    """Tag, verify, or re-cut one image and write its sidecar.
+    """Tag, verify, re-cut, or vocabulary-normalize one image.
 
     Returns ``ok`` (full pipeline), ``upgraded`` (v1 -> v2 verification),
-    ``repartitioned`` (threshold re-cut, no models), ``failed``/``read-
-    error``/``backoff`` as before, ``upgrade-failed`` when a verification
-    could not run (the original sidecar is untouched), or ``skipped`` when
-    there is nothing to do. Read failures are logged without a sidecar so
-    the next round retries them; inference/write failures accumulate
-    ``attempts`` in the sidecar. When the sidecar itself cannot be written,
-    an in-memory counter keeps the 3-attempt cap effective.
+    ``repartitioned`` (threshold re-cut, no models), ``normalized``
+    (vocabulary upgrade, no models and no image read), ``failed``/
+    ``read-error``/``backoff`` as before, ``upgrade-failed`` when a
+    verification/re-cut/normalization could not run (the original
+    sidecar is untouched), or ``skipped`` when there is nothing to do.
+    Read failures are logged without a sidecar so the next round retries
+    them; inference/write failures accumulate ``attempts`` in the
+    sidecar. When the sidecar itself cannot be written, an in-memory
+    counter keeps the 3-attempt cap effective.
     """
     if threshold is None:
         threshold = sidecar.DEFAULT_CLIP_THRESHOLD
@@ -440,10 +476,22 @@ def process_one(image_path: Path, *, threads: int, threshold: float | None = Non
     attempts = max(attempts, _write_failures.get(str(sidecar_path), 0))
 
     if (
-        action in (sidecar.ACTION_VERIFY, sidecar.ACTION_REPARTITION)
+        action in (
+            sidecar.ACTION_VERIFY,
+            sidecar.ACTION_REPARTITION,
+            sidecar.ACTION_NORMALIZE,
+        )
         and _upgrade_backoff_active(sidecar_path)
     ):
         return "backoff"
+
+    if action == sidecar.ACTION_NORMALIZE:
+        # Vocabulary-only upgrade: sidecar JSON rewrite, no image read and
+        # no model load (this returns before any inference call).
+        return _normalize_one(
+            image_path, sidecar_path,
+            previous if isinstance(previous, dict) else {},
+        )
 
     if action == sidecar.ACTION_REPARTITION:
         return _recut_one(
@@ -517,11 +565,11 @@ def _needs_work(image: Path, threshold: float) -> bool:
 
     Two in-process caps are folded in so a round never starts a session
     that is doomed to do nothing: failure-sidecar writes that hit the
-    MAX_ATTEMPTS cap (nothing could be persisted) and verification/re-cut
-    failures that hit the same cap (the original sidecar must not be
-    overwritten). Both clear on restart. Unreadable images cannot be
-    detected here, but they fail before any inference, so they never
-    trigger a model load either.
+    MAX_ATTEMPTS cap (nothing could be persisted) and verification/re-cut/
+    vocabulary-normalization failures that hit the same cap (the original
+    sidecar must not be overwritten). Both clear on restart. Unreadable
+    images cannot be detected here, but they fail before any inference, so
+    they never trigger a model load either.
     """
     sidecar_path = sidecar.sidecar_path_for(image)
     if _write_backoff_active(sidecar_path):
@@ -530,7 +578,11 @@ def _needs_work(image: Path, threshold: float) -> bool:
     if action == sidecar.ACTION_SKIP:
         return False
     if (
-        action in (sidecar.ACTION_VERIFY, sidecar.ACTION_REPARTITION)
+        action in (
+            sidecar.ACTION_VERIFY,
+            sidecar.ACTION_REPARTITION,
+            sidecar.ACTION_NORMALIZE,
+        )
         and _upgrade_backoff_active(sidecar_path)
     ):
         return False
@@ -546,6 +598,8 @@ def _count_status(stats: dict, status: str) -> None:
         stats["upgraded"] += 1
     elif status == "repartitioned":
         stats["repartitioned"] += 1
+    elif status == "normalized":
+        stats["normalized"] += 1
     elif status == "upgrade-failed":
         stats["upgrade_failed"] += 1
     elif status == "read-error":
@@ -576,7 +630,10 @@ def _drain_session(
     already attempted) so images that arrive mid-session join the same batch
     instead of waiting for the next round.
     """
-    baseline = stats["processed"] + stats["upgraded"] + stats["repartitioned"]
+    baseline = (
+        stats["processed"] + stats["upgraded"] + stats["repartitioned"]
+        + stats["normalized"]
+    )
     log.info("session start (pending=%d)", len(pending))
     started = time.perf_counter()
     attempted: set[str] = set()
@@ -608,6 +665,7 @@ def _drain_session(
         info = unload if isinstance(unload, dict) else {}
         handled = (
             stats["processed"] + stats["upgraded"] + stats["repartitioned"]
+            + stats["normalized"]
             - baseline
         )
         log.info(
@@ -627,12 +685,18 @@ def run_once(
     threshold: float | None = None,
     maint_windows: list[tuple[int, int]] | None = None,
 ) -> dict[str, int]:
-    """One full round: cheap scan, optional model session, cleanup.
+    """One full round: cheap scan, vocabulary pass, optional model session.
 
-    A round with no pending work loads nothing at all. Pending work inside a
-    maintenance window is counted as ``paused`` and deferred (the scan itself
-    still runs); otherwise a session drains it and unloads the models before
-    the round returns. Round counters are returned for the summary log.
+    A round with no pending work loads nothing at all.  The vocabulary
+    normalization pass runs right after the scan, before any session is
+    considered: it only rewrites sidecar JSON (never reads an image, never
+    calls inference), so a round whose only pending work is a vocabulary
+    upgrade drains it without opening a session or loading a model -- it
+    also keeps running inside maintenance windows, which only ever defer
+    *model* work.  Pending model work inside a window is counted
+    ``paused`` and deferred (the scan itself still runs); otherwise a
+    session drains it and unloads the models before the round returns.
+    Round counters are returned for the summary log.
     """
     global _window_wait_logged
     if threshold is None:
@@ -644,6 +708,7 @@ def run_once(
         "processed": 0,
         "upgraded": 0,
         "repartitioned": 0,
+        "normalized": 0,
         "skipped": 0,
         "paused": 0,
         "failed": 0,
@@ -657,8 +722,35 @@ def run_once(
     stats["orphans_cleaned"] = cleanup_orphans(root)
     stats["temps_cleaned"] = cleanup_stale_temps(root)
 
+    # Model-free vocabulary upgrades: drain them in the cheap-scan phase so
+    # they never open a session (and therefore never touch a model loader),
+    # regardless of maintenance windows.  Every image this pass touches is
+    # excluded from the pending scan below -- a successful rewrite already
+    # counted as ``normalized`` and a failed one must not burn a second
+    # attempt inside a session in the same round.
+    vocab_handled: set[str] = set()
+    for image in images:
+        image_sidecar = sidecar.sidecar_path_for(image)
+        if _write_backoff_active(image_sidecar):
+            continue  # nothing could be persisted: the pending scan skips it
+        if sidecar.process_action(
+            image_sidecar, threshold=threshold
+        ) != sidecar.ACTION_NORMALIZE:
+            continue
+        vocab_handled.add(str(image))
+        if _upgrade_backoff_active(image_sidecar):
+            _count_status(stats, "backoff")
+            continue
+        state = sidecar.read_sidecar(image_sidecar)
+        if not isinstance(state, dict):
+            vocab_handled.discard(str(image))  # vanished mid-round: re-decide
+            continue
+        _count_status(stats, _normalize_one(image, image_sidecar, state))
+
     pending: list[Path] = []
     for image in images:
+        if str(image) in vocab_handled:
+            continue
         if _needs_work(image, threshold):
             pending.append(image)
         else:
@@ -713,9 +805,10 @@ def main() -> int:
     log.info(
         "tag worker starting root=%s threads=%d nice=%d scan_interval=%.1fs "
         "item_delay=%.1fs clip_threshold=%.3f clip_model=%s nsfw2_model=%s "
-        "maint_windows=%s",
+        "vocab_version=%d maint_windows=%s",
         root, threads, nice, scan_interval, item_delay, threshold,
         inference.clip_model_id(), inference.nsfw2_model_id(),
+        normalize.vocab_version(),
         ",".join(
             f"{start // 60:02d}:{start % 60:02d}-{end // 60:02d}:{end % 60:02d}"
             for start, end in maint_windows
@@ -740,14 +833,14 @@ def main() -> int:
                 continue
             log.info(
                 "round complete images=%d processed=%d upgraded=%d "
-                "repartitioned=%d skipped=%d paused=%d failed=%d "
+                "repartitioned=%d normalized=%d skipped=%d paused=%d failed=%d "
                 "read_errors=%d upgrade_failed=%d orphans_cleaned=%d "
                 "temps_cleaned=%d elapsed=%.1fs",
                 stats["images"], stats["processed"], stats["upgraded"],
-                stats["repartitioned"], stats["skipped"], stats["paused"],
-                stats["failed"], stats["read_errors"], stats["upgrade_failed"],
-                stats["orphans_cleaned"], stats["temps_cleaned"],
-                time.monotonic() - started,
+                stats["repartitioned"], stats["normalized"], stats["skipped"],
+                stats["paused"], stats["failed"], stats["read_errors"],
+                stats["upgrade_failed"], stats["orphans_cleaned"],
+                stats["temps_cleaned"], time.monotonic() - started,
             )
             time.sleep(round_sleep(stats, scan_interval))
     except KeyboardInterrupt:
