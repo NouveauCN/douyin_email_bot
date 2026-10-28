@@ -16,3 +16,7 @@ pending_retries.json
 failed_links.txt
 .codegraph/
 short_link_cache.json
+# Local probe workspace (8+ GB model/venv scratch) and the legacy .env
+# backup that may hold credentials: never stage-able with `git add -A`.
+.probe/
+.env.save

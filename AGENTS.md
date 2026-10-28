@@ -326,10 +326,26 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
 - `tag_worker/` is an optional single-instance CPU service that scans the
   comics gallery (`COMICS_PICS_PATH`, default `/app/comics/pics`) and writes a
   Chinese-tag sidecar next to each image as `<full filename>.tags.json` (for
-  example `a.jpg.tags.json`). The sidecar carries `version`, `source`,
-  `generated_at`, `status`, `model`, `nsfw` label/confidence, `description`,
-  and `tags`; writes are a dot-prefixed temp file plus `os.replace`, UTF-8,
-  `ensure_ascii=false`, indent 2.
+  example `a.jpg.tags.json`); writes are a dot-prefixed temp file plus
+  `os.replace`, UTF-8, `ensure_ascii=false`, indent 2.
+- The sidecar schema is `version 2` (`SIDECAR_VERSION = 2`, and version 1
+  remains worker-owned). A successful sidecar carries `version`, `source`,
+  `generated_at`, `status`, `model`, `description`, and the confirmation
+  fields:
+  - `tags` — only the tags that passed CLIP confidence confirmation, in the
+    original Qwen order; `dropped_tags` — the below-threshold tags (strings
+    only, for audit); `tag_scores` — every candidate tag's score, including
+    the dropped ones.
+  - `nsfw` — `label`, `confidence`, `agreement` (`high` = both classifiers
+    agree, `low` = they disagree, `single` = exactly one produced a usable
+    verdict — the "no usable verdict" fallback is also written as `single`,
+    as a conservative `nsfw` record with no model scores), and
+    `models.primary` / `models.secondary` with each classifier's own
+    `{label, confidence}` (`null` when that model was unavailable).
+  - `verification` — `{model, threshold, mean_score, min_score}` recording
+    the Chinese-CLIP model and the threshold used for this sidecar.
+  `status: failed` sidecars keep the same `version`, `attempts`, and
+  `error` fields as before.
 - Sidecars are invisible to the gallery, deduplication, thumbnail cache, and
   viewer because every comics walk filters on `_IMAGE_EXTS`; `file_browser.py`
   never sees them through those walks and only reads them as explicit metadata
@@ -339,12 +355,17 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   stays consistent on POSIX even if a concurrent delete removes the entry) and
   only creates/deletes its own `*.tags.json`, which no media path observes.
 - The gallery UI displays those sidecars read-only and lets users filter by
-  tag: `GET /api/comics` adds `tags`, `nsfw`, and `description` per image and
-  accepts an exact-match `?tag=` query (plus the `__untagged__` pseudo tag)
-  applied to the full list before pagination, while `GET /api/comics/tags`
-  returns counted tags with `untagged`/`nsfw`/`total` and a 30-second cache.
-  The inline UI renders clickable tag chips, a tag `<select>`, description
-  tooltips, and appends tags/descriptions to card search text. Sidecar paths
+  tag: `GET /api/comics` adds `tags`, `nsfw`, `description`, `confidence`
+  (the v2 `verification.mean_score`, `null` on v1/missing sidecars), and
+  `agreement` (`high`/`low`/`single`/`null`) per image and accepts an
+  exact-match `?tag=` query (plus the `__untagged__` pseudo tag) applied to
+  the full list before pagination, while `GET /api/comics/tags` returns
+  counted tags with `untagged`/`nsfw`/`total` and a 30-second cache. The
+  inline UI renders clickable tag chips with a tooltip of description plus
+  `平均置信 NN%` when a confidence exists, paints an `nsfw` chip amber
+  (`.tag-chip.nsfw-low`) with an `NSFW 判定不一致` tooltip note when the two
+  classifiers disagreed, and appends tags/descriptions to card search text.
+  Dropped (below-threshold) tags are never shown or counted. Sidecar paths
   are always derived from already-collected gallery relpaths and never from
   query input; missing, corrupt, or `status: failed` sidecars degrade to "no
   tags" without failing a request, and `tag_worker` remains the only sidecar
@@ -354,17 +375,47 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   VLM paths (`TAG_WORKER_THREADS`, default 4), strictly one image at a time in
   one process, a per-image delay (`TAG_WORKER_ITEM_DELAY`, default 1.0 s), and
   an idle scan interval (`TAG_WORKER_SCAN_INTERVAL`, default 60 s). Compose
-  additionally caps the container at 4 CPUs / 18 GB. Logs go to stdout: one
-  line per processed image plus a per-round summary; rounds are never
-  interrupted by an exception.
-- Models: `Falconsai/nsfw_image_detection`, then the resident fp32 CPU
-  `Qwen/Qwen2.5-VL-3B-Instruct` (loaded on first use, never reloaded). The
+  additionally caps the container at 4 CPUs / 20 GB. Logs go to stdout: one
+  line per processed image, one `session start`/`session end` pair per model
+  session, and a per-round summary; rounds are never interrupted by an
+  exception.
+- Models: `Falconsai/nsfw_image_detection` (primary NSFW),
+  `AdamCodd/vit-base-nsfw-detector` (second NSFW opinion; the originally
+  preferred `dima806/nsfw_image_detection` no longer exists on the Hub, so
+  the verified AdamCodd ViT is the default), the resident fp32 CPU
+  `Qwen/Qwen2.5-VL-3B-Instruct`, and `OFA-Sys/chinese-clip-vit-base-patch16`
+  for tag confidence. All four load lazily, never at import time. The Qwen
   prompt asks for exactly `描述：<一句中文>` and `标签：<5-10个中文标签，用、分隔>`;
   parsing tolerates swapped lines, inline markers, comma/顿号 separators, and
-  dirty output. When the NSFW label is `nsfw`, `nsfw` is inserted as the first
-  tag; an unusable classifier result is recorded conservatively as `nsfw` so
-  the sidecar still carries the tag. Unparseable VLM output yields `tags: []`
-  with a `status: ok` sidecar.
+  dirty output. Unparseable VLM output yields `tags: []` with a
+  `status: ok` sidecar.
+- Confidence confirmation: every candidate tag gets one Chinese-CLIP
+  image/text cosine score (`score_tags`, batched, one image forward); tags
+  with `score >= TAG_WORKER_CLIP_THRESHOLD` (default **0.30**) stay in
+  `tags` in their original order, the rest move to `dropped_tags` with all
+  scores recorded in `tag_scores`, and `verification` stores the model,
+  threshold, mean and min. The cutoff is calibrated on production data: 183
+  sidecars / 1047 tags measured min 0.264 and median 0.361, so 0.30 trims
+  2.3% of tags (~1.1% once the exempt `nsfw` marker is excluded), while
+  0.35 would trim 36.6% and start cutting plausible tags — hence rejected.
+  Changing the threshold only re-cuts existing sidecars from their stored
+  scores; no model runs for that. The boundary passes (`==` keeps a tag), a
+  tag without a usable score is treated as unconfirmed and dropped at any
+  threshold (its `tag_scores` entry is `null`), and the injected `nsfw`
+  marker is exempt from scoring so CLIP can never threshold the classifier
+  verdict away; that marker may bring `tags` to `MAX_TAGS + 1` entries
+  rather than evicting a passing candidate.
+- NSFW cross-validation: `label` is `nsfw` when **either** classifier flags
+  the image (a flag is never lost); `agreement` is `high` when both usable
+  verdicts match, `low` when they disagree (the image still shows `nsfw`,
+  with the confidence of the model that judged `nsfw`), and `single` when
+  exactly one model produced a usable verdict (zero usable verdicts are
+  also recorded as `single` — the conservative `nsfw` fallback; in
+  production only the secondary verdict can be missing, because the primary
+  always yields a verdict or fails the image). The second classifier is
+  optional: its load/inference failure only downgrades the record to
+  `single` and never fails a first-round tagging run; an unusable primary
+  result is still recorded conservatively as `nsfw`.
 - Retry policy: `status: ok` is skipped until the sidecar is deleted;
   `status: failed` retries after a 30-minute cooldown up to `attempts: 3`, then
   is skipped permanently. Unreadable images are logged and retried next round
@@ -372,22 +423,65 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   an in-memory per-path counter enforces the same 3-attempt cap for the
   process lifetime; it clears on restart or once a sidecar at that path
   becomes readable again.
+- Migration (`version 1` -> `version 2`): a `status: ok` sidecar at version 1
+  takes the verification-upgrade path — Qwen is **not** called, the existing
+  `description`/`model`/tags are kept, and only the dual NSFW pass plus CLIP
+  scoring re-cut run, writing a version 2 sidecar. Version 2 `ok` sidecars
+  are skipped; `failed` retry semantics are unchanged. An upgrade failure
+  (CLIP or the second classifier cannot load or answer) **never overwrites**
+  the original sidecar: the v1 bytes stay intact and an independent
+  in-memory per-path counter stops retrying that path after 3 failures for
+  the rest of the process (a restart re-arms it; the log shows each failure
+  and the final deferral). New images without a sidecar run the full
+  pipeline (Qwen + dual NSFW + CLIP) and still write `failed` sidecars with
+  the unchanged `attempts` semantics. If a version 2 sidecar's `tag_scores`
+  are complete but its recorded `verification.threshold` differs from the
+  current `TAG_WORKER_CLIP_THRESHOLD`, the worker re-cuts `tags`/
+  `dropped_tags` from the stored scores only — no model runs for that.
 - Orphan cleanup runs every round and deletes only worker-owned `*.tags.json`
   files under the comics source whose source image is gone and whose own mtime
   is over an hour old, after the same lexical+resolve validation used
   elsewhere. Ownership is checked first: the JSON must match this worker's
-  schema (`version` plus `source`), so foreign `*.tags.json` files are never
-  deleted. Crash temporaries (`.<name>.tags.json.<uuid>.tmp`) older than an
-  hour are recycled under the same rules. Images, directories, `.media_locks`,
-  dot files, and anything outside the source are never touched.
+  schema (a **known** `version` — 1 or 2 — plus `source`), so foreign
+  `*.tags.json` files and unknown versions are never deleted; version 1
+  sidecars remain ours and are cleaned like any other. Crash temporaries
+  (`.<name>.tags.json.<uuid>.tmp`) older than an hour are recycled under the
+  same rules. Images, directories, `.media_locks`, dot files, and anything
+  outside the source are never touched.
 - Run exactly one instance (the same rule as `qq_gateway`): sidecars are
   written atomically and an existing sidecar means "skip", so a second
   instance would only duplicate work, not corrupt data.
-- Models persist in the `tag_models` volume (`HF_HOME=/app/models`); the first
-  start downloads both models into it (about 8 GB) over direct HTTPS.
+- Session lifecycle: models are **never resident outside a session**. A round
+  only stats sidecars to find pending work (no model may be in RAM then, so
+  idle memory is the Python+library baseline); when work is pending and no
+  maintenance window is open, one session lazily loads the models, drains the
+  pending set (re-scanning after every image so arrivals join the same
+  batch), and unloads them in a `finally` block — module caches set to
+  `None`, `gc.collect()`, best-effort `malloc_trim`, with `session start
+  (pending=N)` / `session end (processed=N, unloaded, rss X→Y MB)` log lines
+  around the RSS readings. Load/unload is the normal path: the HF cache in
+  `tag_models` makes reloads cheap and never re-downloads.
+- Maintenance windows (`TAG_WORKER_MAINT_WINDOWS`, `HH:MM-HH:MM` comma
+  separated, may cross midnight, default
+  `00:30-01:45,08:30-09:45,16:30-17:45`, empty string disables; malformed
+  segments are skipped with a warning) bracket the systemd user timers
+  `maa-daily` (01:00/09:00/17:00) and `maa-check` (01:35) by 30 minutes.
+  Inside a window no new session starts: the cheap scan still runs and
+  pending images are counted `paused` (logged once per window), and if a
+  session crosses the window start it finishes the current image, unloads,
+  and the loop polls every 30 s until the window ends. The worker **unloads
+  instead of pausing** because a paused process would keep its ~15.5 GB of
+  fp32 model pages resident and still squeeze MAA out of memory.
+- Models persist in the `tag_models` volume (`HF_HOME=/app/models`); the
+  first start downloads all four models into it (about 9.5 GB: Qwen 7.1 GB,
+  Chinese CLIP 1.5 GB, plus the two NSFW ViTs at ~330 MB each) over direct
+  HTTPS.
 - Environment: `COMICS_PICS_PATH`, `HF_HOME`, `TAG_WORKER_NICE`,
-  `TAG_WORKER_THREADS`, `TAG_WORKER_SCAN_INTERVAL`, `TAG_WORKER_ITEM_DELAY`.
-  Start it explicitly with:
+  `TAG_WORKER_THREADS`, `TAG_WORKER_SCAN_INTERVAL`, `TAG_WORKER_ITEM_DELAY`,
+  `TAG_WORKER_CLIP_MODEL` (default `OFA-Sys/chinese-clip-vit-base-patch16`),
+  `TAG_WORKER_CLIP_THRESHOLD` (default 0.30),
+  `TAG_WORKER_NSFW2_MODEL` (default `AdamCodd/vit-base-nsfw-detector`), and
+  `TAG_WORKER_MAINT_WINDOWS`. Start it explicitly with:
   `sudo docker compose up -d --build tag_worker`
 
 ## Configuration And Paths
@@ -524,10 +618,10 @@ sudo docker compose down
 - `tag_worker` is an optional single-instance service built from `./tag_worker`
   with no published host ports and no `depends_on`. Besides the comics bind it
   owns the `tag_models` volume mounted at `/app/models` (`HF_HOME`) so the
-  Qwen2.5-VL-3B and NSFW weights survive rebuilds; it never receives
-  `config.yaml`, `.env`, the `state` volume, or the Docker socket. Its
-  `deploy.resources.limits` (4 CPUs, 18 GB) are honored by Compose v2 outside
-  Swarm; after deployment confirm with
+  Qwen2.5-VL-3B, Chinese CLIP, and both NSFW classifier weights survive
+  rebuilds; it never receives `config.yaml`, `.env`, the `state` volume, or
+  the Docker socket. Its `deploy.resources.limits` (4 CPUs, 20 GB) are
+  honored by Compose v2 outside Swarm; after deployment confirm with
   `docker inspect --format '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}}' douyin_tag_worker`
   (`NanoCpus=4000000000` means 4 CPUs; Compose maps `cpus` to `NanoCpus`, so
   `CpuQuota` stays 0 and is not the field to check).

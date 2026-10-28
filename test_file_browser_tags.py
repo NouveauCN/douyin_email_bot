@@ -18,10 +18,18 @@ _TEST_PNG = base64.b64decode(
 _MISSING = object()
 
 
-def _sidecar(tags=None, status="ok", nsfw_label="safe", description=""):
-    """A schema-valid sidecar dict; ``tags=None`` omits the field entirely."""
+def _sidecar(tags=None, status="ok", nsfw_label="safe", description="",
+             version=1, agreement=None, mean_score=None, tag_scores=None,
+             dropped_tags=None):
+    """A schema-valid sidecar dict; ``tags=None`` omits the field entirely.
+
+    The defaults build the legacy ``version 1`` document (no confirmation
+    blocks) so the tolerance tests keep proving v1 still renders; pass
+    ``version=2`` with ``agreement``/``mean_score``/``tag_scores`` to
+    exercise the confidence-confirmation fields.
+    """
     data = {
-        "version": 1,
+        "version": version,
         "source": "unit-test",
         "generated_at": "2026-10-27T00:00:00Z",
         "status": status,
@@ -29,8 +37,24 @@ def _sidecar(tags=None, status="ok", nsfw_label="safe", description=""):
         "nsfw": {"label": nsfw_label, "confidence": 0.9},
         "description": description,
     }
+    if agreement is not None:
+        data["nsfw"]["agreement"] = agreement
+        data["nsfw"]["models"] = {
+            "primary": {"label": nsfw_label, "confidence": 0.9},
+            "secondary": {"label": nsfw_label, "confidence": 0.7},
+        }
     if tags is not None:
         data["tags"] = tags
+    if mean_score is not None:
+        data["verification"] = {
+            "model": "OFA-Sys/chinese-clip-vit-base-patch16",
+            "threshold": 0.25,
+            "mean_score": mean_score,
+            "min_score": mean_score,
+        }
+    if tag_scores is not None:
+        data["tag_scores"] = tag_scores
+        data["dropped_tags"] = list(dropped_tags or [])
     return data
 
 
@@ -455,6 +479,147 @@ class ComicsTagUiTests(ComicsTagTestCase):
         # Failed filters roll back so select/grid/pagination stay aligned.
         self.assertIn("syncTagSelect", page)
         self.assertIn("筛选失败，已恢复上一个筛选", page)
+
+
+class ApiComicsConfirmationTests(ComicsTagTestCase):
+    def test_v2_sidecar_exposes_confidence_and_agreement(self):
+        self.write_image(
+            "v2.png",
+            _sidecar(["动漫", "nsfw"], nsfw_label="nsfw", description="一位少女",
+                     version=2, agreement="low", mean_score=0.38,
+                     tag_scores={"动漫": 0.41, "浴袍": 0.2},
+                     dropped_tags=["浴袍"]),
+        )
+        self.write_image("plain.png")
+
+        payload = self.client.get("/api/comics").get_json()
+        by_name = {image["relpath"]: image for image in payload["images"]}
+        tagged, plain = by_name["v2.png"], by_name["plain.png"]
+
+        self.assertEqual(tagged["confidence"], 0.38)
+        self.assertEqual(tagged["agreement"], "low")
+        # Only confirmed tags are exposed; dropped ones stay in the sidecar.
+        self.assertEqual(tagged["tags"], ["动漫", "nsfw"])
+        self.assertNotIn("dropped_tags", tagged)
+        self.assertNotIn("tag_scores", tagged)
+        self.assertIsNone(plain["confidence"])
+        self.assertIsNone(plain["agreement"])
+
+    def test_v1_and_missing_sidecars_report_null_confirmation(self):
+        self.write_image("v1.png", _sidecar(["动漫"], description="旧描述",
+                                            version=1))
+        self.write_image("v1nsfw.png",
+                         _sidecar(["nsfw"], nsfw_label="nsfw", version=1))
+        self.write_image("none.png")
+
+        payload = self.client.get("/api/comics").get_json()
+        by_name = {image["relpath"]: image for image in payload["images"]}
+
+        for name in ("v1.png", "v1nsfw.png", "none.png"):
+            with self.subTest(name=name):
+                self.assertIsNone(by_name[name]["confidence"])
+                self.assertIsNone(by_name[name]["agreement"])
+        # The v1 document still displays exactly as it always did.
+        self.assertEqual(by_name["v1.png"]["tags"], ["动漫"])
+        self.assertEqual(by_name["v1.png"]["description"], "旧描述")
+        self.assertIs(by_name["v1nsfw.png"]["nsfw"], True)
+
+    def test_confirmation_values_are_validated_not_trusted(self):
+        broken = _sidecar(["动漫"], version=2, agreement="high",
+                          mean_score=0.5)
+        broken["verification"]["mean_score"] = "lots"
+        broken["nsfw"]["agreement"] = "definitely"
+        self.write_image("broken.png", broken)
+
+        image = self.client.get("/api/comics").get_json()["images"][0]
+
+        self.assertIsNone(image["confidence"])  # non-numeric mean -> null
+        self.assertIsNone(image["agreement"])   # unknown level -> null
+        self.assertEqual(image["tags"], ["动漫"])  # tags still render
+
+    def test_summary_counts_only_confirmed_tags(self):
+        self.write_image(
+            "a.png", _sidecar(["动漫"], version=2, agreement="high",
+                              mean_score=0.4, tag_scores={"动漫": 0.41},
+                              dropped_tags=["浴袍"]),
+        )
+
+        summary = self.client.get("/api/comics/tags").get_json()
+
+        self.assertEqual(summary["tags"], [{"tag": "动漫", "count": 1}])
+        self.assertEqual(summary["total"], 1)
+
+
+class ConfirmationUiTests(ComicsTagTestCase):
+    def test_chip_title_appends_mean_confidence_after_description(self):
+        self.write_image(
+            "a.png", _sidecar(["动漫", "少女"], description="一位少女",
+                              version=2, agreement="high", mean_score=0.38),
+        )
+
+        page = self.client.get("/").get_data(as_text=True)
+
+        self.assertIn('title="一位少女\n平均置信 38%"', page)
+        # The JS-built cards compute the same line from the API fields.
+        self.assertIn("Math.round(image.confidence * 100)", page)
+        self.assertIn("lines.join('\\n')", page)
+
+    def test_disputed_nsfw_chip_is_amber_and_noted_in_the_title(self):
+        self.write_image(
+            "a.png", _sidecar(["nsfw", "动漫"], nsfw_label="nsfw",
+                              description="一位少女", version=2,
+                              agreement="low", mean_score=0.38),
+        )
+
+        page = self.client.get("/").get_data(as_text=True)
+
+        self.assertIn('class="tag-chip nsfw nsfw-low"', page)
+        self.assertIn(
+            'title="一位少女\n平均置信 38%\nNSFW 判定不一致"', page
+        )
+        # A distinct amber rule, not the plain red nsfw style.
+        self.assertIn(".tag-chip.nsfw-low {", page)
+        self.assertIn("NSFW 判定不一致", page)
+
+    def test_agreed_nsfw_chip_keeps_the_plain_red_style(self):
+        self.write_image(
+            "a.png", _sidecar(["nsfw"], nsfw_label="nsfw", version=2,
+                              agreement="high", mean_score=0.9),
+        )
+
+        page = self.client.get("/").get_data(as_text=True)
+
+        self.assertIn('class="tag-chip nsfw"', page)
+        self.assertNotIn('class="tag-chip nsfw nsfw-low"', page)
+        self.assertNotIn("NSFW 判定不一致", page.split("function card(")[0])
+
+    def test_v1_card_keeps_a_plain_description_tooltip(self):
+        self.write_image("a.png", _sidecar(["动漫"], description="一位少女",
+                                           version=1))
+        self.write_image("b.png", _sidecar(["nsfw"], nsfw_label="nsfw",
+                                           description="旧描述", version=1))
+
+        page = self.client.get("/").get_data(as_text=True)
+
+        self.assertIn('title="一位少女"', page)
+        self.assertNotIn('title="一位少女\n', page)
+        self.assertNotIn('class="tag-chip nsfw nsfw-low"', page)
+
+    def test_dropped_tags_are_never_rendered_anywhere(self):
+        self.write_image(
+            "a.png",
+            _sidecar(["动漫"], version=2, agreement="high", mean_score=0.4,
+                     tag_scores={"动漫": 0.41, "浴袍": 0.1, "背景": 0.05},
+                     dropped_tags=["浴袍", "背景"]),
+        )
+
+        page = self.client.get("/").get_data(as_text=True)
+        api = self.client.get("/api/comics").get_json()
+
+        self.assertNotIn("浴袍", page)
+        self.assertNotIn("背景", page)
+        self.assertNotIn("浴袍", json.dumps(api, ensure_ascii=False))
+        self.assertEqual(api["images"][0]["tags"], ["动漫"])
 
 
 if __name__ == "__main__":
