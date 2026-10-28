@@ -136,10 +136,11 @@ class ManualTagUpdateTests(ManualTagTestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
         self.assertTrue(payload["success"])
-        self.assertEqual(payload["tags"], ["新标签", "少女"])
+        # The verdict rule injects sfw first (no nsfw in the submission).
+        self.assertEqual(payload["tags"], ["sfw", "新标签", "少女"])
         self.assertIs(payload["manual"], True)
         after = self.read_sidecar("a.png")
-        self.assertEqual(after["tags"], ["新标签", "少女"])
+        self.assertEqual(after["tags"], ["sfw", "新标签", "少女"])
         self.assertIs(after["manual"], True)
         # Read-modify-write: every other field is carried over untouched.
         for field in ("version", "source", "generated_at", "status", "model",
@@ -173,7 +174,8 @@ class ManualTagUpdateTests(ManualTagTestCase):
         self.assertEqual(state["status"], "ok")
         self.assertEqual(state["model"], "manual")
         self.assertEqual(state["description"], "")
-        self.assertEqual(state["tags"], ["动漫", "少女"])
+        # No nsfw in the submission, so the verdict rule injects sfw first.
+        self.assertEqual(state["tags"], ["sfw", "动漫", "少女"])
         self.assertIs(state["manual"], True)
         self.assertIn("manual_edited_at", state)
         self.assertIn("generated_at", state)
@@ -188,7 +190,7 @@ class ManualTagUpdateTests(ManualTagTestCase):
 
         image = self.client.get("/api/comics").get_json()["images"][0]
 
-        self.assertEqual(image["tags"], ["动漫"])
+        self.assertEqual(image["tags"], ["sfw", "动漫"])
         self.assertIs(image["manual"], True)
         self.assertIs(image["nsfw"], False)
         self.assertIsNone(image["confidence"])   # no verification block
@@ -202,8 +204,9 @@ class ManualTagUpdateTests(ManualTagTestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.get_json()["tags"], ["动漫", "少女"])
-        self.assertEqual(self.read_sidecar("a.png")["tags"], ["动漫", "少女"])
+        expected = ["sfw", "动漫", "少女"]
+        self.assertEqual(response.get_json()["tags"], expected)
+        self.assertEqual(self.read_sidecar("a.png")["tags"], expected)
 
     def test_update_accepts_exactly_twelve_tags(self):
         self.write_image("a.png")
@@ -212,7 +215,10 @@ class ManualTagUpdateTests(ManualTagTestCase):
         response = self.update("a.png", tags)
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(self.read_sidecar("a.png")["tags"], tags)
+        # The 12-entry cap governs the submitted input; the injected sfw
+        # marker may legitimately leave 13 stored entries.
+        self.assertEqual(self.read_sidecar("a.png")["tags"],
+                         ["sfw"] + tags)
 
     def test_update_rejects_thirteen_tags_without_writing(self):
         self.write_image("a.png", _v2_sidecar(tags=["动漫"]))
@@ -273,7 +279,7 @@ class ManualTagUpdateTests(ManualTagTestCase):
         self.assertEqual(state["attempts"], 2)      # preserved, not reset
         self.assertEqual(state["error"], "RuntimeError: boom")
         image = self.client.get("/api/comics").get_json()["images"][0]
-        self.assertEqual(image["tags"], ["救回的标签"])
+        self.assertEqual(image["tags"], ["sfw", "救回的标签"])
         self.assertIs(image["manual"], True)
 
     def test_errors_and_successes_never_leak_absolute_paths(self):
@@ -345,7 +351,7 @@ class ManualTagUpdateTests(ManualTagTestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        expected = ["ab", "动漫", "少女", "正常"]
+        expected = ["sfw", "ab", "动漫", "少女", "正常"]
         self.assertEqual(response.get_json()["tags"], expected)
         self.assertEqual(self.read_sidecar("a.png")["tags"], expected)
         # No control byte may survive into the file (a NUL would serialize
@@ -448,7 +454,8 @@ class ManualTagPathValidationTests(ManualTagTestCase):
         response = self.update("a.png", ["通过"])
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(self.read_sidecar("a.png")["tags"], ["通过"])
+        self.assertEqual(self.read_sidecar("a.png")["tags"],
+                         ["sfw", "通过"])
 
 
 class ManualTagResetTests(ManualTagTestCase):
@@ -529,9 +536,12 @@ class ManualTagApiTests(ManualTagTestCase):
         self.update("a.png", ["新标签"])
 
         # The 30s summary cache was dropped by the write, so the new tag
-        # shows up immediately instead of waiting for the TTL.
+        # shows up immediately instead of waiting for the TTL. The sfw
+        # marker the verdict rule injected leads the pinned verdict order.
         refreshed = self.client.get("/api/comics/tags").get_json()
-        self.assertEqual(refreshed["tags"], [{"tag": "新标签", "count": 1}])
+        self.assertEqual(refreshed["tags"], [
+            {"tag": "sfw", "count": 1}, {"tag": "新标签", "count": 1},
+        ])
 
     def test_tag_filter_sees_manually_written_tags(self):
         self.write_image("a.png")
@@ -607,7 +617,7 @@ class ManualTagUiTests(ManualTagTestCase):
             response.headers["Content-Type"].startswith("application/json")
         )
         api = self.client.get("/api/comics").get_json()
-        self.assertEqual(api["images"][0]["tags"], [_XSS, "动漫"])
+        self.assertEqual(api["images"][0]["tags"], ["sfw", _XSS, "动漫"])
 
         page = self.client.get("/").get_data(as_text=True)
         self.assertNotIn("<img src=x onerror=alert(1)>", page)
@@ -628,7 +638,8 @@ class ManualTagVocabularyTests(ManualTagTestCase):
         response = self.update("a.png", ["动漫角色", "红发角色", "机甲"])
 
         self.assertEqual(response.status_code, 200)
-        expected = ["动漫", "角色", "红发", "机甲"]  # dedup across aliases
+        # dedup across aliases; the injected sfw marker leads the list.
+        expected = ["sfw", "动漫", "角色", "红发", "机甲"]
         self.assertEqual(response.get_json()["tags"], expected)
         state = self.read_sidecar("a.png")
         self.assertEqual(state["tags"], expected)
@@ -643,21 +654,23 @@ class ManualTagVocabularyTests(ManualTagTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["tags"],
-                         ["机甲", "动漫", "角色", "深海"])
+                         ["sfw", "机甲", "动漫", "角色", "深海"])
 
-    def test_verdict_words_pass_through_without_forced_changes(self):
-        # nsfw/sfw are ordinary canonical words on this route: the manual
-        # authority decides, nothing is added or removed here.
+    def test_verdict_words_normalize_to_exactly_one_first(self):
+        # Supersedes the retired "verdict words pass through untouched"
+        # contract: the manual route now enforces exactly one verdict word
+        # in first position. An explicit nsfw submission wins and drops
+        # any sfw; a submission without nsfw gets sfw injected first.
         self.write_image("a.png")
 
         response = self.update("a.png", ["nsfw", "动漫", "sfw"])
 
         self.assertEqual(response.status_code, 200)
         state = self.read_sidecar("a.png")
-        self.assertEqual(state["tags"], ["nsfw", "动漫", "sfw"])
-        # And a manual edit without them gains none.
+        self.assertEqual(state["tags"], ["nsfw", "动漫"])
+        # Removing the verdict words only regresses to sfw — never nsfw.
         self.update("a.png", ["动漫"])
-        self.assertEqual(self.read_sidecar("a.png")["tags"], ["动漫"])
+        self.assertEqual(self.read_sidecar("a.png")["tags"], ["sfw", "动漫"])
 
     def test_twelve_tag_cap_applies_to_the_pre_normalization_input(self):
         self.write_image("a.png")
@@ -674,7 +687,7 @@ class ManualTagVocabularyTests(ManualTagTestCase):
         state = self.read_sidecar("a.png")
         self.assertGreater(len(state["tags"]), 12)
         self.assertEqual(state["tags"][:5],
-                         ["动漫", "角色", "卡通", "男性", "红发"])
+                         ["sfw", "动漫", "角色", "卡通", "男性"])
         self.assertEqual(state["vocabulary_version"],
                          normalize.vocab_version())
 

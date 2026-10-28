@@ -717,7 +717,6 @@ def _parse_comics_sidecar(
         return empty
     nsfw = data.get("nsfw")
     nsfw_record = nsfw if isinstance(nsfw, dict) else {}
-    is_nsfw = nsfw_record.get("label") == "nsfw"
     agreement = nsfw_record.get("agreement")
     if agreement not in ("high", "low", "single"):
         agreement = None
@@ -741,6 +740,16 @@ def _parse_comics_sidecar(
         [tag for tag in tags_value if isinstance(tag, str)]
         if isinstance(tags_value, list) else []
     )
+    # The verdict flag shown by the gallery derives from ``tags``
+    # membership, never from the classifier ``nsfw.label`` history block:
+    # a manual re-judgement only rewrites ``tags``, so any other rule would
+    # desynchronise the per-image boolean, the ``/api/comics/tags``
+    # top-level count, and the ``?tag=`` filter (the 89-vs-88 mismatch).
+    # ``failed``/missing sidecars render no tags, so they report False here
+    # too — exactly what the filter and the counters already see. The
+    # ``nsfw`` block itself stays untouched as the classifiers' audit
+    # record and is only consulted for ``agreement`` above.
+    is_nsfw = "nsfw" in tags
     return tags, is_nsfw, description, confidence, agreement, bool(
         data.get("manual")
     )
@@ -1988,6 +1997,18 @@ def api_comics_tags_update():
     shared closed vocabulary (alias expansion, order preserved, duplicates
     collapsed) after the 12/32 input bounds, and the write records the
     ``vocabulary_version`` it normalized against.
+
+    Verdict rule (enforced after normalization, before the write): the
+    stored ``tags`` always hold exactly one verdict word in first
+    position.  A submission containing ``nsfw`` keeps ``nsfw`` and drops
+    any ``sfw`` (an explicit re-judgement wins); a submission without
+    ``nsfw`` gets ``sfw`` injected first.  Deleting ``nsfw`` therefore
+    flips the image to ``sfw``, while deleting ``sfw`` only regresses to
+    ``sfw`` and never escalates to ``nsfw``.  The sidecar's ``nsfw``
+    classifier block is never rewritten here — only ``tags`` (plus the
+    manual markers) change, so the bounds still apply to the submitted
+    input and the injected marker may take the stored list to
+    ``MAX + 1`` entries, exactly like the worker's marker injection.
     """
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
@@ -2003,10 +2024,18 @@ def api_comics_tags_update():
     # Vocabulary normalization runs after the existing cleaning and the
     # 12/32 input bounds (the cap applies to the submitted tags): aliases
     # expand to their canonical forms, order is preserved, duplicates
-    # collapse, and out-of-vocabulary words are kept verbatim.  nsfw/sfw
-    # pass through like any other canonical word -- a manual edit never
-    # gains or loses a classification tag here.
+    # collapse, and out-of-vocabulary words are kept verbatim.
     tags = tag_normalize.normalize_tags(cleaned, path=_COMICS_VOCABULARY)
+    # Manual verdict rule, applied to the normalized list right before the
+    # write: exactly one verdict word, always first.  ``nsfw`` present
+    # means an explicit re-judgement -- keep it, drop any ``sfw``; with no
+    # ``nsfw`` the image must not stay unjudged, so ``sfw`` is injected
+    # first (deleting ``nsfw`` flips the image to ``sfw``; deleting
+    # ``sfw`` only regresses to ``sfw`` and never escalates to ``nsfw``).
+    if "nsfw" in tags:
+        tags = ["nsfw"] + [tag for tag in tags if tag not in ("nsfw", "sfw")]
+    else:
+        tags = ["sfw"] + [tag for tag in tags if tag != "sfw"]
     vocabulary_version = tag_normalize.vocab_version(_COMICS_VOCABULARY)
 
     sidecar_path = _manual_sidecar_path(target)
@@ -3258,6 +3287,8 @@ INDEX_HTML = (
   }
   .tag-modal h3 { font-size:16px; color:#111; margin:0 0 4px; word-break:break-all; }
   .tag-modal-hint { color:#888; font-size:12px; margin:0 0 10px; line-height:1.6; }
+  /* Verdict re-judgement note, shown only while the modal still holds nsfw. */
+  .tag-modal-verdict-hint { color:#9a6a05; font-size:12px; margin:-6px 0 10px; line-height:1.6; }
   .tag-modal-chips { display:flex; flex-wrap:wrap; gap:6px; margin:0 0 12px; }
   .tag-modal-chips:empty::after { content:"暂无标签"; color:#aaa; font-size:12px; }
   .modal-chip {
@@ -4143,12 +4174,23 @@ if (searchClear) searchClear.addEventListener('click', function() {
       MAX_TAG_CHARS + ' 个字符。保存后该图转为手动标签，worker 不再自动改写。';
     modal.appendChild(hint);
 
+    // Verdict note: only while the edited tag list still holds ``nsfw``,
+    // because saving without it flips the image to ``sfw`` server-side.
+    // Shown/hidden through textContent-driven DOM properties like every
+    // other dynamic label in this modal.
+    var verdictHint = document.createElement('p');
+    verdictHint.className = 'tag-modal-verdict-hint';
+    verdictHint.textContent = '删除 nsfw 保存后将自动改为 sfw';
+    verdictHint.hidden = tags.indexOf('nsfw') === -1;
+    modal.appendChild(verdictHint);
+
     var chipsBox = document.createElement('div');
     chipsBox.className = 'tag-modal-chips';
     modal.appendChild(chipsBox);
 
     function renderModalChips() {
       while (chipsBox.firstChild) chipsBox.removeChild(chipsBox.firstChild);
+      verdictHint.hidden = tags.indexOf('nsfw') === -1;
       tags.forEach(function(tag, index) {
         var chip = document.createElement('span');
         chip.className = 'modal-chip';
