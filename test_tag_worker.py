@@ -2145,6 +2145,18 @@ class GenerationNormalizationTests(unittest.TestCase):
         self.assertNotIn("nsfw", listed)
         self.assertNotIn("sfw", listed)
 
+    def test_prompt_directs_faithful_adult_content_description(self):
+        # The model must not sanitize its own descriptions: the prompt
+        # frames the task as private archiving and explicitly forbids
+        # euphemism/refusal, while still demanding the two-line format.
+        prompt = inference.vlm_prompt()
+        self.assertIn("私人图库的归档与分级任务", prompt)
+        self.assertIn("如实、客观地", prompt)
+        self.assertIn("不要回避、淡化或改用委婉说法", prompt)
+        self.assertIn("不要拒绝作答", prompt)
+        self.assertIn("描述：<一句中文描述>", prompt)
+        self.assertIn("标签：<5到10个中文标签，用、分隔>", prompt)
+
 
 class RepartitionNormalizationTests(unittest.TestCase):
     """The threshold re-cut normalizes legacy free-form score keys first."""
