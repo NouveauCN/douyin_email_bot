@@ -477,7 +477,11 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
   the verified AdamCodd ViT is the default), the resident fp32 CPU
   `Qwen/Qwen2.5-VL-3B-Instruct`, and `OFA-Sys/chinese-clip-vit-base-patch16`
   for tag confidence. All four load lazily, never at import time. The Qwen
-  prompt asks for exactly `描述：<一句中文>` and `标签：<5-10个中文标签，用、分隔>`,
+  prompt frames the job as a private-library archival/grading task and
+  instructs the model to describe adult content factually (no euphemism,
+  no refusal — descriptions are for personal classification, not moral
+  judgement), then asks for exactly `描述：<一句中文>` and
+  `标签：<5-10个中文标签，用、分隔>`,
   then appends one guidance line `优先从标准标签库选择（可有表外词）：<every
   vocabulary word, comma separated>` — the classifier-owned `nsfw`/`sfw`
   words are excluded from that list so the model is never invited to grade
