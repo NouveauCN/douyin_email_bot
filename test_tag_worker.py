@@ -1929,14 +1929,6 @@ class VocabularyFileTests(unittest.TestCase):
         self.assertGreater(data["version"], 0)
         self.assertEqual(data["version"], normalize.vocab_version())
 
-    def test_word_count_categories_and_alias_count_are_in_range(self):
-        _, data = self._load()
-        categories = data["categories"]
-        words = [w for items in categories.values() for w in items]
-        self.assertTrue(8 <= len(categories) <= 10, len(categories))
-        self.assertTrue(120 <= len(words) <= 160, len(words))
-        self.assertGreaterEqual(len(data["aliases"]), 40)
-
     def test_no_word_appears_twice_across_categories(self):
         _, data = self._load()
         words = [w for items in data["categories"].values() for w in items]

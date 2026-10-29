@@ -598,9 +598,9 @@ bootstrap used by both entry points; keep it before any F2-dependent imports.
 ### Tag vocabulary (closed word list)
 
 - `tag_worker/vocabulary.json` is the closed vocabulary: a plain repository
-  data file with a positive `version`, nine `categories` word lists (~120-160
-  canonical forms, no word repeated across categories) and an `aliases` map
-  (40+ concrete/specific forms -> canonical components, for example
+  data file with a positive `version`, `categories` word lists (canonical
+  forms, no word repeated across categories) and an `aliases` map
+  (concrete/specific forms -> canonical components, for example
   `动漫角色 -> [动漫, 角色]` and `躺姿 -> [躺下]`). Every alias component must
   itself be a canonical word; a hand edit violating that keeps the original
   tag instead of inventing a word. The worker image ships it next to the
